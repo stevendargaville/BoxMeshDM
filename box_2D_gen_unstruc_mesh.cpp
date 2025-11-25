@@ -8,6 +8,9 @@
 #include <string>
 #include <mpi.h>
 #include <petsc/private/dmpleximpl.h>
+#include <petscdmplex.h>
+#include <petscviewerhdf5.h>
+#include <map>
 
 #if !defined(ANSI_DECLARATORS)
   #define ANSI_DECLARATORS
@@ -25,7 +28,7 @@
 // 4. Constraint: Boundary nodes only move tangentially.
 // =========================================================
 
-const int TILDE_DIM = 3; 
+const int TILE_DIM = 2; 
 const double DOMAIN_SIZE = 1.0;
 const double TARGET_EDGE_LENGTH = 0.0075; 
 
@@ -405,13 +408,29 @@ void remove_duplicates(std::vector<Point>& points) {
     points = unique_points;
 }
 
+// Helper to determine which rank owns a point based on spatial location
+int get_owner_rank(double x, double y, int size) {
+    double tile_s = DOMAIN_SIZE / TILE_DIM;
+    int tx = std::floor(x / tile_s);
+    int ty = std::floor(y / tile_s);
+    
+    // Clamp to handle numerical noise at upper boundaries
+    if (tx < 0) tx = 0; 
+    if (tx >= TILE_DIM) tx = TILE_DIM - 1;
+    if (ty < 0) ty = 0; 
+    if (ty >= TILE_DIM) ty = TILE_DIM - 1;
+
+    int global_tile_id = ty * TILE_DIM + tx;
+    return global_tile_id % size;
+}
+
 // --- Main Processing ---
-void process_tile(int tile_x, int tile_y) {
+void process_tile(int tile_x, int tile_y, 
+                  std::vector<Point>& acc_cloud, 
+                  std::vector<Triangle>& acc_mesh, 
+                  std::map<uint64_t, int>& id_to_idx) {
 
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);   
-
-    double tile_s = DOMAIN_SIZE / TILDE_DIM;
+    double tile_s = DOMAIN_SIZE / TILE_DIM;
     double t_min_x = tile_x * tile_s; double t_max_x = (tile_x + 1) * tile_s;
     double t_min_y = tile_y * tile_s; double t_max_y = (tile_y + 1) * tile_s;
     
@@ -565,28 +584,9 @@ void process_tile(int tile_x, int tile_y) {
     // Final Emit
     mesh = triangulation(cloud);
     
-    // NEW: Write full triangulation (including ghosts) to disk for visualization
-    {
-        std::string filename = "tile_" + std::to_string(tile_x) + "_" + std::to_string(tile_y) + ".dat";
-        std::ofstream outfile(filename);
-        if (outfile.is_open()) {
-            // Write Points
-            outfile << cloud.size() << "\n";
-            for (const auto& p : cloud) {
-                outfile << p.x << " " << p.y << "\n";
-            }
-            // Write Triangles
-            outfile << mesh.size() << "\n";
-            for (const auto& t : mesh) {
-                outfile << t.v0 << " " << t.v1 << " " << t.v2 << "\n";
-            }
-            outfile.close();
-        }
-    }
-
-    int count = 0;
-    int boundary_nodes = 0;
-    
+    // MERGE INTO ACCUMULATOR
+    // We only keep triangles that are geometrically "owned" by this tile to avoid duplication
+    // when a rank owns adjacent tiles.
     for (const auto& tri : mesh) {
         const Point& p0 = cloud[tri.v0];
         const Point& p1 = cloud[tri.v1];
@@ -594,41 +594,202 @@ void process_tile(int tile_x, int tile_y) {
         double cx = (p0.x+p1.x+p2.x)/3.0; 
         double cy = (p0.y+p1.y+p2.y)/3.0;
 
+        // Strict ownership check for the triangle
         if (cx >= t_min_x && cx < t_max_x && cy >= t_min_y && cy < t_max_y) {
-            count++;
-            if (is_on_boundary(p0)) boundary_nodes++;
-            if (is_on_boundary(p1)) boundary_nodes++;
-            if (is_on_boundary(p2)) boundary_nodes++;
+            Triangle new_t;
+            Point* pts[3] = { (Point*)&p0, (Point*)&p1, (Point*)&p2 };
+            int*   v_idx[3] = { &new_t.v0, &new_t.v1, &new_t.v2 };
+
+            // This builds a mapping between point id and its index in the accumulated cloud
+            for(int k=0; k<3; ++k) {
+                uint64_t pid = pts[k]->id;
+                if (id_to_idx.find(pid) == id_to_idx.end()) {
+                    int new_idx = acc_cloud.size();
+                    acc_cloud.push_back(*pts[k]);
+                    id_to_idx[pid] = new_idx;
+                }
+                *v_idx[k] = id_to_idx[pid];
+            }
+            acc_mesh.push_back(new_t);
         }
     }
-     
-    std::cout << "Rank " << rank << " Tile [" << tile_x << "," << tile_y << "] : " << count << " elements. "
-              << "(Touched Boundary Nodes: " << boundary_nodes << ")\n";
 }
 
-int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+DM CreateDistributedDM(const std::vector<Point>& cloud, const std::vector<Triangle>& mesh) {
+    int comm_rank, comm_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    PetscInt num_local_pts = cloud.size();
+    std::vector<PetscInt> global_ids(num_local_pts, -1);
+    PetscInt num_owned = 0;
 
-    if (rank == 0) {
-        std::cout << "Generating Unstructured Mesh of 2D box...\n";
-        std::cout << "Running on " << size << " MPI ranks for " << TILDE_DIM << "x" << TILDE_DIM << " tiles.\n";
+    // 1. Identify Owned Vertices
+    for (int i = 0; i < num_local_pts; ++i) {
+        if (get_owner_rank(cloud[i].x, cloud[i].y, comm_size) == comm_rank) {
+            num_owned++;
+        }
     }
 
-    // Distribute tiles cyclically among ranks
-    for (int y = 0; y < TILDE_DIM; ++y) {
-        for (int x = 0; x < TILDE_DIM; ++x) {
-            int global_id = y * TILDE_DIM + x;
+    // 2. Calculate Global Offsets - petscint to ensure large counts work
+    PetscInt start_id = 0;
+    MPI_Exscan(&num_owned, &start_id, 1, MPIU_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    // 3. Assign Global IDs to Owned Vertices
+    PetscInt current_id = start_id;
+    for (int i = 0; i < num_local_pts; ++i) {
+        if (get_owner_rank(cloud[i].x, cloud[i].y, comm_size) == comm_rank) {
+            global_ids[i] = current_id++;
+        }
+    }
+
+    // 4. Resolve Ghost IDs
+    // We need to ask the owners for the Global IDs of our ghost points.
+    std::vector<std::vector<uint64_t>> send_ids(comm_size);
+    std::vector<std::vector<int>>      send_req_indices(comm_size); // Map back to local index
+
+    for (int i = 0; i < num_local_pts; ++i) {
+        if (global_ids[i] == -1) {
+            int owner = get_owner_rank(cloud[i].x, cloud[i].y, comm_size);
+            send_ids[owner].push_back(cloud[i].id);
+            send_req_indices[owner].push_back(i);
+        }
+    }
+
+    // Exchange counts
+    std::vector<int> send_counts(comm_size), recv_counts(comm_size);
+    for(int r=0; r<comm_size; ++r) send_counts[r] = send_ids[r].size();
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+    // Prepare Receive Buffers (Requests from others)
+    std::vector<std::vector<uint64_t>> recv_ids(comm_size);
+    std::vector<std::vector<PetscInt>> send_answers(comm_size);
+    
+    // Post Receives
+    for(int r=0; r<comm_size; ++r) {
+        if(recv_counts[r] > 0) {
+            recv_ids[r].resize(recv_counts[r]);
+        }
+    }
+
+    // Simple Point-to-Point Exchange (Blocking for simplicity, use Irecv/Isend in prod)
+    for(int r=0; r<comm_size; ++r) {
+        if (r == comm_rank) continue;
+        if (send_counts[r] > 0) {
+            MPI_Send(send_ids[r].data(), send_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD);
+        }
+    }
+    
+    // Process Incoming Requests
+    // We need a map for fast lookup of OUR owned points
+    std::map<uint64_t, PetscInt> my_owned_map;
+    for(int i=0; i<num_local_pts; ++i) {
+        if (get_owner_rank(cloud[i].x, cloud[i].y, comm_size) == comm_rank) {
+            my_owned_map[cloud[i].id] = global_ids[i];
+        }
+    }
+
+    for(int r=0; r<comm_size; ++r) {
+        if (r == comm_rank) continue;
+        if (recv_counts[r] > 0) {
+            MPI_Status status;
+            MPI_Recv(recv_ids[r].data(), recv_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD, &status);
             
-            if (global_id % size == rank) {
-                process_tile(x, y);
+            send_answers[r].resize(recv_counts[r]);
+            for(int k=0; k<recv_counts[r]; ++k) {
+                send_answers[r][k] = my_owned_map[recv_ids[r][k]];
+            }
+            // Send answers back
+            MPI_Send(send_answers[r].data(), recv_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD);
+        }
+    }
+
+    // Receive Answers
+    for(int r=0; r<comm_size; ++r) {
+        if (r == comm_rank) continue;
+        if (send_counts[r] > 0) {
+            std::vector<PetscInt> answers(send_counts[r]);
+            MPI_Status status;
+            MPI_Recv(answers.data(), send_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD, &status);
+            
+            for(int k=0; k<send_counts[r]; ++k) {
+                int local_idx = send_req_indices[r][k];
+                global_ids[local_idx] = answers[k];
             }
         }
     }
 
-    MPI_Finalize();
+    // 5. Build DMPlex
+    PetscInt num_cells = mesh.size();
+    std::vector<PetscInt> cells(num_cells * 3);
+    for(int i=0; i<num_cells; ++i) {
+        cells[i*3 + 0] = global_ids[mesh[i].v0];
+        cells[i*3 + 1] = global_ids[mesh[i].v1];
+        cells[i*3 + 2] = global_ids[mesh[i].v2];
+    }
+
+    // Prepare coordinates for DMPlexCreateFromCellListParallelPetsc
+    std::vector<PetscReal> coords(num_local_pts * 2);
+    for(int i=0; i<num_local_pts; ++i) {
+        coords[i*2+0] = cloud[i].x;
+        coords[i*2+1] = cloud[i].y;
+    }
+
+    DM dm;
+    // Use DMPlexCreateFromCellListParallelPetsc which replaces the removed function
+    PetscInt two = 2;
+    PetscInt three = 3;
+    (void*)DMPlexCreateFromCellListParallelPetsc(MPI_COMM_WORLD, two, num_cells, num_local_pts, PETSC_DECIDE, \
+         three, PETSC_TRUE, cells.data(), two, coords.data(), NULL, NULL, &dm);
+    return dm;
+}
+
+int main(int argc, char** argv) {
+
+    PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
+
+    int comm_rank, comm_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    if (comm_rank == 0) {
+        std::cout << "Generating Unstructured Mesh of 2D box...\n";
+        std::cout << "Running on " << comm_size << " MPI ranks for " << TILE_DIM << "x" << TILE_DIM << " tiles.\n";
+    }
+
+    std::vector<Point> rank_cloud;
+    std::vector<Triangle> rank_mesh;
+    std::map<uint64_t, int> id_map;
+
+    // Distribute tiles cyclically among ranks
+    for (int y = 0; y < TILE_DIM; ++y) {
+        for (int x = 0; x < TILE_DIM; ++x) {
+            int global_id = y * TILE_DIM + x;
+            
+            if (global_id % comm_size == comm_rank) {
+                process_tile(x, y, rank_cloud, rank_mesh, id_map);
+            }
+        }
+    }
+
+    std::cout << "Rank " << comm_rank << " generated " << rank_mesh.size() << " triangles.\n";
+
+    DM dm = CreateDistributedDM(rank_cloud, rank_mesh);
+    PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
+    PetscViewer viewer;
+    // Can view this in paraview with:
+    // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
+    // then using the XDMF reader
+    // paraview box_mesh.xmf
+    PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
+    PetscCall(DMView(dm, viewer));
+    PetscCall(PetscViewerDestroy(&viewer));
+
+    rank_cloud.clear();
+    rank_mesh.clear();
+    id_map.clear();
+
+    PetscCall(DMDestroy(&dm));
+    PetscCall(PetscFinalize());
     return 0;
 }
