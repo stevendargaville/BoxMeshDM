@@ -39,7 +39,7 @@ const double EPSILON = 1e-13;
 const double START_JITTER = 0.30;
 double MIN_ANGLE_THRESHOLD = 30.0;
 
-const int ANNEAL_CYCLES = 3; 
+const int ANNEAL_ITERS = 3; 
 const int FINAL_SMOOTH_ITERS = 2;
 
 struct Point {
@@ -158,11 +158,11 @@ void hash_combine(uint64_t& h, double v) {
 // --- Jitter ---
 void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
     for (size_t i = 0; i < points.size(); ++i) {
-        // Hash based on STABLE ID + Cycle Offset
+        // Hash based on STABLE ID + iters Offset
         // This ensures that even if the point moves, the jitter sequence is deterministic
         uint64_t h = points[i].id;
-        
-        // Mix in the cycle/seed offset to ensure different jitter each step
+
+        // Mix in the iters/seed offset to ensure different jitter each step
         h ^= seed_offset + 0x9e3779b9 + (h << 6) + (h >> 2);
 
         RngState rng = {h};
@@ -418,17 +418,17 @@ void process_tile(int tile_x, int tile_y) {
     
     // UNIFIED PADDING LOGIC
     // We generate a halo large enough to absorb the boundary effects of annealing.
-    // The distortion from the boundary travels approx 1 edge per cycle.
+    // The distortion from the boundary travels approx 1 edge per iter.
     // We add +3 for safety 
-    double pad = TARGET_EDGE_LENGTH * (ANNEAL_CYCLES + FINAL_SMOOTH_ITERS + 3);
+    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITERS + 3);
 
     // Safety Check: Ensure the required halo doesn't exceed the tile size.
     // In a domain decomposition, needing a halo larger than the subdomain 
     // implies we need data from neighbors-of-neighbors, which is inefficient/complex.
     if (pad > tile_s/2.0) {
-        std::cerr << "Error: Annealing cycles (" << ANNEAL_CYCLES << ") require a halo of " 
+        std::cerr << "Error: Annealing iters (" << ANNEAL_ITERS << ") require a halo of " 
                   << pad << ", which exceeds the tile size (" << tile_s << ").\n"
-                  << "Reduce ANNEAL_CYCLES or increase tile size (by having fewer tiles or more points per tile).\n";
+                  << "Reduce ANNEAL_ITERS or increase tile size (by having fewer tiles or more points per tile).\n";
         std::exit(EXIT_FAILURE);
     }    
 
@@ -552,8 +552,8 @@ void process_tile(int tile_x, int tile_y) {
     std::vector<Triangle> mesh;
     double current_jitter = START_JITTER;
 
-    for (int cycle = 0; cycle < ANNEAL_CYCLES; ++cycle) {
-        apply_jitter(cloud, current_jitter, cycle);
+    for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
+        apply_jitter(cloud, current_jitter, iter);
         mesh = triangulation(cloud);
         relax_points(cloud, mesh, s_min_x, s_min_y, s_max_x, s_max_y);
     }
