@@ -27,7 +27,7 @@
 
 const int TILDE_DIM = 3; 
 const double DOMAIN_SIZE = 1.0;
-const double TARGET_SPACING = 0.01; 
+const double TARGET_EDGE_LENGTH = 0.0075; 
 
 const double EPSILON = 1e-13;     
 const double START_JITTER = 0.30;
@@ -168,8 +168,8 @@ void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
 
         RngState rng = {h};
 
-        double jx = (next_double(rng) - 0.5) * 2.0 * amount * TARGET_SPACING;
-        double jy = (next_double(rng) - 0.5) * 2.0 * amount * TARGET_SPACING;
+        double jx = (next_double(rng) - 0.5) * 2.0 * amount * TARGET_EDGE_LENGTH;
+        double jy = (next_double(rng) - 0.5) * 2.0 * amount * TARGET_EDGE_LENGTH;
 
         // CRITICAL: Boundary nodes effectively ignore perpendicular jitter here
         apply_boundary_constraint(points[i], jx, jy);
@@ -418,7 +418,7 @@ void process_tile(int tile_x, int tile_y) {
     // We generate a halo large enough to absorb the boundary effects of annealing.
     // The distortion from the boundary travels approx 1 edge per cycle.
     // We add +3 for safety 
-    double pad = TARGET_SPACING * (ANNEAL_CYCLES + FINAL_SMOOTH_ITERS + 3);
+    double pad = TARGET_EDGE_LENGTH * (ANNEAL_CYCLES + FINAL_SMOOTH_ITERS + 3);
 
     // Safety Check: Ensure the required halo doesn't exceed the tile size.
     // In a domain decomposition, needing a halo larger than the subdomain 
@@ -466,58 +466,58 @@ void process_tile(int tile_x, int tile_y) {
     
     // Left (x=0)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON) {
-        int min_i = floor(search_min_y / TARGET_SPACING);
-        int max_i = ceil(search_max_y / TARGET_SPACING);
+        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
+        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
-            double y = i * TARGET_SPACING;
+            double y = i * TARGET_EDGE_LENGTH;
             if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) cloud.push_back(create_stable_point(0.0, y));
         }
     }
     // Right (x=1)
     if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON) {
-        int min_i = floor(search_min_y / TARGET_SPACING);
-        int max_i = ceil(search_max_y / TARGET_SPACING);
+        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
+        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
-            double y = i * TARGET_SPACING;
+            double y = i * TARGET_EDGE_LENGTH;
             if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) cloud.push_back(create_stable_point(DOMAIN_SIZE, y));
         }
     }
     // Bottom (y=0)
     if (search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        int min_i = floor(search_min_x / TARGET_SPACING);
-        int max_i = ceil(search_max_x / TARGET_SPACING);
+        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
+        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
-            double x = i * TARGET_SPACING;
+            double x = i * TARGET_EDGE_LENGTH;
             if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) cloud.push_back(create_stable_point(x, 0.0));
         }
     }
     // Top (y=1)
     if (search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        int min_i = floor(search_min_x / TARGET_SPACING);
-        int max_i = ceil(search_max_x / TARGET_SPACING);
+        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
+        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
-            double x = i * TARGET_SPACING;
+            double x = i * TARGET_EDGE_LENGTH;
             if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) cloud.push_back(create_stable_point(x, DOMAIN_SIZE));
         }
     }
 
     // 3. INTERIOR GENERATION (with Exclusion)
-    int min_ix = floor(search_min_x / TARGET_SPACING);
-    int max_ix = ceil(search_max_x / TARGET_SPACING);
-    double hex_y_spacing = TARGET_SPACING * 0.8660254;
+    int min_ix = floor(search_min_x / TARGET_EDGE_LENGTH);
+    int max_ix = ceil(search_max_x / TARGET_EDGE_LENGTH);
+    double hex_y_spacing = TARGET_EDGE_LENGTH * 0.8660254;
     int min_iy = floor(search_min_y / hex_y_spacing);
     int max_iy = ceil(search_max_y / hex_y_spacing);
     
     // Distance from wall to reject interior points
     // FIX: Must be larger than max jitter to prevent collision with boundary
-    // Max jitter is START_JITTER * TARGET_SPACING. We add a safety margin.
-    double exclusion = TARGET_SPACING * (START_JITTER + 0.1); 
+    // Max jitter is START_JITTER * TARGET_EDGE_LENGTH. We add a safety margin.
+    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.1); 
 
     for (int iy = min_iy; iy <= max_iy; ++iy) {
         double cy = iy * hex_y_spacing;
-        double row_offset = (iy % 2 != 0) ? (TARGET_SPACING * 0.5) : 0.0;
+        double row_offset = (iy % 2 != 0) ? (TARGET_EDGE_LENGTH * 0.5) : 0.0;
         for (int ix = min_ix; ix <= max_ix; ++ix) {
-            double cx = ix * TARGET_SPACING + row_offset;
+            double cx = ix * TARGET_EDGE_LENGTH + row_offset;
             
             // Rejection Sampling for Exclusion Zone
             if (cx < exclusion) continue;
@@ -541,7 +541,7 @@ void process_tile(int tile_x, int tile_y) {
     // If we relax the very edge, it collapses inward due to lack of outer neighbors.
     // This collapse propagates errors inward.
     // We freeze a strip of width ~ 1.5 * spacing.
-    double frozen_margin = TARGET_SPACING * 1.5;
+    double frozen_margin = TARGET_EDGE_LENGTH * 1.5;
 
     double s_min_x = search_min_x + frozen_margin; 
     double s_max_x = search_max_x - frozen_margin;

@@ -53,7 +53,7 @@ def main():
         # Plot Points (Small dots)
         px = [p[0] for p in points]
         py = [p[1] for p in points]
-        plt.scatter(px, py, s=1, c=c, alpha=0.5, label=fname)
+        plt.scatter(px, py, s=0.5, c=c, alpha=0.5, label=fname)
 
         # Plot Triangles (Edges)
         for t in tris:
@@ -61,7 +61,7 @@ def main():
                 pts = [points[t[0]], points[t[1]], points[t[2]], points[t[0]]]
                 xs = [p[0] for p in pts]
                 ys = [p[1] for p in pts]
-                plt.plot(xs, ys, color=c, linewidth=0.5, alpha=0.4)
+                plt.plot(xs, ys, color=c, linewidth=0.25, alpha=0.4)
         
     plt.title("Unstructured Mesh Tiles (Overlaid)")
     plt.xlabel("X")
