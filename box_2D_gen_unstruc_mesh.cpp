@@ -4,9 +4,15 @@
 #include <algorithm>
 #include <cstdint>
 #include <iomanip>
-#include <fstream> // Added for file output
-#include <string>  // Added for file output
-#include <mpi.h>   // Added for MPI
+#include <fstream>
+#include <string>
+#include <mpi.h>
+#include <petsc/private/dmpleximpl.h>
+
+#if !defined(ANSI_DECLARATORS)
+  #define ANSI_DECLARATORS
+#endif
+#include <triangle.h>
 
 // =========================================================
 // JITTER + LLOYD SMOOTH MESH GENERATOR FOR [0,1]^2 WITH FIXED BOUNDARIES
@@ -34,6 +40,54 @@ struct Point {
     double x, y;
     uint64_t id = 0; // Added for deterministic jitter
 };
+
+// Taken from PETSc in src/dm/impls/plex/generators/triangle/trigenerate.c
+static void InitInput_Triangle(struct triangulateio *inputCtx)
+{
+  inputCtx->numberofpoints             = 0;
+  inputCtx->numberofpointattributes    = 0;
+  inputCtx->pointlist                  = NULL;
+  inputCtx->pointattributelist         = NULL;
+  inputCtx->pointmarkerlist            = NULL;
+  inputCtx->numberofsegments           = 0;
+  inputCtx->segmentlist                = NULL;
+  inputCtx->segmentmarkerlist          = NULL;
+  inputCtx->numberoftriangleattributes = 0;
+  inputCtx->trianglelist               = NULL;
+  inputCtx->numberofholes              = 0;
+  inputCtx->holelist                   = NULL;
+  inputCtx->numberofregions            = 0;
+  inputCtx->regionlist                 = NULL;
+}
+
+static void InitOutput_Triangle(struct triangulateio *outputCtx)
+{
+  outputCtx->numberofpoints        = 0;
+  outputCtx->pointlist             = NULL;
+  outputCtx->pointattributelist    = NULL;
+  outputCtx->pointmarkerlist       = NULL;
+  outputCtx->numberoftriangles     = 0;
+  outputCtx->trianglelist          = NULL;
+  outputCtx->triangleattributelist = NULL;
+  outputCtx->neighborlist          = NULL;
+  outputCtx->segmentlist           = NULL;
+  outputCtx->segmentmarkerlist     = NULL;
+  outputCtx->numberofedges         = 0;
+  outputCtx->edgelist              = NULL;
+  outputCtx->edgemarkerlist        = NULL;
+}
+
+static void FiniOutput_Triangle(struct triangulateio *outputCtx)
+{
+  free(outputCtx->pointlist);
+  free(outputCtx->pointmarkerlist);
+  free(outputCtx->segmentlist);
+  free(outputCtx->segmentmarkerlist);
+  free(outputCtx->edgelist);
+  free(outputCtx->edgemarkerlist);
+  free(outputCtx->trianglelist);
+  free(outputCtx->neighborlist);
+}
 
 // --- Boundary Logic ---
 
@@ -125,49 +179,44 @@ void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
     }
 }
 
-// --- Triangulation (Bowyer-Watson) ---
-std::vector<Triangle> triangulation(const std::vector<Point>& points, double min_x, double min_y, double max_x, double max_y) {
-    std::vector<Triangle> triangles;
-    double w = max_x - min_x; double h = max_y - min_y;
-    std::vector<Point> work = points;
-    int n = points.size();
+// Wrapper for Triangle library
+std::vector<Triangle> triangulation(const std::vector<Point>& points) {
+    struct triangulateio in;
+    struct triangulateio out;    
     
-    // Super Triangle
-    // Ensure CCW orientation and sufficient coverage
-    double cx = min_x + w * 0.5;
-    
-    work.push_back({cx, max_y + 100.0 * h, 0});            // Top
-    work.push_back({min_x - 100.0 * w, min_y - 50.0 * h, 0}); // Bottom Left
-    work.push_back({max_x + 100.0 * w, min_y - 50.0 * h, 0}); // Bottom Right
-    triangles.push_back({n, n+1, n+2}); 
+    // Initialize structures
+    InitInput_Triangle(&in);
+    InitOutput_Triangle(&out);
 
-    for(int i=0; i<n; ++i) {
-        std::vector<Edge> poly;
-        std::vector<int> bad;
-        for(size_t k=0; k<triangles.size(); ++k) {
-            if(triangles[k].inCircumcircle(work[i], work)) bad.push_back(k);
-        }
-        for(int t_idx : bad) {
-            const auto& t = triangles[t_idx];
-            Edge edges[] = {{t.v0,t.v1}, {t.v1,t.v2}, {t.v2,t.v0}};
-            for(auto& edge : edges) {
-                bool shared = false;
-                for(int o_idx : bad) {
-                    if(t_idx == o_idx) continue;
-                    const auto& ot = triangles[o_idx];
-                    Edge o_edges[] = {{ot.v0,ot.v1}, {ot.v1,ot.v2}, {ot.v2,ot.v0}};
-                    for(auto& oe : o_edges) if(edge == oe) { shared=true; break; }
-                    if(shared) break;
-                }
-                if(!shared) poly.push_back(edge);
-            }
-        }
-        for(int k=bad.size()-1; k>=0; --k) triangles.erase(triangles.begin() + bad[k]);
-        for(auto& edge : poly) triangles.push_back({edge.v0, edge.v1, i});
+    in.numberofpoints = points.size();
+    in.pointlist = new double[in.numberofpoints * 2];
+
+    for (size_t i = 0; i < points.size(); ++i) {
+        in.pointlist[i * 2] = points[i].x;
+        in.pointlist[i * 2 + 1] = points[i].y;
     }
-    std::vector<Triangle> final;
-    for(auto& t : triangles) if(t.v0 < n && t.v1 < n && t.v2 < n) final.push_back(t);
-    return final;
+
+    char args[32];
+    (void*)PetscStrncpy(args, "ezQ", sizeof(args));    
+
+    triangulate(args, &in, &out, NULL);
+
+    const PetscInt numCells = out.numberoftriangles;
+    std::vector<Triangle> mesh;
+    mesh.reserve(numCells);
+
+    for (int i = 0; i < numCells; ++i) {
+        Triangle t;
+        t.v0 = (int)out.trianglelist[i * 3 + 0];
+        t.v1 = (int)out.trianglelist[i * 3 + 1];
+        t.v2 = (int)out.trianglelist[i * 3 + 2];
+        mesh.push_back(t);
+    }
+
+    delete[] in.pointlist;
+    FiniOutput_Triangle(&out);
+
+    return mesh;
 }
 
 // --- Relaxation ---
@@ -357,6 +406,10 @@ void remove_duplicates(std::vector<Point>& points) {
 
 // --- Main Processing ---
 void process_tile(int tile_x, int tile_y) {
+
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);   
+
     double tile_s = DOMAIN_SIZE / TILDE_DIM;
     double t_min_x = tile_x * tile_s; double t_max_x = (tile_x + 1) * tile_s;
     double t_min_y = tile_y * tile_s; double t_max_y = (tile_y + 1) * tile_s;
@@ -500,18 +553,17 @@ void process_tile(int tile_x, int tile_y) {
 
     for (int cycle = 0; cycle < ANNEAL_CYCLES; ++cycle) {
         apply_jitter(cloud, current_jitter, cycle);
-
-        mesh = triangulation(cloud, t_min_x - pad, t_min_y - pad, t_max_x + pad, t_max_y + pad);
+        mesh = triangulation(cloud);
         relax_points(cloud, mesh, s_min_x, s_min_y, s_max_x, s_max_y);
     }
     // Final Polish
     for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
-        mesh = triangulation(cloud, t_min_x - pad, t_min_y - pad, t_max_x + pad, t_max_y + pad);
+        mesh = triangulation(cloud);
         relax_points(cloud, mesh, s_min_x, s_min_y, s_max_x, s_max_y);
     }
     
     // Final Emit
-    mesh = triangulation(cloud, t_min_x - pad, t_min_y - pad, t_max_x + pad, t_max_y + pad);
+    mesh = triangulation(cloud);
     
     // NEW: Write full triangulation (including ghosts) to disk for visualization
     {
@@ -549,9 +601,7 @@ void process_tile(int tile_x, int tile_y) {
             if (is_on_boundary(p2)) boundary_nodes++;
         }
     }
-    
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);    
+     
     std::cout << "Rank " << rank << " Tile [" << tile_x << "," << tile_y << "] : " << count << " elements. "
               << "(Touched Boundary Nodes: " << boundary_nodes << ")\n";
 }
