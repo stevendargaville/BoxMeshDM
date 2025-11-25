@@ -729,18 +729,27 @@ DM CreateDistributedDM(const std::vector<Point>& cloud, const std::vector<Triang
     }
 
     // Prepare coordinates for DMPlexCreateFromCellListParallelPetsc
-    std::vector<PetscReal> coords(num_local_pts * 2);
+    // FIX: Only pass OWNED points to PETSc. 
+    // acc_cloud contains ghosts (vertices of owned triangles that are owned by neighbors).
+    // PETSc expects 'numPoints' to be the count of locally owned vertices, 
+    // and 'coords' to be the coordinates of those specific vertices in Global ID order.
+    std::vector<PetscReal> owned_coords;
+    owned_coords.reserve(num_owned * 2);
+    
     for(int i=0; i<num_local_pts; ++i) {
-        coords[i*2+0] = cloud[i].x;
-        coords[i*2+1] = cloud[i].y;
+        if (get_owner_rank(cloud[i].x, cloud[i].y, comm_size) == comm_rank) {
+            owned_coords.push_back(cloud[i].x);
+            owned_coords.push_back(cloud[i].y);
+        }
     }
 
     DM dm;
-    // Use DMPlexCreateFromCellListParallelPetsc which replaces the removed function
+    // Build the DM
     PetscInt two = 2;
     PetscInt three = 3;
-    (void*)DMPlexCreateFromCellListParallelPetsc(MPI_COMM_WORLD, two, num_cells, num_local_pts, PETSC_DECIDE, \
-         three, PETSC_TRUE, cells.data(), two, coords.data(), NULL, NULL, &dm);
+    // Pass num_owned instead of num_local_pts, and owned_coords instead of coords
+    (void*)DMPlexCreateFromCellListParallelPetsc(MPI_COMM_WORLD, two, num_cells, num_owned, PETSC_DECIDE, \
+         three, PETSC_TRUE, cells.data(), two, owned_coords.data(), NULL, NULL, &dm);
     return dm;
 }
 
