@@ -15,11 +15,11 @@
 #include <triangle.h>
 
 // =========================================================
-// JITTER + LLOYD SMOOTH MESH GENERATOR FOR [0,1]^2 WITH FIXED BOUNDARIES
+// JITTER + LLOYD SMOOTH MESH GENERATOR FOR [0,DOMAIN_SIZE]^2 WITH FIXED BOUNDARIES
 // =========================================================
 // 
 // Strategy:
-// 1. Boundary Gen: Create points explicitly on [0,1]^2 edges.
+// 1. Boundary Gen: Create points explicitly on [0,DOMAIN_SIZE]^2 edges.
 // 2. Interior Gen: Create Hex Grid points, REJECTING those near edges.
 // 3. Annealing: Jitter -> Smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
@@ -29,7 +29,6 @@ const int TILDE_DIM = 3;
 const double DOMAIN_SIZE = 1.0;
 const double TARGET_EDGE_LENGTH = 0.0075; 
 
-// Robust Tolerances for Mesh Generation
 // We need these to be relative to edge length to support very fine meshes (e.g. 10^-6 spacing)
 const double TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
 const double TOL_LEN_SQ = TOL_LEN * TOL_LEN;
