@@ -29,6 +29,12 @@ const int TILDE_DIM = 3;
 const double DOMAIN_SIZE = 1.0;
 const double TARGET_EDGE_LENGTH = 0.0075; 
 
+// Robust Tolerances for Mesh Generation
+// We need these to be relative to edge length to support very fine meshes (e.g. 10^-6 spacing)
+const double TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
+const double TOL_LEN_SQ = TOL_LEN * TOL_LEN;
+const double TOL_AREA = TOL_LEN_SQ * 1e-2;
+
 const double EPSILON = 1e-13;     
 const double START_JITTER = 0.30;
 double MIN_ANGLE_THRESHOLD = 30.0;
@@ -123,13 +129,6 @@ bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
 
 struct Triangle {
     int v0, v1, v2;
-    bool inCircumcircle(const Point& p, const std::vector<Point>& pts) const {
-        const Point& a = pts[v0]; const Point& b = pts[v1]; const Point& c = pts[v2];
-        double ax = a.x-p.x; double ay = a.y-p.y;
-        double bx = b.x-p.x; double by = b.y-p.y;
-        double cx = c.x-p.x; double cy = c.y-p.y;
-        return ((ax*ax + ay*ay)*(bx*cy - cx*by) - (bx*bx + by*by)*(ax*cy - cx*ay) + (cx*cx + cy*cy)*(ax*by - bx*ay)) > 1e-10;
-    }
 };
 
 struct Edge {
@@ -233,7 +232,7 @@ double get_min_angle_deg(const Point& a, const Point& b, const Point& c) {
     double bc = std::sqrt(bc2);
     double ca = std::sqrt(ca2);
 
-    if (ab < 1e-9 || bc < 1e-9 || ca < 1e-9) return 0.0;
+    if (ab < TOL_LEN || bc < TOL_LEN || ca < TOL_LEN) return 0.0;
 
     // Law of Cosines
     double ang_a = std::acos(clamp_val((ab2 + ca2 - bc2) / (2.0 * ab * ca)));
@@ -301,7 +300,7 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& mesh,
     std::vector<double> candidate_factors = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7};
 
     for (int i=0; i<n; ++i) {
-        if (w_sum[i] < 1e-12) continue;
+        if (w_sum[i] < TOL_AREA) continue;
         
         // Update if in valid safe zone (ignoring deep ghost layers)
         if (points[i].x > min_safe_x && points[i].x < max_safe_x && points[i].y > min_safe_y && points[i].y < max_safe_y) {
@@ -385,11 +384,13 @@ void remove_duplicates(std::vector<Point>& points) {
 
     // Sort to bring duplicates together
     std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
-        if (std::abs(a.x - b.x) > 1e-9) return a.x < b.x;
+        // Use robust tolerance for sorting check
+        if (std::abs(a.x - b.x) > TOL_LEN) return a.x < b.x;
         return a.y < b.y;
     });
 
     std::vector<Point> unique_points;
+    unique_points.reserve(points.size());
     unique_points.push_back(points[0]);
 
     for (size_t i = 1; i < points.size(); ++i) {
@@ -397,7 +398,8 @@ void remove_duplicates(std::vector<Point>& points) {
         const Point& curr = points[i];
         double dist_sq = (prev.x - curr.x)*(prev.x - curr.x) + (prev.y - curr.y)*(prev.y - curr.y);
         
-        if (dist_sq > 1e-12) { // Keep if distance > 1e-6
+        // Only keep if distance is physically significant relative to mesh size
+        if (dist_sq > TOL_LEN_SQ) {
             unique_points.push_back(curr);
         }
     }
@@ -437,7 +439,6 @@ void process_tile(int tile_x, int tile_y) {
 
     // 1. EXPLICIT CORNERS
     // Add corners if they are in the search box.
-    // Use type 5 for corners to distinguish IDs.
     
     // (0,0)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
