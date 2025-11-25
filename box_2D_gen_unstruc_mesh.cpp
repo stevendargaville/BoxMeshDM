@@ -179,7 +179,7 @@ void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
     }
 }
 
-// Wrapper for Triangle library
+// Wrapper for Triangle library - https://www.cs.cmu.edu/~quake/triangle.html
 std::vector<Triangle> triangulation(const std::vector<Point>& points) {
     struct triangulateio in;
     struct triangulateio out;    
@@ -614,7 +614,7 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     if (rank == 0) {
-        std::cout << "Generating Annealed Mesh with Explicit Boundaries...\n";
+        std::cout << "Generating Unstructured Mesh of 2D box...\n";
         std::cout << "Running on " << size << " MPI ranks for " << TILDE_DIM << "x" << TILDE_DIM << " tiles.\n";
     }
 
