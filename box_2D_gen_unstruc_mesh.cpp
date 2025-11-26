@@ -536,8 +536,11 @@ void process_tile(int tile_x, int tile_y,
     
     // Distance from wall to reject interior points
     // FIX: Must be larger than max jitter to prevent collision with boundary
-    // Max jitter is START_JITTER * TARGET_EDGE_LENGTH. We add a safety margin.
-    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.1); 
+    // Max jitter is START_JITTER * TARGET_EDGE_LENGTH. 
+    // We need a larger safety margin to prevent slivers.
+    // 0.6 ensures that even with 0.3 jitter, the closest approach is ~0.3L, 
+    // which results in an aspect ratio of ~3:1 (acceptable).
+    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.35); 
 
     for (int iy = min_iy; iy <= max_iy; ++iy) {
         double cy = iy * hex_y_spacing;
