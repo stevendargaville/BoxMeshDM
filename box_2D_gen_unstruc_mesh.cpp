@@ -203,21 +203,21 @@ std::vector<Triangle> triangulation(const std::vector<Point>& points) {
     triangulate(args, &in, &out, NULL);
 
     const PetscInt numCells = out.numberoftriangles;
-    std::vector<Triangle> mesh;
-    mesh.reserve(numCells);
+    std::vector<Triangle> triangles;
+    triangles.reserve(numCells);
 
     for (int i = 0; i < numCells; ++i) {
         Triangle t;
         t.v0 = (int)out.trianglelist[i * 3 + 0];
         t.v1 = (int)out.trianglelist[i * 3 + 1];
         t.v2 = (int)out.trianglelist[i * 3 + 2];
-        mesh.push_back(t);
+        triangles.push_back(t);
     }
 
     delete[] in.pointlist;
     FiniOutput_Triangle(&out);
 
-    return mesh;
+    return triangles;
 }
 
 // --- Relaxation ---
@@ -247,11 +247,11 @@ double get_min_angle_deg(const Point& a, const Point& b, const Point& c) {
 // Helper for relax_points to calculate local min angle
 double calculate_local_min_angle(int node_idx, const Point& node_pos, 
                                  const std::vector<Point>& points, 
-                                 const std::vector<Triangle>& mesh, 
+                                 const std::vector<Triangle>& triangles, 
                                  const std::vector<int>& connected_tris) {
     double min_a = 180.0;
     for (int t_idx : connected_tris) {
-        const auto& tri = mesh[t_idx];
+        const auto& tri = triangles[t_idx];
         Point p1, p2;
         // Find the other two vertices (neighbors)
         if (tri.v0 == node_idx) { p1 = points[tri.v1]; p2 = points[tri.v2]; }
@@ -264,7 +264,7 @@ double calculate_local_min_angle(int node_idx, const Point& node_pos,
     return min_a;
 }
 
-void relax_points(std::vector<Point>& points, const std::vector<Triangle>& mesh, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
+void relax_points(std::vector<Point>& points, const std::vector<Triangle>& triangles, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
     int n = points.size();
     
     // Accumulators for Area-Weighted Centroids
@@ -274,8 +274,8 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& mesh,
     // Build adjacency map for conditional check
     std::vector<std::vector<int>> point_to_tris(n);
 
-    for (size_t k = 0; k < mesh.size(); ++k) {
-        const auto& t = mesh[k];
+    for (size_t k = 0; k < triangles.size(); ++k) {
+        const auto& t = triangles[k];
         const Point& p0 = points[t.v0];
         const Point& p1 = points[t.v1];
         const Point& p2 = points[t.v2];
@@ -315,7 +315,7 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& mesh,
             double full_dx = tx - points[i].x;
             double full_dy = ty - points[i].y;
 
-            double current_min_angle = calculate_local_min_angle(i, points[i], points, mesh, point_to_tris[i]);
+            double current_min_angle = calculate_local_min_angle(i, points[i], points, triangles, point_to_tris[i]);
             
             Point best_candidate = points[i];
             double best_angle = current_min_angle;
@@ -326,21 +326,17 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& mesh,
                 double dy = full_dy * factor;
 
                 // TEST: Boundary Projection
-                apply_boundary_constraint(points[i], dx, dy); // Note: points[i] is passed by ref but not modified here effectively for logic check, wait... 
-                // apply_boundary_constraint modifies the point passed to it if it snaps. 
+                apply_boundary_constraint(points[i], dx, dy);
                 // We need to be careful not to modify points[i] permanently yet.
                 // Let's create a temp point for the constraint check.
                 Point temp_p = points[i];
                 apply_boundary_constraint(temp_p, dx, dy); 
                 
                 Point candidate = points[i];
-                // Apply the (potentially constrained) movement
-                // Note: apply_boundary_constraint modifies 'p' to snap it, and 'dx/dy' to zero out perpendicular movement.
-                // So we should use the snapped position + the constrained delta.
                 candidate.x = temp_p.x + dx;
                 candidate.y = temp_p.y + dy;
 
-                double candidate_angle = calculate_local_min_angle(i, candidate, points, mesh, point_to_tris[i]);
+                double candidate_angle = calculate_local_min_angle(i, candidate, points, triangles, point_to_tris[i]);
 
                 // Optimization Logic:
                 // We prefer the move if it improves the angle.
@@ -348,20 +344,13 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& mesh,
                 if (candidate_angle > best_angle) {
                     best_angle = candidate_angle;
                     best_candidate = candidate;
-                  //   std::cout << "Point " << i << " improved from " << current_min_angle << " to " << candidate_angle 
-                  //             << " using factor " << factor << "\n";
                 }
             }
 
             // Apply the best move found (if any improved the state, or if we want to enforce a move)
             // Here we only move if we found a better state or if the current state is valid and the new state is also valid (smoothing).
             // But strictly following "best angle" is safest.
-            
             // However, if ALL moves make it worse, we should probably stay put (which is covered since best_candidate starts as points[i]).
-            // BUT, if the current angle is very good, and a move makes it slightly worse but still good, standard Lloyd would move.
-            // This "Hill Climbing" approach might get stuck. 
-            // Let's stick to: "Pick the factor that results in the MAX local min angle".
-            
             points[i] = best_candidate;
         }
     }
@@ -427,24 +416,24 @@ int get_owner_rank(double x, double y, int size) {
     return global_tile_id % size;
 }
 
-void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Triangle>& mesh, int rank, int size) {
+void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned, int rank, int size) {
     // 1. Vertex Load Imbalance
-    long local_owned_verts = 0;
-    for (const auto& p : cloud) {
+    long points_owned = 0;
+    for (const auto& p : points_on_owned_triangles_and_orphans) {
         if (get_owner_rank(p.x, p.y, size) == rank) {
-            local_owned_verts++;
+            points_owned++;
         }
     }
 
-    long min_verts, max_verts, sum_verts;
-    MPI_Reduce(&local_owned_verts, &min_verts, 1, MPI_LONG, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_owned_verts, &max_verts, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_owned_verts, &sum_verts, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    long min_points_owned_global, max_points_owned_global, num_points_owned_global;
+    MPI_Reduce(&points_owned, &min_points_owned_global, 1, MPI_LONG, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&points_owned, &max_points_owned_global, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&points_owned, &num_points_owned_global, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
     // 2. Triangle Statistics (Area & Angles)
-    long local_owned_tris = mesh.size();
-    long total_tris;
-    MPI_Reduce(&local_owned_tris, &total_tris, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    long num_tris_owned = triangles_owned.size();
+    long num_tris_owned_global;
+    MPI_Reduce(&num_tris_owned, &num_tris_owned_global, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
     double local_min_area = 1e30, local_max_area = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
@@ -453,10 +442,10 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
     std::vector<long> local_bins(18, 0);
     std::set<std::pair<int, int>> processed_edges;
 
-    for (const auto& t : mesh) {
-        const Point& p0 = cloud[t.v0];
-        const Point& p1 = cloud[t.v1];
-        const Point& p2 = cloud[t.v2];
+    for (const auto& t : triangles_owned) {
+        const Point& p0 = points_on_owned_triangles_and_orphans[t.v0];
+        const Point& p1 = points_on_owned_triangles_and_orphans[t.v1];
+        const Point& p2 = points_on_owned_triangles_and_orphans[t.v2];
 
         // Area
         double area = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
@@ -493,8 +482,8 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
             if (processed_edges.find({idx1, idx2}) == processed_edges.end()) {
                 processed_edges.insert({idx1, idx2});
                 
-                const Point& ep1 = cloud[idx1];
-                const Point& ep2 = cloud[idx2];
+                const Point& ep1 = points_on_owned_triangles_and_orphans[idx1];
+                const Point& ep2 = points_on_owned_triangles_and_orphans[idx2];
                 
                 // Check ownership of edge midpoint
                 double mx = (ep1.x + ep2.x) * 0.5;
@@ -518,7 +507,7 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
         }
     }
 
-    if (mesh.empty()) {
+    if (triangles_owned.empty()) {
         local_min_area = 1e30; local_max_area = -1.0;
         local_min_angle = 360.0; local_max_angle = -1.0;
     }
@@ -537,13 +526,13 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
     if (rank == 0) {
         std::cout << "\n=== Mesh Statistics ===\n";
         std::cout << "Vertices:\n";
-        std::cout << "  Total: " << sum_verts << "\n";
-        std::cout << "  Min per Rank: " << min_verts << "\n";
-        std::cout << "  Max per Rank: " << max_verts << "\n";
-        std::cout << "  Imbalance Ratio (Max/Avg): " << (double)max_verts / ((double)sum_verts / size) << "\n";
+        std::cout << "  Total: " << num_points_owned_global << "\n";
+        std::cout << "  Min per Rank: " << min_points_owned_global << "\n";
+        std::cout << "  Max per Rank: " << max_points_owned_global << "\n";
+        std::cout << "  Imbalance Ratio (Max/Avg): " << (double)max_points_owned_global / ((double)num_points_owned_global / size) << "\n";
         
         std::cout << "Triangles:\n";
-        std::cout << "  Total: " << total_tris << "\n";
+        std::cout << "  Total: " << num_tris_owned_global << "\n";
         std::cout << "  Area Min: " << global_min_area << "\n";
         std::cout << "  Area Max: " << global_max_area << "\n";
         std::cout << "  Area Ratio: " << (global_min_area > 0 ? global_max_area / global_min_area : -1.0) << "\n";
@@ -567,8 +556,8 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
 
 // --- Main Processing ---
 void process_tile(int tile_x, int tile_y, 
-                  std::vector<Point>& acc_cloud, 
-                  std::vector<Triangle>& acc_mesh, 
+                  std::vector<Point>& points_on_owned_triangles_and_orphans, 
+                  std::vector<Triangle>& triangles_owned, 
                   std::map<uint64_t, int>& id_to_idx) {
 
     int comm_rank, comm_size;
@@ -598,7 +587,7 @@ void process_tile(int tile_x, int tile_y,
     double search_min_x = t_min_x - pad; double search_max_x = t_max_x + pad;
     double search_min_y = t_min_y - pad; double search_max_y = t_max_y + pad;
 
-    std::vector<Point> cloud;
+    std::vector<Point> points_with_halos;
 
     // 1. EXPLICIT CORNERS
     // Add corners if they are in the search box.
@@ -606,22 +595,22 @@ void process_tile(int tile_x, int tile_y,
     // (0,0)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
         search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        cloud.push_back(create_stable_point(0.0, 0.0));
+        points_with_halos.push_back(create_stable_point(0.0, 0.0));
     }
     // (1,0)
     if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
         search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        cloud.push_back(create_stable_point(DOMAIN_SIZE, 0.0));
+        points_with_halos.push_back(create_stable_point(DOMAIN_SIZE, 0.0));
     }
     // (0,1)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
         search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        cloud.push_back(create_stable_point(0.0, DOMAIN_SIZE));
+        points_with_halos.push_back(create_stable_point(0.0, DOMAIN_SIZE));
     }
     // (1,1)
     if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
         search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        cloud.push_back(create_stable_point(DOMAIN_SIZE, DOMAIN_SIZE));
+        points_with_halos.push_back(create_stable_point(DOMAIN_SIZE, DOMAIN_SIZE));
     }
 
     // 2. EXPLICIT BOUNDARY GENERATION (Edges only)
@@ -634,7 +623,7 @@ void process_tile(int tile_x, int tile_y,
         int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double y = i * TARGET_EDGE_LENGTH;
-            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) cloud.push_back(create_stable_point(0.0, y));
+            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_stable_point(0.0, y));
         }
     }
     // Right (x=1)
@@ -643,7 +632,7 @@ void process_tile(int tile_x, int tile_y,
         int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double y = i * TARGET_EDGE_LENGTH;
-            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) cloud.push_back(create_stable_point(DOMAIN_SIZE, y));
+            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_stable_point(DOMAIN_SIZE, y));
         }
     }
     // Bottom (y=0)
@@ -652,7 +641,7 @@ void process_tile(int tile_x, int tile_y,
         int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double x = i * TARGET_EDGE_LENGTH;
-            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) cloud.push_back(create_stable_point(x, 0.0));
+            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_stable_point(x, 0.0));
         }
     }
     // Top (y=1)
@@ -661,12 +650,12 @@ void process_tile(int tile_x, int tile_y,
         int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double x = i * TARGET_EDGE_LENGTH;
-            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) cloud.push_back(create_stable_point(x, DOMAIN_SIZE));
+            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_stable_point(x, DOMAIN_SIZE));
         }
     }
 
     // 3. INTERIOR GENERATION (Stratified Sampling)
-    // To match the density of a hex grid (optimal for triangles), we scale the spacing.
+    // To match the density of a hex grid (optimal for triangles_owned), we scale the spacing.
     // Hex Density: 1 pt / (sqrt(3)/2 * L^2). Square Density: 1 pt / S^2.
     // S = L * sqrt(sqrt(3)/2) ~ 0.9306 * L
     double strat_spacing = TARGET_EDGE_LENGTH * 0.9306;
@@ -705,14 +694,14 @@ void process_tile(int tile_x, int tile_y,
             if (cy < exclusion) continue;
             if (cy > DOMAIN_SIZE - exclusion) continue;
 
-            // Only add point if strictly inside bounding box (handled by loop indices mostly)
-            cloud.push_back(create_stable_point(cx, cy));
+            // Only add point if strictly away from boundaries
+            points_with_halos.push_back(create_stable_point(cx, cy));
         }
     }
 
     // FIX: Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
     // This prevents Bowyer-Watson from exploding.
-    remove_duplicates(cloud);
+    remove_duplicates(points_with_halos);
 
     // 4. ANNEALING
     // We relax all points that are strictly inside the generated cloud.
@@ -728,30 +717,30 @@ void process_tile(int tile_x, int tile_y,
     double s_min_y = search_min_y + frozen_margin; 
     double s_max_y = search_max_y - frozen_margin;
 
-    std::vector<Triangle> mesh;
+    std::vector<Triangle> triangles_with_halos;
     double current_jitter = START_JITTER;
 
     for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
-        apply_jitter(cloud, current_jitter, iter);
-        mesh = triangulation(cloud);
-        relax_points(cloud, mesh, s_min_x, s_min_y, s_max_x, s_max_y);
+        apply_jitter(points_with_halos, current_jitter, iter);
+        triangles_with_halos = triangulation(points_with_halos);
+        relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
     }
     // Final Polish
     for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
-        mesh = triangulation(cloud);
-        relax_points(cloud, mesh, s_min_x, s_min_y, s_max_x, s_max_y);
+        triangles_with_halos = triangulation(points_with_halos);
+        relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
     }
     
     // Final Emit
-    mesh = triangulation(cloud);
+    triangles_with_halos = triangulation(points_with_halos);
     
     // MERGE INTO ACCUMULATOR
     // We only keep triangles that are geometrically "owned" by this tile to avoid duplication
     // when a rank owns adjacent tiles.
-    for (const auto& tri : mesh) {
-        const Point& p0 = cloud[tri.v0];
-        const Point& p1 = cloud[tri.v1];
-        const Point& p2 = cloud[tri.v2];
+    for (const auto& tri : triangles_with_halos) {
+        const Point& p0 = points_with_halos[tri.v0];
+        const Point& p1 = points_with_halos[tri.v1];
+        const Point& p2 = points_with_halos[tri.v2];
 
         // Robust Ownership Rule:
         // A triangle is owned by the rank that owns the triangle's "lowest" vertex.
@@ -779,13 +768,13 @@ void process_tile(int tile_x, int tile_y,
             for(int k=0; k<3; ++k) {
                 uint64_t pid = pts[k]->id;
                 if (id_to_idx.find(pid) == id_to_idx.end()) {
-                    int new_idx = acc_cloud.size();
-                    acc_cloud.push_back(*pts[k]);
+                    int new_idx = points_on_owned_triangles_and_orphans.size();
+                    points_on_owned_triangles_and_orphans.push_back(*pts[k]);
                     id_to_idx[pid] = new_idx;
                 }
                 *v_idx[k] = id_to_idx[pid];
             }
-            acc_mesh.push_back(new_t);
+            triangles_owned.push_back(new_t);
         }
     }
 
@@ -793,42 +782,42 @@ void process_tile(int tile_x, int tile_y,
     // It is possible to own a vertex spatially (it's in our tile) but NOT own any of the 
     // triangles connected to it (due to the min_id rule giving them to neighbors).
     // We must still track this vertex so we can assign it a Global ID and answer requests.
-    for (const auto& p : cloud) {
+    for (const auto& p : points_with_halos) {
         if (get_owner_rank(p.x, p.y, comm_size) == comm_rank) {
              uint64_t pid = p.id;
              if (id_to_idx.find(pid) == id_to_idx.end()) {
-                 int new_idx = acc_cloud.size();
-                 acc_cloud.push_back(p);
+                 int new_idx = points_on_owned_triangles_and_orphans.size();
+                 points_on_owned_triangles_and_orphans.push_back(p);
                  id_to_idx[pid] = new_idx;
              }
         }
     }
 }
 
-DM CreateDistributedDM(const std::vector<Point>& cloud, const std::vector<Triangle>& mesh) {
+DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
     int comm_rank, comm_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
-    PetscInt num_local_pts = cloud.size();
-    std::vector<PetscInt> global_ids(num_local_pts, -1);
-    PetscInt num_owned = 0;
+    PetscInt num_points_on_owned_triangles_and_orphans = points_on_owned_triangles_and_orphans.size();
+    std::vector<PetscInt> global_ids(num_points_on_owned_triangles_and_orphans, -1);
+    PetscInt num_points_owned = 0;
 
     // 1. Identify Owned Vertices
-    for (int i = 0; i < num_local_pts; ++i) {
-        if (get_owner_rank(cloud[i].x, cloud[i].y, comm_size) == comm_rank) {
-            num_owned++;
+    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+            num_points_owned++;
         }
     }
 
     // 2. Calculate Global Offsets - petscint to ensure large counts work
     PetscInt start_id = 0;
-    MPI_Exscan(&num_owned, &start_id, 1, MPIU_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Exscan(&num_points_owned, &start_id, 1, MPIU_INT, MPI_SUM, MPI_COMM_WORLD);
 
     // 3. Assign Global IDs to Owned Vertices
     PetscInt current_id = start_id;
-    for (int i = 0; i < num_local_pts; ++i) {
-        if (get_owner_rank(cloud[i].x, cloud[i].y, comm_size) == comm_rank) {
+    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
             global_ids[i] = current_id++;
         }
     }
@@ -838,10 +827,10 @@ DM CreateDistributedDM(const std::vector<Point>& cloud, const std::vector<Triang
     std::vector<std::vector<uint64_t>> send_ids(comm_size);
     std::vector<std::vector<int>>      send_req_indices(comm_size); // Map back to local index
 
-    for (int i = 0; i < num_local_pts; ++i) {
+    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
         if (global_ids[i] == -1) {
-            int owner = get_owner_rank(cloud[i].x, cloud[i].y, comm_size);
-            send_ids[owner].push_back(cloud[i].id);
+            int owner = get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size);
+            send_ids[owner].push_back(points_on_owned_triangles_and_orphans[i].id);
             send_req_indices[owner].push_back(i);
         }
     }
@@ -873,9 +862,9 @@ DM CreateDistributedDM(const std::vector<Point>& cloud, const std::vector<Triang
     // Process Incoming Requests
     // We need a map for fast lookup of OUR owned points
     std::map<uint64_t, PetscInt> my_owned_map;
-    for(int i=0; i<num_local_pts; ++i) {
-        if (get_owner_rank(cloud[i].x, cloud[i].y, comm_size) == comm_rank) {
-            my_owned_map[cloud[i].id] = global_ids[i];
+    for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+            my_owned_map[points_on_owned_triangles_and_orphans[i].id] = global_ids[i];
         }
     }
 
@@ -910,26 +899,26 @@ DM CreateDistributedDM(const std::vector<Point>& cloud, const std::vector<Triang
     }
 
     // 5. Build DMPlex
-    PetscInt num_cells = mesh.size();
-    std::vector<PetscInt> cells(num_cells * 3);
-    for(int i=0; i<num_cells; ++i) {
-        cells[i*3 + 0] = global_ids[mesh[i].v0];
-        cells[i*3 + 1] = global_ids[mesh[i].v1];
-        cells[i*3 + 2] = global_ids[mesh[i].v2];
+    PetscInt num_tris_owned = triangles_owned.size();
+    std::vector<PetscInt> cells(num_tris_owned * 3);
+    for(int i=0; i<num_tris_owned; ++i) {
+        cells[i*3 + 0] = global_ids[triangles_owned[i].v0];
+        cells[i*3 + 1] = global_ids[triangles_owned[i].v1];
+        cells[i*3 + 2] = global_ids[triangles_owned[i].v2];
     }
 
     // Prepare coordinates for DMPlexCreateFromCellListParallelPetsc
     // FIX: Only pass OWNED points to PETSc. 
-    // acc_cloud contains ghosts (vertices of owned triangles that are owned by neighbors).
+    // points_on_owned_triangles_and_orphans contains ghosts (vertices of owned triangles that are owned by neighbors).
     // PETSc expects 'numPoints' to be the count of locally owned vertices, 
-    // and 'coords' to be the coordinates of those specific vertices in Global ID order.
-    std::vector<PetscReal> owned_coords;
-    owned_coords.reserve(num_owned * 2);
+    // and 'coords' to be the coordinates of those specific vertices
+    std::vector<PetscReal> coords_points_owned;
+    coords_points_owned.reserve(num_points_owned * 2);
     
-    for(int i=0; i<num_local_pts; ++i) {
-        if (get_owner_rank(cloud[i].x, cloud[i].y, comm_size) == comm_rank) {
-            owned_coords.push_back(cloud[i].x);
-            owned_coords.push_back(cloud[i].y);
+    for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+            coords_points_owned.push_back(points_on_owned_triangles_and_orphans[i].x);
+            coords_points_owned.push_back(points_on_owned_triangles_and_orphans[i].y);
         }
     }
 
@@ -937,9 +926,9 @@ DM CreateDistributedDM(const std::vector<Point>& cloud, const std::vector<Triang
     // Build the DM
     PetscInt two = 2;
     PetscInt three = 3;
-    // Pass num_owned instead of num_local_pts, and owned_coords instead of coords
-    (void*)DMPlexCreateFromCellListParallelPetsc(MPI_COMM_WORLD, two, num_cells, num_owned, PETSC_DECIDE, \
-         three, PETSC_TRUE, cells.data(), two, owned_coords.data(), NULL, NULL, &dm);
+    // Pass num_points_owned instead of num_points_on_owned_triangles_and_orphans, and coords_points_owned instead of coords
+    (void*)DMPlexCreateFromCellListParallelPetsc(MPI_COMM_WORLD, two, num_tris_owned, num_points_owned, PETSC_DECIDE, \
+         three, PETSC_TRUE, cells.data(), two, coords_points_owned.data(), NULL, NULL, &dm);
     return dm;
 }
 
@@ -979,8 +968,8 @@ int main(int argc, char** argv) {
         std::cout << "Running on " << comm_size << " MPI ranks for " << TILE_DIM << "x" << TILE_DIM << " tiles.\n";
     }
 
-    std::vector<Point> rank_cloud;
-    std::vector<Triangle> rank_mesh;
+    std::vector<Point> points_on_owned_triangles_and_orphans;
+    std::vector<Triangle> triangles_owned;
     std::map<uint64_t, int> id_map;
 
     // Distribute tiles cyclically among ranks
@@ -989,16 +978,16 @@ int main(int argc, char** argv) {
             int global_id = y * TILE_DIM + x;
             
             if (global_id % comm_size == comm_rank) {
-                process_tile(x, y, rank_cloud, rank_mesh, id_map);
+                process_tile(x, y, points_on_owned_triangles_and_orphans, triangles_owned, id_map);
             }
         }
     }
 
-    std::cout << "Rank " << comm_rank << " generated " << rank_mesh.size() << " triangles.\n";
+    std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
-    ComputeAndPrintStats(rank_cloud, rank_mesh, comm_rank, comm_size);
+    ComputeAndPrintStats(points_on_owned_triangles_and_orphans, triangles_owned, comm_rank, comm_size);
 
-    DM dm = CreateDistributedDM(rank_cloud, rank_mesh);
+    DM dm = CreateDistributedDM(points_on_owned_triangles_and_orphans, triangles_owned);
     PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
     
     if (WRITE_MESH) {
@@ -1015,8 +1004,8 @@ int main(int argc, char** argv) {
         PetscCall(PetscViewerDestroy(&viewer));
     }
 
-    rank_cloud.clear();
-    rank_mesh.clear();
+    points_on_owned_triangles_and_orphans.clear();
+    triangles_owned.clear();
     id_map.clear();
 
     PetscCall(DMDestroy(&dm));
