@@ -1065,7 +1065,7 @@ int main(int argc, char** argv) {
 
     ComputeAndPrintStats(points_on_owned_triangles_and_orphans, triangles_owned, comm_rank, comm_size);
 
-   if (comm_rank == 0) std::cout << "Creating DM...\n";
+    if (comm_rank == 0) std::cout << "Creating DM...\n";
     DM dm = CreateDM(points_on_owned_triangles_and_orphans, triangles_owned);
     PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
     
