@@ -18,7 +18,7 @@
 #include <triangle.h>
 
 // =========================================================
-// JITTER + LLOYD SMOOTH MESH GENERATOR FOR [0,DOMAIN_SIZE]^2 WITH FIXED BOUNDARIES
+// JITTER + LLOYD SMOOTH MESH GENERATOR FOR [0,DOMAIN_SIZE]^2
 // =========================================================
 // 
 // Strategy:
@@ -384,11 +384,12 @@ Point create_stable_point(double x, double y) {
 void remove_duplicates(std::vector<Point>& points) {
     if (points.empty()) return;
 
-    // Sort to bring duplicates together
+    // FIX: Use strict lexicographical sort. 
+    // Using tolerance in sort comparator violates Strict Weak Ordering and causes non-deterministic behavior.
     std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
-        // Use robust tolerance for sorting check
-        if (std::abs(a.x - b.x) > TOL_LEN) return a.x < b.x;
-        return a.y < b.y;
+        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y) return a.y < b.y;
+        return a.id < b.id; // Tie-breaker for absolute stability
     });
 
     std::vector<Point> unique_points;
@@ -398,6 +399,8 @@ void remove_duplicates(std::vector<Point>& points) {
     for (size_t i = 1; i < points.size(); ++i) {
         const Point& prev = unique_points.back();
         const Point& curr = points[i];
+        
+        // Check distance with tolerance
         double dist_sq = (prev.x - curr.x)*(prev.x - curr.x) + (prev.y - curr.y)*(prev.y - curr.y);
         
         // Only keep if distance is physically significant relative to mesh size
@@ -429,6 +432,10 @@ void process_tile(int tile_x, int tile_y,
                   std::vector<Point>& acc_cloud, 
                   std::vector<Triangle>& acc_mesh, 
                   std::map<uint64_t, int>& id_to_idx) {
+
+    int comm_rank, comm_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);                     
 
     double tile_s = DOMAIN_SIZE / TILE_DIM;
     double t_min_x = tile_x * tile_s; double t_max_x = (tile_x + 1) * tile_s;
@@ -591,11 +598,25 @@ void process_tile(int tile_x, int tile_y,
         const Point& p0 = cloud[tri.v0];
         const Point& p1 = cloud[tri.v1];
         const Point& p2 = cloud[tri.v2];
-        double cx = (p0.x+p1.x+p2.x)/3.0; 
-        double cy = (p0.y+p1.y+p2.y)/3.0;
 
-        // Strict ownership check for the triangle
-        if (cx >= t_min_x && cx < t_max_x && cy >= t_min_y && cy < t_max_y) {
+        // Robust Ownership Rule:
+        // A triangle is owned by the rank that owns the triangle's "lowest" vertex.
+        // We define "lowest" using the stable ID to ensure all ranks agree.
+        // If multiple vertices are on the same rank, that rank definitely owns it.
+        // If vertices are on different ranks, the one with the smallest ID decides.
+        
+        uint64_t min_id = std::min({p0.id, p1.id, p2.id});
+        
+        // Find which point has this ID
+        const Point* min_p = &p0;
+        if (p1.id == min_id) min_p = &p1;
+        if (p2.id == min_id) min_p = &p2;
+
+        // Check if WE own this determining vertex
+        // Note: We use the global 'get_owner_rank' function which is purely spatial and deterministic.
+        int owner = get_owner_rank(min_p->x, min_p->y, comm_size);
+
+        if (owner == comm_rank) {
             Triangle new_t;
             Point* pts[3] = { (Point*)&p0, (Point*)&p1, (Point*)&p2 };
             int*   v_idx[3] = { &new_t.v0, &new_t.v1, &new_t.v2 };
