@@ -871,11 +871,11 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
 // Label boundary faces and vertices based on geometric location
 void LabelBoundaries(DM dm) {
 
-    // Create a label named "marker" (standard name for boundary markers)
+    // Create a label named "Face Sets" (standard name for boundary markers)
     // Values: 1=Bottom, 2=Right, 3=Top, 4=Left
-    PetscCallVoid(DMCreateLabel(dm, "marker"));
+    PetscCallVoid(DMCreateLabel(dm, "Face Sets"));
     DMLabel label;
-    PetscCallVoid(DMGetLabel(dm, "marker", &label));
+    PetscCallVoid(DMGetLabel(dm, "Face Sets", &label));
     
     // Get coordinates
     Vec coordsVec;
@@ -910,6 +910,9 @@ void LabelBoundaries(DM dm) {
         }
     }
     
+    PetscCallVoid(DMCreateLabel(dm, "markers"));
+    PetscCallVoid(DMGetLabel(dm, "markers", &label));
+
     // 2. Label Edges (Depth 1 in 2D)
     PetscInt eStart, eEnd;
     PetscCallVoid(DMPlexGetDepthStratum(dm, 1, &eStart, &eEnd));
