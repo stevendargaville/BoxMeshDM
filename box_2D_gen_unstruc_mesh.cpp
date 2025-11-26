@@ -29,7 +29,7 @@
 // =========================================================
 int TILE_DIM = -1;
 const double DOMAIN_SIZE = 1.0;
-const double TARGET_EDGE_LENGTH = 0.0025; 
+const double TARGET_EDGE_LENGTH = 0.001; 
 
 // We need these to be relative to edge length to support very fine meshes (e.g. 10^-6 spacing)
 const double TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
@@ -424,6 +424,89 @@ int get_owner_rank(double x, double y, int size) {
 
     int global_tile_id = ty * TILE_DIM + tx;
     return global_tile_id % size;
+}
+
+void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Triangle>& mesh, int rank, int size) {
+    // 1. Vertex Load Imbalance
+    long local_owned_verts = 0;
+    for (const auto& p : cloud) {
+        if (get_owner_rank(p.x, p.y, size) == rank) {
+            local_owned_verts++;
+        }
+    }
+
+    long min_verts, max_verts, sum_verts;
+    MPI_Reduce(&local_owned_verts, &min_verts, 1, MPI_LONG, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_owned_verts, &max_verts, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_owned_verts, &sum_verts, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    // 2. Triangle Statistics (Area & Angles)
+    long local_owned_tris = mesh.size();
+    long total_tris;
+    MPI_Reduce(&local_owned_tris, &total_tris, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    double local_min_area = 1e30, local_max_area = -1.0;
+    double local_min_angle = 360.0, local_max_angle = -1.0;
+
+    for (const auto& t : mesh) {
+        const Point& p0 = cloud[t.v0];
+        const Point& p1 = cloud[t.v1];
+        const Point& p2 = cloud[t.v2];
+
+        // Area
+        double area = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
+        if (area < local_min_area) local_min_area = area;
+        if (area > local_max_area) local_max_area = area;
+
+        // Angles
+        double d01_sq = std::pow(p1.x-p0.x, 2) + std::pow(p1.y-p0.y, 2);
+        double d12_sq = std::pow(p2.x-p1.x, 2) + std::pow(p2.y-p1.y, 2);
+        double d20_sq = std::pow(p0.x-p2.x, 2) + std::pow(p0.y-p2.y, 2);
+        
+        double d01 = std::sqrt(d01_sq);
+        double d12 = std::sqrt(d12_sq);
+        double d20 = std::sqrt(d20_sq);
+
+        if (d01 > 1e-14 && d12 > 1e-14 && d20 > 1e-14) {
+            double a0 = std::acos(clamp_val((d01_sq + d20_sq - d12_sq) / (2.0*d01*d20))) * 180.0 / 3.14159265358979323846;
+            double a1 = std::acos(clamp_val((d01_sq + d12_sq - d20_sq) / (2.0*d01*d12))) * 180.0 / 3.14159265358979323846;
+            double a2 = std::acos(clamp_val((d12_sq + d20_sq - d01_sq) / (2.0*d12*d20))) * 180.0 / 3.14159265358979323846;
+
+            local_min_angle = std::min({local_min_angle, a0, a1, a2});
+            local_max_angle = std::max({local_max_angle, a0, a1, a2});
+        }
+    }
+
+    if (mesh.empty()) {
+        local_min_area = 1e30; local_max_area = -1.0;
+        local_min_angle = 360.0; local_max_angle = -1.0;
+    }
+
+    double global_min_area, global_max_area;
+    double global_min_angle, global_max_angle;
+
+    MPI_Reduce(&local_min_area, &global_min_area, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_max_area, &global_max_area, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_min_angle, &global_min_angle, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_max_angle, &global_max_angle, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        std::cout << "\n=== Mesh Statistics ===\n";
+        std::cout << "Vertices:\n";
+        std::cout << "  Total: " << sum_verts << "\n";
+        std::cout << "  Min per Rank: " << min_verts << "\n";
+        std::cout << "  Max per Rank: " << max_verts << "\n";
+        std::cout << "  Imbalance Ratio (Max/Avg): " << (double)max_verts / ((double)sum_verts / size) << "\n";
+        
+        std::cout << "Triangles:\n";
+        std::cout << "  Total: " << total_tris << "\n";
+        std::cout << "  Area Min: " << global_min_area << "\n";
+        std::cout << "  Area Max: " << global_max_area << "\n";
+        std::cout << "  Area Ratio: " << (global_min_area > 0 ? global_max_area / global_min_area : -1.0) << "\n";
+        std::cout << "  Angle Min: " << global_min_angle << " deg\n";
+        std::cout << "  Angle Max: " << global_max_angle << " deg\n";
+        std::cout << "=======================\n";
+    }
 }
 
 // --- Main Processing ---
@@ -830,6 +913,8 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Rank " << comm_rank << " generated " << rank_mesh.size() << " triangles.\n";
+
+    ComputeAndPrintStats(rank_cloud, rank_mesh, comm_rank, comm_size);
 
     DM dm = CreateDistributedDM(rank_cloud, rank_mesh);
     PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
