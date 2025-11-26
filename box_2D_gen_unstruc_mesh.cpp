@@ -734,23 +734,42 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
     for(int r=0; r<comm_size; ++r) send_counts[r] = send_ids[r].size();
     MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
 
-    // Prepare Receive Buffers
+    // ---------------------------------------------------------
+    // PHASE 1: Exchange Hash IDs (Requests)
+    // ---------------------------------------------------------
     std::vector<std::vector<uint64_t>> recv_ids(comm_size);
-    std::vector<std::vector<PetscInt>> send_answers(comm_size);
-    // Preallocate the space for the receives
+    std::vector<MPI_Request> requests;
+    requests.reserve(comm_size * 2);
+
+    // 1. Post Receives for incoming requests
     for(int r=0; r<comm_size; ++r) {
         if(recv_counts[r] > 0) {
             recv_ids[r].resize(recv_counts[r]);
+            MPI_Request req;
+            MPI_Irecv(recv_ids[r].data(), recv_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD, &req);
+            requests.push_back(req);
         }
     }
 
-    // Send the unique hash id of points that we require
+    // 2. Post Sends for our requests
     for(int r=0; r<comm_size; ++r) {
         if (r == comm_rank) continue;
         if (send_counts[r] > 0) {
-            MPI_Send(send_ids[r].data(), send_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD);
+            MPI_Request req;
+            MPI_Isend(send_ids[r].data(), send_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD, &req);
+            requests.push_back(req);
         }
     }
+
+    // 3. Wait for Phase 1 to complete
+    if (!requests.empty()) {
+        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    }
+    requests.clear();
+
+    // ---------------------------------------------------------
+    // PROCESSING: Lookup Global IDs
+    // ---------------------------------------------------------
     
     // We need a map for fast lookup between the unique hash id and the global id
     std::map<uint64_t, PetscInt> points_owned_l2g_map;
@@ -760,36 +779,55 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
         }
     }
 
-    // Receive Requests and Send Answers
+    std::vector<std::vector<PetscInt>> send_answers(comm_size);
     for(int r=0; r<comm_size; ++r) {
-        if (r == comm_rank) continue;
         if (recv_counts[r] > 0) {
-            MPI_Status status;
-            // Receive the local ID's we have to identify
-            MPI_Recv(recv_ids[r].data(), recv_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD, &status);
-            
-            // Work out the global ID's of the points we just received
             send_answers[r].resize(recv_counts[r]);
             for(int k=0; k<recv_counts[r]; ++k) {
                 send_answers[r][k] = points_owned_l2g_map[recv_ids[r][k]];
             }
-            // Send the global id's back
-            MPI_Send(send_answers[r].data(), recv_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD);
         }
     }
 
-    // Receive Answers
+    // ---------------------------------------------------------
+    // PHASE 2: Exchange Global IDs (Answers)
+    // ---------------------------------------------------------
+    std::vector<std::vector<PetscInt>> recv_answers(comm_size);
+
+    // 1. Post Receives for answers to our requests
+    // We expect 'send_counts[r]' answers from rank r
     for(int r=0; r<comm_size; ++r) {
         if (r == comm_rank) continue;
         if (send_counts[r] > 0) {
-            std::vector<PetscInt> answers(send_counts[r]);
-            MPI_Status status;
-            // Receive the global id's of points we need
-            MPI_Recv(answers.data(), send_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD, &status);
-            
+            recv_answers[r].resize(send_counts[r]);
+            MPI_Request req;
+            MPI_Irecv(recv_answers[r].data(), send_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD, &req);
+            requests.push_back(req);
+        }
+    }
+
+    // 2. Post Sends for answers we generated
+    for(int r=0; r<comm_size; ++r) {
+        if (recv_counts[r] > 0) {
+            MPI_Request req;
+            MPI_Isend(send_answers[r].data(), recv_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD, &req);
+            requests.push_back(req);
+        }
+    }
+
+    // 3. Wait for Phase 2 to complete
+    if (!requests.empty()) {
+        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    }
+
+    // ---------------------------------------------------------
+    // FINALIZE: Update the global ids
+    // ---------------------------------------------------------
+    for(int r=0; r<comm_size; ++r) {
+        if (send_counts[r] > 0) {
             for(int k=0; k<send_counts[r]; ++k) {
                 int local_idx = send_req_indices[r][k];
-                global_ids[local_idx] = answers[k];
+                global_ids[local_idx] = recv_answers[r][k];
             }
         }
     }
@@ -1027,6 +1065,7 @@ int main(int argc, char** argv) {
 
     ComputeAndPrintStats(points_on_owned_triangles_and_orphans, triangles_owned, comm_rank, comm_size);
 
+   if (comm_rank == 0) std::cout << "Creating DM...\n";
     DM dm = CreateDM(points_on_owned_triangles_and_orphans, triangles_owned);
     PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
     
