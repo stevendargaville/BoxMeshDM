@@ -868,6 +868,93 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
 
 // ~~~~~~~~~~~~~~~~~
 
+// Label boundary faces and vertices based on geometric location
+void LabelBoundaries(DM dm) {
+
+    // Create a label named "marker" (standard name for boundary markers)
+    // Values: 1=Bottom, 2=Right, 3=Top, 4=Left
+    PetscCallVoid(DMCreateLabel(dm, "marker"));
+    DMLabel label;
+    PetscCallVoid(DMGetLabel(dm, "marker", &label));
+    
+    // Get coordinates
+    Vec coordsVec;
+    PetscCallVoid(DMGetCoordinatesLocal(dm, &coordsVec));
+    PetscSection coordSection;
+    PetscCallVoid(DMGetCoordinateSection(dm, &coordSection));
+
+    const PetscScalar *coords;
+    PetscCallVoid(VecGetArrayRead(coordsVec, &coords));
+    
+    // 1. Label Vertices (Depth 0)
+    PetscInt vStart, vEnd;
+    PetscCallVoid(DMPlexGetDepthStratum(dm, 0, &vStart, &vEnd));
+    
+    for (PetscInt v = vStart; v < vEnd; ++v) {
+        PetscInt dof;
+        PetscCallVoid(PetscSectionGetDof(coordSection, v, &dof));
+        if (dof > 0) {
+            PetscInt off;
+            PetscCallVoid(PetscSectionGetOffset(coordSection, v, &off));
+            double x = coords[off];
+            double y = coords[off+1];
+            
+            PetscInt val = 0;
+            // Priority for corners: Bottom > Right > Top > Left
+            if (std::abs(y) < EPSILON) val = 1;              // Bottom
+            else if (std::abs(x - DOMAIN_SIZE) < EPSILON) val = 2; // Right
+            else if (std::abs(y - DOMAIN_SIZE) < EPSILON) val = 3; // Top
+            else if (std::abs(x) < EPSILON) val = 4;         // Left
+
+            if (val != 0) PetscCallVoid(DMLabelSetValue(label, v, val));
+        }
+    }
+    
+    // 2. Label Edges (Depth 1 in 2D)
+    PetscInt eStart, eEnd;
+    PetscCallVoid(DMPlexGetDepthStratum(dm, 1, &eStart, &eEnd));
+    
+    for (PetscInt e = eStart; e < eEnd; ++e) {
+        PetscInt num_points;
+        const PetscInt *points;
+        PetscCallVoid(DMPlexGetConeSize(dm, e, &num_points));
+        PetscCallVoid(DMPlexGetCone(dm, e, &points));
+        
+        // Compute centroid of edge to determine boundary
+        double cx = 0, cy = 0;
+        int count = 0;
+        
+        for(int i=0; i<num_points; ++i) {
+            PetscInt v = points[i];
+            PetscInt off, dof;
+            PetscCallVoid(PetscSectionGetDof(coordSection, v, &dof));
+            if (dof > 0) {
+                PetscCallVoid(PetscSectionGetOffset(coordSection, v, &off));
+                cx += coords[off];
+                cy += coords[off+1];
+                count++;
+            }
+        }
+        
+        if (count > 0) {
+            cx /= count;
+            cy /= count;
+            
+            PetscInt val = 0;
+            if (std::abs(cy) < EPSILON) val = 1;              // Bottom
+            else if (std::abs(cx - DOMAIN_SIZE) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - DOMAIN_SIZE) < EPSILON) val = 3; // Top
+            else if (std::abs(cx) < EPSILON) val = 4;         // Left
+
+            if (val != 0) PetscCallVoid(DMLabelSetValue(label, e, val));
+        }
+    }
+
+    PetscCallVoid(VecRestoreArrayRead(coordsVec, &coords));
+}
+
+// ~~~~~~~~~~~~~~~~~
+
 // Print mesh statistics on rank 0
 void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned, int rank, int size) {
 
@@ -1063,12 +1150,17 @@ int main(int argc, char** argv) {
 
     std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
+    // Print stats about the mesh
     ComputeAndPrintStats(points_on_owned_triangles_and_orphans, triangles_owned, comm_rank, comm_size);
 
+    // Create the DM
     if (comm_rank == 0) std::cout << "Creating DM...\n";
     DM dm = CreateDM(points_on_owned_triangles_and_orphans, triangles_owned);
     PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
     
+    // Label boundaries
+    LabelBoundaries(dm);
+
     if (WRITE_MESH) {
         PetscViewer viewer;
         // Can view this in paraview with:
