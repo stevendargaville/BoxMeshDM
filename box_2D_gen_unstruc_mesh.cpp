@@ -23,19 +23,19 @@
 // =========================================================
 // 
 // Strategy:
-// 1. Boundary Gen: Create points explicitly on [0,DOMAIN_SIZE]^2 edges.
-// 2. Interior Gen: Create Hex Grid points, REJECTING those near edges.
-// 3. Annealing: Jitter -> Smooth loop.
+// 1. Boundary Gen: Create points explicitly on [0,DOMAIN_SIZE]^2 boundaries.
+// 2. Interior Gen: Create random points inside small squares, REJECTING those near boundaries.
+// 3. Iterate: jitter -> triangulate -> smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
 // =========================================================
 int TILE_DIM = -1;
 const double DOMAIN_SIZE = 1.0;
-const double TARGET_EDGE_LENGTH = 0.0025; 
+double TARGET_EDGE_LENGTH = 0.0025; // Default value
 
 // We need these to be relative to edge length to support very fine meshes (e.g. 10^-6 spacing)
-const double TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
-const double TOL_LEN_SQ = TOL_LEN * TOL_LEN;
-const double TOL_AREA = TOL_LEN_SQ * 1e-2;
+double TOL_LEN;
+double TOL_LEN_SQ;
+double TOL_AREA;
 
 const double EPSILON = 1e-13;     
 const double START_JITTER = 0.30;
@@ -947,6 +947,18 @@ int main(int argc, char** argv) {
 
     PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
 
+    // Parse command line options
+    PetscBool set;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &TARGET_EDGE_LENGTH, &set));
+
+    PetscBool WRITE_MESH = PETSC_FALSE;
+    PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &WRITE_MESH, NULL));
+
+    // Initialize dependent variables
+    TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
+    TOL_LEN_SQ = TOL_LEN * TOL_LEN;
+    TOL_AREA = TOL_LEN_SQ * 1e-2;
+
     int comm_rank, comm_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
@@ -963,6 +975,7 @@ int main(int argc, char** argv) {
 
     if (comm_rank == 0) {
         std::cout << "Generating Unstructured Mesh of 2D box...\n";
+        std::cout << "Target Edge Length: " << TARGET_EDGE_LENGTH << "\n";
         std::cout << "Running on " << comm_size << " MPI ranks for " << TILE_DIM << "x" << TILE_DIM << " tiles.\n";
     }
 
@@ -987,14 +1000,20 @@ int main(int argc, char** argv) {
 
     DM dm = CreateDistributedDM(rank_cloud, rank_mesh);
     PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
-    PetscViewer viewer;
-    // Can view this in paraview with:
-    // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
-    // then using the XDMF reader
-    // paraview box_mesh.xmf
-    PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
-    PetscCall(DMView(dm, viewer));
-    PetscCall(PetscViewerDestroy(&viewer));
+    
+    if (WRITE_MESH) {
+        PetscViewer viewer;
+        // Can view this in paraview with:
+        // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
+        // then using the XDMF reader
+        // paraview box_mesh.xmf
+        if (comm_rank == 0) {
+            std::cout << "Writing out mesh...\n";        
+        }
+        PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
+        PetscCall(DMView(dm, viewer));
+        PetscCall(PetscViewerDestroy(&viewer));
+    }
 
     rank_cloud.clear();
     rank_mesh.clear();
