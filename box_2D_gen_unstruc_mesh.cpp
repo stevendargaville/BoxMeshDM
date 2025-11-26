@@ -19,7 +19,8 @@
 #include <triangle.h>
 
 // =========================================================
-// JITTER + LLOYD SMOOTH MESH GENERATOR FOR [0,DOMAIN_SIZE]^2
+// Unstructured mesh generator for 2D box
+// Builds a PETSc DMPlex
 // =========================================================
 // 
 // Strategy:
@@ -28,28 +29,46 @@
 // 3. Iterate: jitter -> triangulate -> smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
 // =========================================================
+
 int TILE_DIM = -1;
 const double DOMAIN_SIZE = 1.0;
-double TARGET_EDGE_LENGTH = 0.0025; // Default value
+double TARGET_EDGE_LENGTH = 0.0025; // Default value - can be overriden by command line
 
-// We need these to be relative to edge length to support very fine meshes (e.g. 10^-6 spacing)
+// We need these to be relative to edge length to support very fine meshes
 double TOL_LEN;
 double TOL_LEN_SQ;
 double TOL_AREA;
 
 const double EPSILON = 1e-13;     
 const double START_JITTER = 0.30;
+// This is the goal, it isn't necessarily achieved
 double MIN_ANGLE_THRESHOLD = 30.0;
 
+// Jitter + smooth iterations first
 const int ANNEAL_ITERS = 3; 
+// Then just smooth iterations
 const int FINAL_SMOOTH_ITERS = 2;
 
+// ~~~~~~~~~~~~~~~~~
+
 struct Point {
-    double x, y;
-    uint64_t id = 0; // Added for deterministic jitter
+    double x, y; // coordinates
+    uint64_t id = 0; // unique id based on hashing coordinates
 };
+struct Triangle {
+    int v0, v1, v2;
+};
+struct Edge {
+    int v0, v1;
+    bool operator==(const Edge& o) const { return (v0 == o.v0 && v1 == o.v1) || (v0 == o.v1 && v1 == o.v0); }
+};
+// Stateless random
+struct RngState { uint64_t s; };
+
+// ~~~~~~~~~~~~~~~~~
 
 // Taken from PETSc in src/dm/impls/plex/generators/triangle/trigenerate.c
+// to interface with Triangle library
 static void InitInput_Triangle(struct triangulateio *inputCtx)
 {
   inputCtx->numberofpoints             = 0;
@@ -97,9 +116,27 @@ static void FiniOutput_Triangle(struct triangulateio *outputCtx)
   free(outputCtx->neighborlist);
 }
 
-// --- Boundary Logic ---
+// ~~~~~~~~~~~~~~~~~
 
-// Returns true if p is on a boundary.
+// Helper to determine which rank owns a point based on spatial location
+int get_owner_rank(double x, double y, int size) {
+    double tile_s = DOMAIN_SIZE / TILE_DIM;
+    int tx = std::floor(x / tile_s);
+    int ty = std::floor(y / tile_s);
+    
+    // Clamp to handle numerical noise at upper boundaries
+    if (tx < 0) tx = 0; 
+    if (tx >= TILE_DIM) tx = TILE_DIM - 1;
+    if (ty < 0) ty = 0; 
+    if (ty >= TILE_DIM) ty = TILE_DIM - 1;
+
+    int global_tile_id = ty * TILE_DIM + tx;
+    return global_tile_id % size;
+}
+
+// ~~~~~~~~~~~~~~~~~
+
+// Returns true if point is on a boundary.
 // Modifies dx, dy to ensure movement is only tangential (sliding).
 bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
     bool on_boundary = false;
@@ -129,23 +166,20 @@ bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
     return on_boundary;
 }
 
-struct Triangle {
-    int v0, v1, v2;
-};
+// Helper for boundary check
+bool is_on_boundary(const Point& p) {
+    return p.x < EPSILON || p.x > 1.0-EPSILON || p.y < EPSILON || p.y > 1.0-EPSILON;
+}
 
-struct Edge {
-    int v0, v1;
-    bool operator==(const Edge& o) const { return (v0 == o.v0 && v1 == o.v1) || (v0 == o.v1 && v1 == o.v0); }
-};
+// ~~~~~~~~~~~~~~~~~
 
-// --- Stateless Random ---
-struct RngState { uint64_t s; };
 uint64_t splitmix64(uint64_t& x) {
     uint64_t z = (x += 0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
     z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
     return z ^ (z >> 31);
 }
+
 double next_double(RngState& state) {
     return (splitmix64(state.s) >> 11) * (1.0 / 9007199254740992.0);
 }
@@ -157,10 +191,20 @@ void hash_combine(uint64_t& h, double v) {
     h ^= c.u + 0x9e3779b9 + (h << 6) + (h >> 2);
 }
 
-// --- Jitter ---
+// Helper to create a point with a unique hash ID based on initial position
+Point create_point_with_unique_hash_id(double x, double y) {
+    uint64_t h = 0;
+    hash_combine(h, x);
+    hash_combine(h, y);
+    return {x, y, h};
+}
+
+// ~~~~~~~~~~~~~~~~~
+
+// Applies deterministic jitter
 void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
     for (size_t i = 0; i < points.size(); ++i) {
-        // Hash based on STABLE ID + iters Offset
+        // Hash based on unique hash ID + iters Offset
         // This ensures that even if the point moves, the jitter sequence is deterministic
         uint64_t h = points[i].id;
 
@@ -179,6 +223,8 @@ void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
         points[i].y += jy;
     }
 }
+
+// ~~~~~~~~~~~~~~~~~
 
 // Wrapper for Triangle library - https://www.cs.cmu.edu/~quake/triangle.html
 std::vector<Triangle> triangulation(const std::vector<Point>& points) {
@@ -220,11 +266,12 @@ std::vector<Triangle> triangulation(const std::vector<Point>& points) {
     return triangles;
 }
 
-// --- Relaxation ---
+// ~~~~~~~~~~~~~~~~~
 
 // Helper: Calculate minimum angle (degrees) of a triangle
 double clamp_val(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
 
+// Gets the smallest angle in a triangle in degrees
 double get_min_angle_deg(const Point& a, const Point& b, const Point& c) {
     double ab2 = (a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y);
     double bc2 = (b.x-c.x)*(b.x-c.x) + (b.y-c.y)*(b.y-c.y);
@@ -243,6 +290,8 @@ double get_min_angle_deg(const Point& a, const Point& b, const Point& c) {
 
     return std::min({ang_a, ang_b, ang_c}) * 180.0 / 3.14159265358979323846;
 }
+
+// ~~~~~~~~~~~~~~~~~
 
 // Helper for relax_points to calculate local min angle
 double calculate_local_min_angle(int node_idx, const Point& node_pos, 
@@ -264,6 +313,11 @@ double calculate_local_min_angle(int node_idx, const Point& node_pos,
     return min_a;
 }
 
+// ~~~~~~~~~~~~~~~~~
+
+// Lloyd-smoothing - only smooths points within a certain box
+// that way we can lock the outermost points in the halo, so the halo 
+// doesn't shrink inwards
 void relax_points(std::vector<Point>& points, const std::vector<Triangle>& triangles, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
     int n = points.size();
     
@@ -356,25 +410,13 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& trian
     }
 }
 
-// Helper for boundary check
-bool is_on_boundary(const Point& p) {
-    return p.x < EPSILON || p.x > 1.0-EPSILON || p.y < EPSILON || p.y > 1.0-EPSILON;
-}
-
-// Helper to create a point with a stable ID based on initial position
-Point create_stable_point(double x, double y) {
-    uint64_t h = 0;
-    hash_combine(h, x);
-    hash_combine(h, y);
-    return {x, y, h};
-}
+// ~~~~~~~~~~~~~~~~~
 
 // Helper to remove duplicates from cloud
 void remove_duplicates(std::vector<Point>& points) {
     if (points.empty()) return;
 
-    // FIX: Use strict lexicographical sort. 
-    // Using tolerance in sort comparator violates Strict Weak Ordering and causes non-deterministic behavior.
+    // Use strict lexicographical sort. 
     std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
         if (a.x != b.x) return a.x < b.x;
         if (a.y != b.y) return a.y < b.y;
@@ -400,24 +442,400 @@ void remove_duplicates(std::vector<Point>& points) {
     points = unique_points;
 }
 
-// Helper to determine which rank owns a point based on spatial location
-int get_owner_rank(double x, double y, int size) {
-    double tile_s = DOMAIN_SIZE / TILE_DIM;
-    int tx = std::floor(x / tile_s);
-    int ty = std::floor(y / tile_s);
-    
-    // Clamp to handle numerical noise at upper boundaries
-    if (tx < 0) tx = 0; 
-    if (tx >= TILE_DIM) tx = TILE_DIM - 1;
-    if (ty < 0) ty = 0; 
-    if (ty >= TILE_DIM) ty = TILE_DIM - 1;
+// ~~~~~~~~~~~~~~~~~
 
-    int global_tile_id = ty * TILE_DIM + tx;
-    return global_tile_id % size;
+// Builds a tile, creates points and triangulates
+void process_tile(int tile_x, int tile_y, 
+                  std::vector<Point>& points_on_owned_triangles_and_orphans, 
+                  std::vector<Triangle>& triangles_owned) {
+
+    // Local map to track points added to the accumulator for this tile
+    std::map<uint64_t, int> id_to_idx;
+
+    int comm_rank, comm_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);      
+    
+    double tile_s = DOMAIN_SIZE / TILE_DIM;
+    double t_min_x = tile_x * tile_s; double t_max_x = (tile_x + 1) * tile_s;
+    double t_min_y = tile_y * tile_s; double t_max_y = (tile_y + 1) * tile_s;
+    
+    // UNIFIED PADDING LOGIC
+    // We generate a halo large enough to absorb the boundary effects of annealing.
+    // The distortion from the boundary travels approx 1 edge per iter.
+    // We add +6 for safety 
+    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITERS + 6);
+
+    // Safety Check: Ensure the required halo doesn't exceed the tile size.
+    // In a domain decomposition, needing a halo larger than the subdomain 
+    // implies we need data from neighbors-of-neighbors, which is inefficient/complex.
+    if (pad > tile_s/2.0) {
+        std::cerr << "Error: Annealing iters (" << ANNEAL_ITERS << ") require a halo of " 
+                  << pad << ", which exceeds the tile size (" << tile_s << ").\n"
+                  << "Reduce ANNEAL_ITERS or increase tile size (by having fewer tiles or more points per tile).\n";
+        std::exit(EXIT_FAILURE);
+    }    
+
+    double search_min_x = t_min_x - pad; double search_max_x = t_max_x + pad;
+    double search_min_y = t_min_y - pad; double search_max_y = t_max_y + pad;
+
+    std::vector<Point> points_with_halos;
+
+    // 1. EXPLICIT CORNERS
+    // Add corners if they are in the search box.
+    
+    // (0,0)
+    if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
+        search_min_y <= EPSILON && search_max_y >= -EPSILON) {
+        points_with_halos.push_back(create_point_with_unique_hash_id(0.0, 0.0));
+    }
+    // (1,0)
+    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
+        search_min_y <= EPSILON && search_max_y >= -EPSILON) {
+        points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, 0.0));
+    }
+    // (0,1)
+    if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
+        search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
+        points_with_halos.push_back(create_point_with_unique_hash_id(0.0, DOMAIN_SIZE));
+    }
+    // (1,1)
+    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
+        search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
+        points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, DOMAIN_SIZE));
+    }
+
+    // 2. EXPLICIT BOUNDARY GENERATION (Edges only)
+    // Iterate 4 boundaries. Add points if they fall within search box.
+    // Exclude corners (EPSILON checks) to avoid duplication with explicit corners above.
+    
+    // Left (x=0)
+    if (search_min_x <= EPSILON && search_max_x >= -EPSILON) {
+        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
+        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
+        for(int i=min_i; i<=max_i; ++i) {
+            double y = i * TARGET_EDGE_LENGTH;
+            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_point_with_unique_hash_id(0.0, y));
+        }
+    }
+    // Right (x=1)
+    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON) {
+        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
+        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
+        for(int i=min_i; i<=max_i; ++i) {
+            double y = i * TARGET_EDGE_LENGTH;
+            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, y));
+        }
+    }
+    // Bottom (y=0)
+    if (search_min_y <= EPSILON && search_max_y >= -EPSILON) {
+        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
+        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
+        for(int i=min_i; i<=max_i; ++i) {
+            double x = i * TARGET_EDGE_LENGTH;
+            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_point_with_unique_hash_id(x, 0.0));
+        }
+    }
+    // Top (y=1)
+    if (search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
+        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
+        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
+        for(int i=min_i; i<=max_i; ++i) {
+            double x = i * TARGET_EDGE_LENGTH;
+            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_point_with_unique_hash_id(x, DOMAIN_SIZE));
+        }
+    }
+
+    // 3. INTERIOR GENERATION (Stratified Sampling)
+    // To match the density of a hex grid (optimal for triangles_owned), we scale the spacing.
+    // Hex Density: 1 pt / (sqrt(3)/2 * L^2). Square Density: 1 pt / S^2.
+    // S = L * sqrt(sqrt(3)/2) ~ 0.9306 * L
+    double strat_spacing = TARGET_EDGE_LENGTH * 0.9306;
+
+    int min_ix = floor(search_min_x / strat_spacing);
+    int max_ix = ceil(search_max_x / strat_spacing);
+    int min_iy = floor(search_min_y / strat_spacing);
+    int max_iy = ceil(search_max_y / strat_spacing);
+    
+    // Distance from wall to reject interior points
+    // Must be larger than max jitter to prevent collision with boundary
+    // Max jitter is START_JITTER * TARGET_EDGE_LENGTH. 
+    // We need a larger safety margin to prevent slivers.
+    // 0.6 ensures that even with 0.3 jitter, the closest approach is ~0.3L, 
+    // which results in an aspect ratio of ~3:1 (acceptable).
+    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.35); 
+
+    for (int iy = min_iy; iy <= max_iy; ++iy) {
+        for (int ix = min_ix; ix <= max_ix; ++ix) {
+            // Deterministic RNG based on global grid index
+            uint64_t h = 0;
+            hash_combine(h, (double)ix);
+            hash_combine(h, (double)iy);
+            RngState rng = {h};
+
+            // Random position within the cell [0, 1)
+            double r1 = next_double(rng);
+            double r2 = next_double(rng);
+
+            double cx = (ix + r1) * strat_spacing;
+            double cy = (iy + r2) * strat_spacing;
+            
+            // Rejection Sampling for Exclusion Zone
+            if (cx < exclusion) continue;
+            if (cx > DOMAIN_SIZE - exclusion) continue;
+            if (cy < exclusion) continue;
+            if (cy > DOMAIN_SIZE - exclusion) continue;
+
+            // Only add point if strictly away from boundaries
+            points_with_halos.push_back(create_point_with_unique_hash_id(cx, cy));
+        }
+    }
+
+    // Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
+    remove_duplicates(points_with_halos);
+
+    // 4. ANNEALING
+    // We relax all points that are strictly inside the generated cloud.
+    // The outer hull acts as a fixed boundary condition.
+    // We must freeze the outer rim of the generated cloud. 
+    // If we relax the very edge, it collapses inward due to lack of outer neighbors.
+    // This collapse propagates errors inward.
+    // We freeze a strip of width ~ 1.5 * spacing.
+    double frozen_margin = TARGET_EDGE_LENGTH * 1.5;
+
+    double s_min_x = search_min_x + frozen_margin; 
+    double s_max_x = search_max_x - frozen_margin;
+    double s_min_y = search_min_y + frozen_margin; 
+    double s_max_y = search_max_y - frozen_margin;
+
+    std::vector<Triangle> triangles_with_halos;
+    double current_jitter = START_JITTER;
+
+    for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
+        apply_jitter(points_with_halos, current_jitter, iter);
+        triangles_with_halos = triangulation(points_with_halos);
+        relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+    }
+    // Final Polish
+    for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
+        triangles_with_halos = triangulation(points_with_halos);
+        relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+    }
+    
+    // Final Emit
+    triangles_with_halos = triangulation(points_with_halos);
+    
+    // MERGE INTO ACCUMULATOR
+    // We only keep triangles that are geometrically "owned" by this tile to avoid duplication
+    // when a rank owns adjacent tiles.
+    for (const auto& tri : triangles_with_halos) {
+        const Point& p0 = points_with_halos[tri.v0];
+        const Point& p1 = points_with_halos[tri.v1];
+        const Point& p2 = points_with_halos[tri.v2];
+
+        // Robust Ownership Rule:
+        // A triangle is owned by the rank that owns the triangle's "lowest" vertex.
+        // We define "lowest" using the unique hash ID to ensure all ranks agree.
+        // If multiple vertices are on the same rank, that rank definitely owns it.
+        // If vertices are on different ranks, the one with the smallest ID decides.
+        
+        uint64_t min_id = std::min({p0.id, p1.id, p2.id});
+        
+        // Find which point has this ID
+        const Point* min_p = &p0;
+        if (p1.id == min_id) min_p = &p1;
+        if (p2.id == min_id) min_p = &p2;
+
+        // Check if WE own this determining vertex
+        // Note: We use the global 'get_owner_rank' function which is purely spatial and deterministic.
+        int owner = get_owner_rank(min_p->x, min_p->y, comm_size);
+
+        if (owner == comm_rank) {
+            Triangle new_t;
+            Point* pts[3] = { (Point*)&p0, (Point*)&p1, (Point*)&p2 };
+            int*   v_idx[3] = { &new_t.v0, &new_t.v1, &new_t.v2 };
+
+            // This builds a mapping between point id and its index in the accumulated cloud
+            for(int k=0; k<3; ++k) {
+                uint64_t pid = pts[k]->id;
+                if (id_to_idx.find(pid) == id_to_idx.end()) {
+                    int new_idx = points_on_owned_triangles_and_orphans.size();
+                    points_on_owned_triangles_and_orphans.push_back(*pts[k]);
+                    id_to_idx[pid] = new_idx;
+                }
+                *v_idx[k] = id_to_idx[pid];
+            }
+            triangles_owned.push_back(new_t);
+        }
+    }
+
+    // Explicitly add "orphaned" vertices that we own spatially.
+    // It is possible to own a vertex spatially (it's in our tile) but NOT own any of the 
+    // triangles connected to it (due to the min_id rule giving them to neighbors).
+    // We must still track this vertex so we can assign it a Global ID and answer requests.
+    for (const auto& p : points_with_halos) {
+        if (get_owner_rank(p.x, p.y, comm_size) == comm_rank) {
+             uint64_t pid = p.id;
+             if (id_to_idx.find(pid) == id_to_idx.end()) {
+                 int new_idx = points_on_owned_triangles_and_orphans.size();
+                 points_on_owned_triangles_and_orphans.push_back(p);
+                 id_to_idx[pid] = new_idx;
+             }
+        }
+    }
+    id_to_idx.clear();
 }
 
+// ~~~~~~~~~~~~~~~~~
+
+// Return a PETSc DM for the points and triangles passed in
+DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
+    int comm_rank, comm_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    PetscInt num_points_on_owned_triangles_and_orphans = points_on_owned_triangles_and_orphans.size();
+    std::vector<PetscInt> global_ids(num_points_on_owned_triangles_and_orphans, -1);
+    PetscInt num_points_owned = 0;
+
+    // 1. Identify Owned Vertices
+    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+            num_points_owned++;
+        }
+    }
+
+    // 2. Calculate Global Offsets - petscint to ensure large counts work
+    PetscInt start_id = 0;
+    MPI_Exscan(&num_points_owned, &start_id, 1, MPIU_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    // 3. Assign Global IDs to Owned Vertices
+    PetscInt current_id = start_id;
+    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+            global_ids[i] = current_id++;
+        }
+    }
+
+    // 4. Resolve Ghost IDs
+    // We need to ask the owners for the Global IDs of our ghost points.
+    std::vector<std::vector<uint64_t>> send_ids(comm_size);
+    std::vector<std::vector<int>>      send_req_indices(comm_size);
+
+    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
+        // If we don't own it we need to find out who does and ask them for the global id
+        if (global_ids[i] == -1) {
+            int owner = get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size);
+            send_ids[owner].push_back(points_on_owned_triangles_and_orphans[i].id);
+            send_req_indices[owner].push_back(i);
+        }
+    }
+
+    // Exchange counts
+    std::vector<int> send_counts(comm_size), recv_counts(comm_size);
+    for(int r=0; r<comm_size; ++r) send_counts[r] = send_ids[r].size();
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+    // Prepare Receive Buffers
+    std::vector<std::vector<uint64_t>> recv_ids(comm_size);
+    std::vector<std::vector<PetscInt>> send_answers(comm_size);
+    // Preallocate the space for the receives
+    for(int r=0; r<comm_size; ++r) {
+        if(recv_counts[r] > 0) {
+            recv_ids[r].resize(recv_counts[r]);
+        }
+    }
+
+    // Send the unique hash id of points that we require
+    for(int r=0; r<comm_size; ++r) {
+        if (r == comm_rank) continue;
+        if (send_counts[r] > 0) {
+            MPI_Send(send_ids[r].data(), send_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD);
+        }
+    }
+    
+    // We need a map for fast lookup between the unique hash id and the global id
+    std::map<uint64_t, PetscInt> points_owned_l2g_map;
+    for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+            points_owned_l2g_map[points_on_owned_triangles_and_orphans[i].id] = global_ids[i];
+        }
+    }
+
+    // Receive Requests and Send Answers
+    for(int r=0; r<comm_size; ++r) {
+        if (r == comm_rank) continue;
+        if (recv_counts[r] > 0) {
+            MPI_Status status;
+            // Receive the local ID's we have to identify
+            MPI_Recv(recv_ids[r].data(), recv_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD, &status);
+            
+            // Work out the global ID's of the points we just received
+            send_answers[r].resize(recv_counts[r]);
+            for(int k=0; k<recv_counts[r]; ++k) {
+                send_answers[r][k] = points_owned_l2g_map[recv_ids[r][k]];
+            }
+            // Send the global id's back
+            MPI_Send(send_answers[r].data(), recv_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD);
+        }
+    }
+
+    // Receive Answers
+    for(int r=0; r<comm_size; ++r) {
+        if (r == comm_rank) continue;
+        if (send_counts[r] > 0) {
+            std::vector<PetscInt> answers(send_counts[r]);
+            MPI_Status status;
+            // Receive the global id's of points we need
+            MPI_Recv(answers.data(), send_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD, &status);
+            
+            for(int k=0; k<send_counts[r]; ++k) {
+                int local_idx = send_req_indices[r][k];
+                global_ids[local_idx] = answers[k];
+            }
+        }
+    }
+
+    // 5. Build DMPlex
+    PetscInt num_tris_owned = triangles_owned.size();
+    std::vector<PetscInt> cells(num_tris_owned * 3);
+    // Global ids for all points on owned triangles
+    for(int i=0; i<num_tris_owned; ++i) {
+        cells[i*3 + 0] = global_ids[triangles_owned[i].v0];
+        cells[i*3 + 1] = global_ids[triangles_owned[i].v1];
+        cells[i*3 + 2] = global_ids[triangles_owned[i].v2];
+    }
+
+    // Prepare coordinates for DMPlexCreateFromCellListParallelPetsc
+    // points_on_owned_triangles_and_orphans contains ghosts (vertices of owned triangles that are owned by neighbors).
+    // PETSc expects 'numPoints' to be the count of locally owned vertices, 
+    // and 'coords' to be the coordinates of those specific vertices
+    std::vector<PetscReal> coords_points_owned;
+    coords_points_owned.reserve(num_points_owned * 2);
+    
+    for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+            coords_points_owned.push_back(points_on_owned_triangles_and_orphans[i].x);
+            coords_points_owned.push_back(points_on_owned_triangles_and_orphans[i].y);
+        }
+    }
+
+    DM dm;
+    // Build the DM
+    PetscInt two = 2;
+    PetscInt three = 3;
+    // Pass num_points_owned instead of num_points_on_owned_triangles_and_orphans, and coords_points_owned instead of coords
+    (void*)DMPlexCreateFromCellListParallelPetsc(MPI_COMM_WORLD, two, num_tris_owned, num_points_owned, PETSC_DECIDE, \
+         three, PETSC_TRUE, cells.data(), two, coords_points_owned.data(), NULL, NULL, &dm);
+    return dm;
+}
+
+// ~~~~~~~~~~~~~~~~~
+
+// Print mesh statistics on rank 0
 void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned, int rank, int size) {
-    // 1. Vertex Load Imbalance
+
+    // 1. Compute load imbalance
     long points_owned = 0;
     for (const auto& p : points_on_owned_triangles_and_orphans) {
         if (get_owner_rank(p.x, p.y, size) == rank) {
@@ -523,6 +941,7 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
     std::vector<long> global_bins(18);
     MPI_Reduce(local_bins.data(), global_bins.data(), 18, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
+    // Output stats to rank 0
     if (rank == 0) {
         std::cout << "\n=== Mesh Statistics ===\n";
         std::cout << "Vertices:\n";
@@ -554,386 +973,7 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
     }
 }
 
-// --- Main Processing ---
-void process_tile(int tile_x, int tile_y, 
-                  std::vector<Point>& points_on_owned_triangles_and_orphans, 
-                  std::vector<Triangle>& triangles_owned) {
-
-    // Local map to track points added to the accumulator for this tile
-    std::map<uint64_t, int> id_to_idx;
-
-    int comm_rank, comm_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);      
-    
-    double tile_s = DOMAIN_SIZE / TILE_DIM;
-    double t_min_x = tile_x * tile_s; double t_max_x = (tile_x + 1) * tile_s;
-    double t_min_y = tile_y * tile_s; double t_max_y = (tile_y + 1) * tile_s;
-    
-    // UNIFIED PADDING LOGIC
-    // We generate a halo large enough to absorb the boundary effects of annealing.
-    // The distortion from the boundary travels approx 1 edge per iter.
-    // We add +6 for safety 
-    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITERS + 6);
-
-    // Safety Check: Ensure the required halo doesn't exceed the tile size.
-    // In a domain decomposition, needing a halo larger than the subdomain 
-    // implies we need data from neighbors-of-neighbors, which is inefficient/complex.
-    if (pad > tile_s/2.0) {
-        std::cerr << "Error: Annealing iters (" << ANNEAL_ITERS << ") require a halo of " 
-                  << pad << ", which exceeds the tile size (" << tile_s << ").\n"
-                  << "Reduce ANNEAL_ITERS or increase tile size (by having fewer tiles or more points per tile).\n";
-        std::exit(EXIT_FAILURE);
-    }    
-
-    double search_min_x = t_min_x - pad; double search_max_x = t_max_x + pad;
-    double search_min_y = t_min_y - pad; double search_max_y = t_max_y + pad;
-
-    std::vector<Point> points_with_halos;
-
-    // 1. EXPLICIT CORNERS
-    // Add corners if they are in the search box.
-    
-    // (0,0)
-    if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
-        search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        points_with_halos.push_back(create_stable_point(0.0, 0.0));
-    }
-    // (1,0)
-    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
-        search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        points_with_halos.push_back(create_stable_point(DOMAIN_SIZE, 0.0));
-    }
-    // (0,1)
-    if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
-        search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        points_with_halos.push_back(create_stable_point(0.0, DOMAIN_SIZE));
-    }
-    // (1,1)
-    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
-        search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        points_with_halos.push_back(create_stable_point(DOMAIN_SIZE, DOMAIN_SIZE));
-    }
-
-    // 2. EXPLICIT BOUNDARY GENERATION (Edges only)
-    // Iterate 4 boundaries. Add points if they fall within search box.
-    // FIX: Exclude corners (EPSILON checks) to avoid duplication with explicit corners above.
-    
-    // Left (x=0)
-    if (search_min_x <= EPSILON && search_max_x >= -EPSILON) {
-        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
-        for(int i=min_i; i<=max_i; ++i) {
-            double y = i * TARGET_EDGE_LENGTH;
-            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_stable_point(0.0, y));
-        }
-    }
-    // Right (x=1)
-    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON) {
-        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
-        for(int i=min_i; i<=max_i; ++i) {
-            double y = i * TARGET_EDGE_LENGTH;
-            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_stable_point(DOMAIN_SIZE, y));
-        }
-    }
-    // Bottom (y=0)
-    if (search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
-        for(int i=min_i; i<=max_i; ++i) {
-            double x = i * TARGET_EDGE_LENGTH;
-            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_stable_point(x, 0.0));
-        }
-    }
-    // Top (y=1)
-    if (search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
-        for(int i=min_i; i<=max_i; ++i) {
-            double x = i * TARGET_EDGE_LENGTH;
-            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_stable_point(x, DOMAIN_SIZE));
-        }
-    }
-
-    // 3. INTERIOR GENERATION (Stratified Sampling)
-    // To match the density of a hex grid (optimal for triangles_owned), we scale the spacing.
-    // Hex Density: 1 pt / (sqrt(3)/2 * L^2). Square Density: 1 pt / S^2.
-    // S = L * sqrt(sqrt(3)/2) ~ 0.9306 * L
-    double strat_spacing = TARGET_EDGE_LENGTH * 0.9306;
-
-    int min_ix = floor(search_min_x / strat_spacing);
-    int max_ix = ceil(search_max_x / strat_spacing);
-    int min_iy = floor(search_min_y / strat_spacing);
-    int max_iy = ceil(search_max_y / strat_spacing);
-    
-    // Distance from wall to reject interior points
-    // FIX: Must be larger than max jitter to prevent collision with boundary
-    // Max jitter is START_JITTER * TARGET_EDGE_LENGTH. 
-    // We need a larger safety margin to prevent slivers.
-    // 0.6 ensures that even with 0.3 jitter, the closest approach is ~0.3L, 
-    // which results in an aspect ratio of ~3:1 (acceptable).
-    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.35); 
-
-    for (int iy = min_iy; iy <= max_iy; ++iy) {
-        for (int ix = min_ix; ix <= max_ix; ++ix) {
-            // Deterministic RNG based on global grid index
-            uint64_t h = 0;
-            hash_combine(h, (double)ix);
-            hash_combine(h, (double)iy);
-            RngState rng = {h};
-
-            // Random position within the cell [0, 1)
-            double r1 = next_double(rng);
-            double r2 = next_double(rng);
-
-            double cx = (ix + r1) * strat_spacing;
-            double cy = (iy + r2) * strat_spacing;
-            
-            // Rejection Sampling for Exclusion Zone
-            if (cx < exclusion) continue;
-            if (cx > DOMAIN_SIZE - exclusion) continue;
-            if (cy < exclusion) continue;
-            if (cy > DOMAIN_SIZE - exclusion) continue;
-
-            // Only add point if strictly away from boundaries
-            points_with_halos.push_back(create_stable_point(cx, cy));
-        }
-    }
-
-    // FIX: Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
-    // This prevents Bowyer-Watson from exploding.
-    remove_duplicates(points_with_halos);
-
-    // 4. ANNEALING
-    // We relax all points that are strictly inside the generated cloud.
-    // The outer hull acts as a fixed boundary condition.
-    // FIX: We must freeze the outer rim of the generated cloud. 
-    // If we relax the very edge, it collapses inward due to lack of outer neighbors.
-    // This collapse propagates errors inward.
-    // We freeze a strip of width ~ 1.5 * spacing.
-    double frozen_margin = TARGET_EDGE_LENGTH * 1.5;
-
-    double s_min_x = search_min_x + frozen_margin; 
-    double s_max_x = search_max_x - frozen_margin;
-    double s_min_y = search_min_y + frozen_margin; 
-    double s_max_y = search_max_y - frozen_margin;
-
-    std::vector<Triangle> triangles_with_halos;
-    double current_jitter = START_JITTER;
-
-    for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
-        apply_jitter(points_with_halos, current_jitter, iter);
-        triangles_with_halos = triangulation(points_with_halos);
-        relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
-    }
-    // Final Polish
-    for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
-        triangles_with_halos = triangulation(points_with_halos);
-        relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
-    }
-    
-    // Final Emit
-    triangles_with_halos = triangulation(points_with_halos);
-    
-    // MERGE INTO ACCUMULATOR
-    // We only keep triangles that are geometrically "owned" by this tile to avoid duplication
-    // when a rank owns adjacent tiles.
-    for (const auto& tri : triangles_with_halos) {
-        const Point& p0 = points_with_halos[tri.v0];
-        const Point& p1 = points_with_halos[tri.v1];
-        const Point& p2 = points_with_halos[tri.v2];
-
-        // Robust Ownership Rule:
-        // A triangle is owned by the rank that owns the triangle's "lowest" vertex.
-        // We define "lowest" using the stable ID to ensure all ranks agree.
-        // If multiple vertices are on the same rank, that rank definitely owns it.
-        // If vertices are on different ranks, the one with the smallest ID decides.
-        
-        uint64_t min_id = std::min({p0.id, p1.id, p2.id});
-        
-        // Find which point has this ID
-        const Point* min_p = &p0;
-        if (p1.id == min_id) min_p = &p1;
-        if (p2.id == min_id) min_p = &p2;
-
-        // Check if WE own this determining vertex
-        // Note: We use the global 'get_owner_rank' function which is purely spatial and deterministic.
-        int owner = get_owner_rank(min_p->x, min_p->y, comm_size);
-
-        if (owner == comm_rank) {
-            Triangle new_t;
-            Point* pts[3] = { (Point*)&p0, (Point*)&p1, (Point*)&p2 };
-            int*   v_idx[3] = { &new_t.v0, &new_t.v1, &new_t.v2 };
-
-            // This builds a mapping between point id and its index in the accumulated cloud
-            for(int k=0; k<3; ++k) {
-                uint64_t pid = pts[k]->id;
-                if (id_to_idx.find(pid) == id_to_idx.end()) {
-                    int new_idx = points_on_owned_triangles_and_orphans.size();
-                    points_on_owned_triangles_and_orphans.push_back(*pts[k]);
-                    id_to_idx[pid] = new_idx;
-                }
-                *v_idx[k] = id_to_idx[pid];
-            }
-            triangles_owned.push_back(new_t);
-        }
-    }
-
-    // FIX: Explicitly add "orphaned" vertices that we own spatially.
-    // It is possible to own a vertex spatially (it's in our tile) but NOT own any of the 
-    // triangles connected to it (due to the min_id rule giving them to neighbors).
-    // We must still track this vertex so we can assign it a Global ID and answer requests.
-    for (const auto& p : points_with_halos) {
-        if (get_owner_rank(p.x, p.y, comm_size) == comm_rank) {
-             uint64_t pid = p.id;
-             if (id_to_idx.find(pid) == id_to_idx.end()) {
-                 int new_idx = points_on_owned_triangles_and_orphans.size();
-                 points_on_owned_triangles_and_orphans.push_back(p);
-                 id_to_idx[pid] = new_idx;
-             }
-        }
-    }
-    id_to_idx.clear();
-}
-
-DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
-    int comm_rank, comm_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
-
-    PetscInt num_points_on_owned_triangles_and_orphans = points_on_owned_triangles_and_orphans.size();
-    std::vector<PetscInt> global_ids(num_points_on_owned_triangles_and_orphans, -1);
-    PetscInt num_points_owned = 0;
-
-    // 1. Identify Owned Vertices
-    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
-        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
-            num_points_owned++;
-        }
-    }
-
-    // 2. Calculate Global Offsets - petscint to ensure large counts work
-    PetscInt start_id = 0;
-    MPI_Exscan(&num_points_owned, &start_id, 1, MPIU_INT, MPI_SUM, MPI_COMM_WORLD);
-
-    // 3. Assign Global IDs to Owned Vertices
-    PetscInt current_id = start_id;
-    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
-        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
-            global_ids[i] = current_id++;
-        }
-    }
-
-    // 4. Resolve Ghost IDs
-    // We need to ask the owners for the Global IDs of our ghost points.
-    std::vector<std::vector<uint64_t>> send_ids(comm_size);
-    std::vector<std::vector<int>>      send_req_indices(comm_size); // Map back to local index
-
-    for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
-        if (global_ids[i] == -1) {
-            int owner = get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size);
-            send_ids[owner].push_back(points_on_owned_triangles_and_orphans[i].id);
-            send_req_indices[owner].push_back(i);
-        }
-    }
-
-    // Exchange counts
-    std::vector<int> send_counts(comm_size), recv_counts(comm_size);
-    for(int r=0; r<comm_size; ++r) send_counts[r] = send_ids[r].size();
-    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-    // Prepare Receive Buffers (Requests from others)
-    std::vector<std::vector<uint64_t>> recv_ids(comm_size);
-    std::vector<std::vector<PetscInt>> send_answers(comm_size);
-    
-    // Post Receives
-    for(int r=0; r<comm_size; ++r) {
-        if(recv_counts[r] > 0) {
-            recv_ids[r].resize(recv_counts[r]);
-        }
-    }
-
-    // Simple Point-to-Point Exchange (Blocking for simplicity, use Irecv/Isend in prod)
-    for(int r=0; r<comm_size; ++r) {
-        if (r == comm_rank) continue;
-        if (send_counts[r] > 0) {
-            MPI_Send(send_ids[r].data(), send_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD);
-        }
-    }
-    
-    // Process Incoming Requests
-    // We need a map for fast lookup of OUR owned points
-    std::map<uint64_t, PetscInt> my_owned_map;
-    for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
-        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
-            my_owned_map[points_on_owned_triangles_and_orphans[i].id] = global_ids[i];
-        }
-    }
-
-    for(int r=0; r<comm_size; ++r) {
-        if (r == comm_rank) continue;
-        if (recv_counts[r] > 0) {
-            MPI_Status status;
-            MPI_Recv(recv_ids[r].data(), recv_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD, &status);
-            
-            send_answers[r].resize(recv_counts[r]);
-            for(int k=0; k<recv_counts[r]; ++k) {
-                send_answers[r][k] = my_owned_map[recv_ids[r][k]];
-            }
-            // Send answers back
-            MPI_Send(send_answers[r].data(), recv_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD);
-        }
-    }
-
-    // Receive Answers
-    for(int r=0; r<comm_size; ++r) {
-        if (r == comm_rank) continue;
-        if (send_counts[r] > 0) {
-            std::vector<PetscInt> answers(send_counts[r]);
-            MPI_Status status;
-            MPI_Recv(answers.data(), send_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD, &status);
-            
-            for(int k=0; k<send_counts[r]; ++k) {
-                int local_idx = send_req_indices[r][k];
-                global_ids[local_idx] = answers[k];
-            }
-        }
-    }
-
-    // 5. Build DMPlex
-    PetscInt num_tris_owned = triangles_owned.size();
-    std::vector<PetscInt> cells(num_tris_owned * 3);
-    for(int i=0; i<num_tris_owned; ++i) {
-        cells[i*3 + 0] = global_ids[triangles_owned[i].v0];
-        cells[i*3 + 1] = global_ids[triangles_owned[i].v1];
-        cells[i*3 + 2] = global_ids[triangles_owned[i].v2];
-    }
-
-    // Prepare coordinates for DMPlexCreateFromCellListParallelPetsc
-    // FIX: Only pass OWNED points to PETSc. 
-    // points_on_owned_triangles_and_orphans contains ghosts (vertices of owned triangles that are owned by neighbors).
-    // PETSc expects 'numPoints' to be the count of locally owned vertices, 
-    // and 'coords' to be the coordinates of those specific vertices
-    std::vector<PetscReal> coords_points_owned;
-    coords_points_owned.reserve(num_points_owned * 2);
-    
-    for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
-        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
-            coords_points_owned.push_back(points_on_owned_triangles_and_orphans[i].x);
-            coords_points_owned.push_back(points_on_owned_triangles_and_orphans[i].y);
-        }
-    }
-
-    DM dm;
-    // Build the DM
-    PetscInt two = 2;
-    PetscInt three = 3;
-    // Pass num_points_owned instead of num_points_on_owned_triangles_and_orphans, and coords_points_owned instead of coords
-    (void*)DMPlexCreateFromCellListParallelPetsc(MPI_COMM_WORLD, two, num_tris_owned, num_points_owned, PETSC_DECIDE, \
-         three, PETSC_TRUE, cells.data(), two, coords_points_owned.data(), NULL, NULL, &dm);
-    return dm;
-}
+// ~~~~~~~~~~~~~~~~~
 
 int main(int argc, char** argv) {
 
@@ -1013,3 +1053,5 @@ int main(int argc, char** argv) {
     PetscCall(PetscFinalize());
     return 0;
 }
+
+// ~~~~~~~~~~~~~~~~~
