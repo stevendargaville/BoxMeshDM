@@ -27,10 +27,9 @@
 // 3. Annealing: Jitter -> Smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
 // =========================================================
-
-const int TILE_DIM = 2; 
+int TILE_DIM = -1;
 const double DOMAIN_SIZE = 1.0;
-const double TARGET_EDGE_LENGTH = 0.0075; 
+const double TARGET_EDGE_LENGTH = 0.0025; 
 
 // We need these to be relative to edge length to support very fine meshes (e.g. 10^-6 spacing)
 const double TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
@@ -435,8 +434,8 @@ void process_tile(int tile_x, int tile_y,
 
     int comm_rank, comm_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);                     
-
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);      
+    
     double tile_s = DOMAIN_SIZE / TILE_DIM;
     double t_min_x = tile_x * tile_s; double t_max_x = (tile_x + 1) * tile_s;
     double t_min_y = tile_y * tile_s; double t_max_y = (tile_y + 1) * tile_s;
@@ -444,8 +443,8 @@ void process_tile(int tile_x, int tile_y,
     // UNIFIED PADDING LOGIC
     // We generate a halo large enough to absorb the boundary effects of annealing.
     // The distortion from the boundary travels approx 1 edge per iter.
-    // We add +3 for safety 
-    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITERS + 3);
+    // We add +6 for safety 
+    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITERS + 6);
 
     // Safety Check: Ensure the required halo doesn't exceed the tile size.
     // In a domain decomposition, needing a halo larger than the subdomain 
@@ -637,6 +636,21 @@ void process_tile(int tile_x, int tile_y,
             acc_mesh.push_back(new_t);
         }
     }
+
+    // FIX: Explicitly add "orphaned" vertices that we own spatially.
+    // It is possible to own a vertex spatially (it's in our tile) but NOT own any of the 
+    // triangles connected to it (due to the min_id rule giving them to neighbors).
+    // We must still track this vertex so we can assign it a Global ID and answer requests.
+    for (const auto& p : cloud) {
+        if (get_owner_rank(p.x, p.y, comm_size) == comm_rank) {
+             uint64_t pid = p.id;
+             if (id_to_idx.find(pid) == id_to_idx.end()) {
+                 int new_idx = acc_cloud.size();
+                 acc_cloud.push_back(p);
+                 id_to_idx[pid] = new_idx;
+             }
+        }
+    }
 }
 
 DM CreateDistributedDM(const std::vector<Point>& cloud, const std::vector<Triangle>& mesh) {
@@ -784,6 +798,16 @@ int main(int argc, char** argv) {
     int comm_rank, comm_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    // Check if comm_size is a perfect square
+    int root = std::round(std::sqrt(comm_size));
+    if (root * root != comm_size) {
+        if (comm_rank == 0) {
+            std::cerr << "Error: Number of MPI ranks (" << comm_size << ") must be a perfect square (e.g., 1, 4, 9, 16).\n";
+        }
+        std::exit(EXIT_FAILURE);
+    }
+    TILE_DIM = root;
 
     if (comm_rank == 0) {
         std::cout << "Generating Unstructured Mesh of 2D box...\n";
