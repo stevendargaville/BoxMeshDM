@@ -11,6 +11,7 @@
 #include <petscdmplex.h>
 #include <petscviewerhdf5.h>
 #include <map>
+#include <set>
 
 #if !defined(ANSI_DECLARATORS)
   #define ANSI_DECLARATORS
@@ -29,7 +30,7 @@
 // =========================================================
 int TILE_DIM = -1;
 const double DOMAIN_SIZE = 1.0;
-const double TARGET_EDGE_LENGTH = 0.001; 
+const double TARGET_EDGE_LENGTH = 0.0025; 
 
 // We need these to be relative to edge length to support very fine meshes (e.g. 10^-6 spacing)
 const double TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
@@ -448,6 +449,10 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
     double local_min_area = 1e30, local_max_area = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
 
+    // 3. Edge Orientation Statistics
+    std::vector<long> local_bins(18, 0);
+    std::set<std::pair<int, int>> processed_edges;
+
     for (const auto& t : mesh) {
         const Point& p0 = cloud[t.v0];
         const Point& p1 = cloud[t.v1];
@@ -475,6 +480,42 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
             local_min_angle = std::min({local_min_angle, a0, a1, a2});
             local_max_angle = std::max({local_max_angle, a0, a1, a2});
         }
+
+        // Edges
+        int v[3] = {t.v0, t.v1, t.v2};
+        for (int i = 0; i < 3; ++i) {
+            int idx1 = v[i];
+            int idx2 = v[(i + 1) % 3];
+            
+            // Sort indices for uniqueness check
+            if (idx1 > idx2) std::swap(idx1, idx2);
+            
+            if (processed_edges.find({idx1, idx2}) == processed_edges.end()) {
+                processed_edges.insert({idx1, idx2});
+                
+                const Point& ep1 = cloud[idx1];
+                const Point& ep2 = cloud[idx2];
+                
+                // Check ownership of edge midpoint
+                double mx = (ep1.x + ep2.x) * 0.5;
+                double my = (ep1.y + ep2.y) * 0.5;
+                
+                if (get_owner_rank(mx, my, size) == rank) {
+                    double dx = ep2.x - ep1.x;
+                    double dy = ep2.y - ep1.y;
+                    // Angle in [0, 180)
+                    double angle = std::atan2(dy, dx) * 180.0 / 3.14159265358979323846;
+                    if (angle < 0) angle += 180.0;
+                    if (angle >= 180.0) angle -= 180.0;
+                    
+                    int bin = static_cast<int>(angle / 10.0);
+                    if (bin < 0) bin = 0;
+                    if (bin >= 18) bin = 17;
+                    
+                    local_bins[bin]++;
+                }
+            }
+        }
     }
 
     if (mesh.empty()) {
@@ -489,6 +530,9 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
     MPI_Reduce(&local_max_area, &global_max_area, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_min_angle, &global_min_angle, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_max_angle, &global_max_angle, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    std::vector<long> global_bins(18);
+    MPI_Reduce(local_bins.data(), global_bins.data(), 18, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
         std::cout << "\n=== Mesh Statistics ===\n";
@@ -505,6 +549,18 @@ void ComputeAndPrintStats(const std::vector<Point>& cloud, const std::vector<Tri
         std::cout << "  Area Ratio: " << (global_min_area > 0 ? global_max_area / global_min_area : -1.0) << "\n";
         std::cout << "  Angle Min: " << global_min_angle << " deg\n";
         std::cout << "  Angle Max: " << global_max_angle << " deg\n";
+
+        std::cout << "Edge Orientations (10 deg bins):\n";
+        long total_edges = 0;
+        for(long c : global_bins) total_edges += c;
+        
+        if (total_edges > 0) {
+            for (int i = 0; i < 18; ++i) {
+                double pct = 100.0 * global_bins[i] / total_edges;
+                std::cout << "  " << std::setw(3) << (i*10) << "-" << std::setw(3) << ((i+1)*10) 
+                          << " deg: " << std::fixed << std::setprecision(2) << pct << "%\n";
+            }
+        }
         std::cout << "=======================\n";
     }
 }
