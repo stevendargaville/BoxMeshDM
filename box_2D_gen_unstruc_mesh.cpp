@@ -557,8 +557,10 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
 // --- Main Processing ---
 void process_tile(int tile_x, int tile_y, 
                   std::vector<Point>& points_on_owned_triangles_and_orphans, 
-                  std::vector<Triangle>& triangles_owned, 
-                  std::map<uint64_t, int>& id_to_idx) {
+                  std::vector<Triangle>& triangles_owned) {
+
+    // Local map to track points added to the accumulator for this tile
+    std::map<uint64_t, int> id_to_idx;
 
     int comm_rank, comm_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
@@ -792,6 +794,7 @@ void process_tile(int tile_x, int tile_y,
              }
         }
     }
+    id_to_idx.clear();
 }
 
 DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
@@ -970,7 +973,6 @@ int main(int argc, char** argv) {
 
     std::vector<Point> points_on_owned_triangles_and_orphans;
     std::vector<Triangle> triangles_owned;
-    std::map<uint64_t, int> id_map;
 
     // Distribute tiles cyclically among ranks
     for (int y = 0; y < TILE_DIM; ++y) {
@@ -978,7 +980,7 @@ int main(int argc, char** argv) {
             int global_id = y * TILE_DIM + x;
             
             if (global_id % comm_size == comm_rank) {
-                process_tile(x, y, points_on_owned_triangles_and_orphans, triangles_owned, id_map);
+                process_tile(x, y, points_on_owned_triangles_and_orphans, triangles_owned);
             }
         }
     }
@@ -1006,7 +1008,6 @@ int main(int argc, char** argv) {
 
     points_on_owned_triangles_and_orphans.clear();
     triangles_owned.clear();
-    id_map.clear();
 
     PetscCall(DMDestroy(&dm));
     PetscCall(PetscFinalize());
