@@ -53,7 +53,7 @@ const int FINAL_SMOOTH_ITERS = 2;
 
 struct Point {
     double x, y; // coordinates
-    uint64_t id = 0; // unique id based on hashing coordinates
+    uint64_t unique_hash_id = 0; // unique id based on hashing coordinates
 };
 struct Triangle {
     int v0, v1, v2;
@@ -206,7 +206,7 @@ void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
     for (size_t i = 0; i < points.size(); ++i) {
         // Hash based on unique hash ID + iters Offset
         // This ensures that even if the point moves, the jitter sequence is deterministic
-        uint64_t h = points[i].id;
+        uint64_t h = points[i].unique_hash_id;
 
         // Mix in the iters/seed offset to ensure different jitter each step
         h ^= seed_offset + 0x9e3779b9 + (h << 6) + (h >> 2);
@@ -302,7 +302,7 @@ double calculate_local_min_angle(int node_idx, const Point& node_pos,
     for (int t_idx : connected_tris) {
         const auto& tri = triangles[t_idx];
         Point p1, p2;
-        // Find the other two vertices (neighbors)
+        // Find the other two points (neighbors)
         if (tri.v0 == node_idx) { p1 = points[tri.v1]; p2 = points[tri.v2]; }
         else if (tri.v1 == node_idx) { p1 = points[tri.v0]; p2 = points[tri.v2]; }
         else { p1 = points[tri.v0]; p2 = points[tri.v1]; }
@@ -342,7 +342,7 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& trian
         // Area = 0.5 * |(x1-x0)(y2-y0) - (y1-y0)(x2-x0)|
         double area = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
 
-        // 3. Accumulate weighted centroid for all vertices of this triangle
+        // 3. Accumulate weighted centroid for all points of this triangle
         wx[t.v0] += area * cx; wy[t.v0] += area * cy; w_sum[t.v0] += area;
         wx[t.v1] += area * cx; wy[t.v1] += area * cy; w_sum[t.v1] += area;
         wx[t.v2] += area * cx; wy[t.v2] += area * cy; w_sum[t.v2] += area;
@@ -420,7 +420,7 @@ void remove_duplicates(std::vector<Point>& points) {
     std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
         if (a.x != b.x) return a.x < b.x;
         if (a.y != b.y) return a.y < b.y;
-        return a.id < b.id; // Tie-breaker for absolute stability
+        return a.unique_hash_id < b.unique_hash_id; // Tie-breaker for absolute stability
     });
 
     std::vector<Point> unique_points;
@@ -594,7 +594,7 @@ void process_tile(int tile_x, int tile_y,
     // Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
     remove_duplicates(points_with_halos);
 
-    // 4. ANNEALING
+    // 4. ITERATIONS
     // We relax all points that are strictly inside the generated cloud.
     // The outer hull acts as a fixed boundary condition.
     // We must freeze the outer rim of the generated cloud. 
@@ -611,43 +611,40 @@ void process_tile(int tile_x, int tile_y,
     std::vector<Triangle> triangles_with_halos;
     double current_jitter = START_JITTER;
 
+    // Jitter + triangulate + smooth loop
     for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
         apply_jitter(points_with_halos, current_jitter, iter);
         triangles_with_halos = triangulation(points_with_halos);
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
     }
-    // Final Polish
+    // Final smooth iterations without jitter
     for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
         triangles_with_halos = triangulation(points_with_halos);
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
     }
     
-    // Final Emit
+    // Final mesh
     triangles_with_halos = triangulation(points_with_halos);
     
-    // MERGE INTO ACCUMULATOR
-    // We only keep triangles that are geometrically "owned" by this tile to avoid duplication
-    // when a rank owns adjacent tiles.
+    // We only keep triangles that are geometrically "owned" by this tile
     for (const auto& tri : triangles_with_halos) {
         const Point& p0 = points_with_halos[tri.v0];
         const Point& p1 = points_with_halos[tri.v1];
         const Point& p2 = points_with_halos[tri.v2];
 
         // Robust Ownership Rule:
-        // A triangle is owned by the rank that owns the triangle's "lowest" vertex.
+        // A triangle is owned by the rank that owns the triangle's "lowest" point.
         // We define "lowest" using the unique hash ID to ensure all ranks agree.
-        // If multiple vertices are on the same rank, that rank definitely owns it.
-        // If vertices are on different ranks, the one with the smallest ID decides.
-        
-        uint64_t min_id = std::min({p0.id, p1.id, p2.id});
+        // If multiple points are on the same rank, that rank definitely owns it.
+        // If points are on different ranks, the one with the smallest ID decides.
+        uint64_t min_hash_id = std::min({p0.unique_hash_id, p1.unique_hash_id, p2.unique_hash_id});
         
         // Find which point has this ID
         const Point* min_p = &p0;
-        if (p1.id == min_id) min_p = &p1;
-        if (p2.id == min_id) min_p = &p2;
+        if (p1.unique_hash_id == min_hash_id) min_p = &p1;
+        if (p2.unique_hash_id == min_hash_id) min_p = &p2;
 
-        // Check if WE own this determining vertex
-        // Note: We use the global 'get_owner_rank' function which is purely spatial and deterministic.
+        // Check if WE own this determining point
         int owner = get_owner_rank(min_p->x, min_p->y, comm_size);
 
         if (owner == comm_rank) {
@@ -655,9 +652,9 @@ void process_tile(int tile_x, int tile_y,
             Point* pts[3] = { (Point*)&p0, (Point*)&p1, (Point*)&p2 };
             int*   v_idx[3] = { &new_t.v0, &new_t.v1, &new_t.v2 };
 
-            // This builds a mapping between point id and its index in the accumulated cloud
+            // This builds a mapping between the unique hash id and its index in the output array
             for(int k=0; k<3; ++k) {
-                uint64_t pid = pts[k]->id;
+                uint64_t pid = pts[k]->unique_hash_id;
                 if (id_to_idx.find(pid) == id_to_idx.end()) {
                     int new_idx = points_on_owned_triangles_and_orphans.size();
                     points_on_owned_triangles_and_orphans.push_back(*pts[k]);
@@ -669,13 +666,13 @@ void process_tile(int tile_x, int tile_y,
         }
     }
 
-    // Explicitly add "orphaned" vertices that we own spatially.
-    // It is possible to own a vertex spatially (it's in our tile) but NOT own any of the 
+    // Explicitly add "orphaned" points that we own spatially.
+    // It is possible to own a point spatially (it's in our tile) but NOT own any of the
     // triangles connected to it (due to the min_id rule giving them to neighbors).
-    // We must still track this vertex so we can assign it a Global ID and answer requests.
+    // We must still track this point so we can assign it a Global ID and answer requests.
     for (const auto& p : points_with_halos) {
         if (get_owner_rank(p.x, p.y, comm_size) == comm_rank) {
-             uint64_t pid = p.id;
+             uint64_t pid = p.unique_hash_id;
              if (id_to_idx.find(pid) == id_to_idx.end()) {
                  int new_idx = points_on_owned_triangles_and_orphans.size();
                  points_on_owned_triangles_and_orphans.push_back(p);
@@ -689,7 +686,7 @@ void process_tile(int tile_x, int tile_y,
 // ~~~~~~~~~~~~~~~~~
 
 // Return a PETSc DM for the points and triangles passed in
-DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
+DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
     int comm_rank, comm_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
@@ -698,7 +695,7 @@ DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_o
     std::vector<PetscInt> global_ids(num_points_on_owned_triangles_and_orphans, -1);
     PetscInt num_points_owned = 0;
 
-    // 1. Identify Owned Vertices
+    // 1. Identify Owned points
     for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
         if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
             num_points_owned++;
@@ -709,7 +706,7 @@ DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_o
     PetscInt start_id = 0;
     MPI_Exscan(&num_points_owned, &start_id, 1, MPIU_INT, MPI_SUM, MPI_COMM_WORLD);
 
-    // 3. Assign Global IDs to Owned Vertices
+    // 3. Assign Global IDs to Owned points
     PetscInt current_id = start_id;
     for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
         if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
@@ -726,7 +723,8 @@ DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_o
         // If we don't own it we need to find out who does and ask them for the global id
         if (global_ids[i] == -1) {
             int owner = get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size);
-            send_ids[owner].push_back(points_on_owned_triangles_and_orphans[i].id);
+            // We send the unique hash id to identify the point
+            send_ids[owner].push_back(points_on_owned_triangles_and_orphans[i].unique_hash_id);
             send_req_indices[owner].push_back(i);
         }
     }
@@ -758,7 +756,7 @@ DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_o
     std::map<uint64_t, PetscInt> points_owned_l2g_map;
     for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
         if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
-            points_owned_l2g_map[points_on_owned_triangles_and_orphans[i].id] = global_ids[i];
+            points_owned_l2g_map[points_on_owned_triangles_and_orphans[i].unique_hash_id] = global_ids[i];
         }
     }
 
@@ -807,9 +805,9 @@ DM CreateDistributedDM(const std::vector<Point>& points_on_owned_triangles_and_o
     }
 
     // Prepare coordinates for DMPlexCreateFromCellListParallelPetsc
-    // points_on_owned_triangles_and_orphans contains ghosts (vertices of owned triangles that are owned by neighbors).
-    // PETSc expects 'numPoints' to be the count of locally owned vertices, 
-    // and 'coords' to be the coordinates of those specific vertices
+    // points_on_owned_triangles_and_orphans contains ghosts (points of owned triangles that are owned by neighbors).
+    // PETSc expects 'numPoints' to be the count of locally owned points, 
+    // and 'coords' to be the coordinates of those specific points
     std::vector<PetscReal> coords_points_owned;
     coords_points_owned.reserve(num_points_owned * 2);
     
@@ -944,7 +942,7 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
     // Output stats to rank 0
     if (rank == 0) {
         std::cout << "\n=== Mesh Statistics ===\n";
-        std::cout << "Vertices:\n";
+        std::cout << "Points:\n";
         std::cout << "  Total: " << num_points_owned_global << "\n";
         std::cout << "  Min per Rank: " << min_points_owned_global << "\n";
         std::cout << "  Max per Rank: " << max_points_owned_global << "\n";
@@ -1029,7 +1027,7 @@ int main(int argc, char** argv) {
 
     ComputeAndPrintStats(points_on_owned_triangles_and_orphans, triangles_owned, comm_rank, comm_size);
 
-    DM dm = CreateDistributedDM(points_on_owned_triangles_and_orphans, triangles_owned);
+    DM dm = CreateDM(points_on_owned_triangles_and_orphans, triangles_owned);
     PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
     
     if (WRITE_MESH) {
