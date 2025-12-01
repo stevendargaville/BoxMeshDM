@@ -1,3 +1,4 @@
+#include "box_2D_gen_unstruc_mesh.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -30,14 +31,13 @@
 // 4. Constraint: Boundary nodes only move tangentially.
 // =========================================================
 
-int TILE_DIM = -1;
+static int TILE_DIM = -1;
 const double DOMAIN_SIZE = 1.0;
-double TARGET_EDGE_LENGTH = 0.0025; // Default value - can be overriden by command line
+static double TARGET_EDGE_LENGTH = 0.0025; 
 
-// We need these to be relative to edge length to support very fine meshes
-double TOL_LEN;
-double TOL_LEN_SQ;
-double TOL_VOLUME;
+static double TOL_LEN;
+static double TOL_LEN_SQ;
+static double TOL_VOLUME;
 
 const double EPSILON = 1e-13;     
 const double START_JITTER = 0.30;
@@ -120,7 +120,7 @@ static void FiniOutput_Triangle(struct triangulateio *outputCtx)
 // ~~~~~~~~~~~~~~~~~
 
 // Helper to determine which rank owns a point based on spatial location
-int get_owner_rank(double x, double y, int size) {
+static int get_owner_rank(double x, double y, int size) {
     double tile_s = DOMAIN_SIZE / TILE_DIM;
     int tx = std::floor(x / tile_s);
     int ty = std::floor(y / tile_s);
@@ -139,7 +139,7 @@ int get_owner_rank(double x, double y, int size) {
 
 // Returns true if point is on a boundary.
 // Modifies dx, dy to ensure movement is only tangential (sliding).
-bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
+static bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
     bool on_boundary = false;
 
     // Left (x=0)
@@ -167,33 +167,28 @@ bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
     return on_boundary;
 }
 
-// Helper for boundary check
-bool is_on_boundary(const Point& p) {
-    return p.x < EPSILON || p.x > 1.0-EPSILON || p.y < EPSILON || p.y > 1.0-EPSILON;
-}
-
 // ~~~~~~~~~~~~~~~~~
 
-uint64_t splitmix64(uint64_t& x) {
+static uint64_t splitmix64(uint64_t& x) {
     uint64_t z = (x += 0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
     z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
     return z ^ (z >> 31);
 }
 
-double next_double(RngState& state) {
+static double next_double(RngState& state) {
     return (splitmix64(state.s) >> 11) * (1.0 / 9007199254740992.0);
 }
 
 // Helper for hashing
-void hash_combine(uint64_t& h, double v) {
+static void hash_combine(uint64_t& h, double v) {
     union { double d; uint64_t u; } c;
     c.d = v;
     h ^= c.u + 0x9e3779b9 + (h << 6) + (h >> 2);
 }
 
 // Helper to create a point with a unique hash ID based on initial position
-Point create_point_with_unique_hash_id(double x, double y) {
+static Point create_point_with_unique_hash_id(double x, double y) {
     uint64_t h = 0;
     hash_combine(h, x);
     hash_combine(h, y);
@@ -203,7 +198,7 @@ Point create_point_with_unique_hash_id(double x, double y) {
 // ~~~~~~~~~~~~~~~~~
 
 // Applies deterministic jitter
-void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
+static void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
     for (size_t i = 0; i < points.size(); ++i) {
         // Hash based on unique hash ID + iters Offset
         // This ensures that even if the point moves, the jitter sequence is deterministic
@@ -228,7 +223,7 @@ void apply_jitter(std::vector<Point>& points, double amount, int seed_offset) {
 // ~~~~~~~~~~~~~~~~~
 
 // Wrapper for Triangle library - https://www.cs.cmu.edu/~quake/triangle.html
-std::vector<Triangle> triangulation(const std::vector<Point>& points) {
+static std::vector<Triangle> triangulation(const std::vector<Point>& points) {
     struct triangulateio in;
     struct triangulateio out;    
     
@@ -270,10 +265,10 @@ std::vector<Triangle> triangulation(const std::vector<Point>& points) {
 // ~~~~~~~~~~~~~~~~~
 
 // Helper: Calculate minimum angle (degrees) of a triangle
-double clamp_val(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
+static double clamp_val(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
 
 // Gets the smallest angle in a triangle in degrees
-double get_min_angle_deg(const Point& a, const Point& b, const Point& c) {
+static double get_min_angle_deg(const Point& a, const Point& b, const Point& c) {
     double ab2 = (a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y);
     double bc2 = (b.x-c.x)*(b.x-c.x) + (b.y-c.y)*(b.y-c.y);
     double ca2 = (c.x-a.x)*(c.x-a.x) + (c.y-a.y)*(c.y-a.y);
@@ -295,7 +290,7 @@ double get_min_angle_deg(const Point& a, const Point& b, const Point& c) {
 // ~~~~~~~~~~~~~~~~~
 
 // Helper for relax_points to calculate local min angle
-double calculate_local_min_angle(int node_idx, const Point& node_pos, 
+static double calculate_local_min_angle(int node_idx, const Point& node_pos, 
                                  const std::vector<Point>& points, 
                                  const std::vector<Triangle>& triangles, 
                                  const std::vector<int>& connected_tris) {
@@ -319,7 +314,7 @@ double calculate_local_min_angle(int node_idx, const Point& node_pos,
 // Lloyd-smoothing - only smooths points within a certain box
 // that way we can lock the outermost points in the halo, so the halo 
 // doesn't shrink inwards
-void relax_points(std::vector<Point>& points, const std::vector<Triangle>& triangles, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
+static void relax_points(std::vector<Point>& points, const std::vector<Triangle>& triangles, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
     int n = points.size();
     
     // Accumulators for volume-Weighted Centroids
@@ -414,7 +409,7 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& trian
 // ~~~~~~~~~~~~~~~~~
 
 // Helper to remove duplicates from cloud
-void remove_duplicates(std::vector<Point>& points) {
+static void remove_duplicates(std::vector<Point>& points) {
     if (points.empty()) return;
 
     // Use strict lexicographical sort. 
@@ -446,7 +441,7 @@ void remove_duplicates(std::vector<Point>& points) {
 // ~~~~~~~~~~~~~~~~~
 
 // Builds a tile, creates points and triangulates
-void process_tile(int tile_x, int tile_y, 
+static void process_tile(MPI_Comm comm, int tile_x, int tile_y, 
                   std::vector<Point>& points_on_owned_triangles_and_orphans, 
                   std::vector<Triangle>& triangles_owned) {
 
@@ -454,8 +449,8 @@ void process_tile(int tile_x, int tile_y,
     std::map<uint64_t, int> id_to_idx;
 
     int comm_rank, comm_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);      
+    MPI_Comm_rank(comm, &comm_rank);
+    MPI_Comm_size(comm, &comm_size);      
     
     double tile_s = DOMAIN_SIZE / TILE_DIM;
     double t_min_x = tile_x * tile_s; double t_max_x = (tile_x + 1) * tile_s;
@@ -707,10 +702,10 @@ void process_tile(int tile_x, int tile_y,
 // ~~~~~~~~~~~~~~~~~
 
 // Return a PETSc DM for the points and triangles passed in
-DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
+static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
     int comm_rank, comm_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+    MPI_Comm_rank(comm, &comm_rank);
+    MPI_Comm_size(comm, &comm_size);
 
     PetscInt num_points_on_owned_triangles_and_orphans = points_on_owned_triangles_and_orphans.size();
     std::vector<PetscInt> global_ids(num_points_on_owned_triangles_and_orphans, -1);
@@ -725,7 +720,7 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
 
     // 2. Calculate Global Offsets - petscint to ensure large counts work
     PetscInt start_id = 0;
-    MPI_Exscan(&num_points_owned, &start_id, 1, MPIU_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Exscan(&num_points_owned, &start_id, 1, MPIU_INT, MPI_SUM, comm);
 
     // 3. Assign Global IDs to Owned points
     PetscInt current_id = start_id;
@@ -753,7 +748,7 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
     // Exchange counts
     std::vector<int> send_counts(comm_size), recv_counts(comm_size);
     for(int r=0; r<comm_size; ++r) send_counts[r] = send_ids[r].size();
-    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
 
     // ---------------------------------------------------------
     // PHASE 1: Exchange Hash IDs (Requests)
@@ -767,7 +762,7 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
         if(recv_counts[r] > 0) {
             recv_ids[r].resize(recv_counts[r]);
             MPI_Request req;
-            MPI_Irecv(recv_ids[r].data(), recv_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD, &req);
+            MPI_Irecv(recv_ids[r].data(), recv_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, comm, &req);
             requests.push_back(req);
         }
     }
@@ -777,7 +772,7 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
         if (r == comm_rank) continue;
         if (send_counts[r] > 0) {
             MPI_Request req;
-            MPI_Isend(send_ids[r].data(), send_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, MPI_COMM_WORLD, &req);
+            MPI_Isend(send_ids[r].data(), send_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, comm, &req);
             requests.push_back(req);
         }
     }
@@ -822,7 +817,7 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
         if (send_counts[r] > 0) {
             recv_answers[r].resize(send_counts[r]);
             MPI_Request req;
-            MPI_Irecv(recv_answers[r].data(), send_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD, &req);
+            MPI_Irecv(recv_answers[r].data(), send_counts[r] * sizeof(PetscInt), MPI_BYTE, r, 101, comm, &req);
             requests.push_back(req);
         }
     }
@@ -831,7 +826,7 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
     for(int r=0; r<comm_size; ++r) {
         if (recv_counts[r] > 0) {
             MPI_Request req;
-            MPI_Isend(send_answers[r].data(), recv_counts[r], MPIU_INT, r, 101, MPI_COMM_WORLD, &req);
+            MPI_Isend(send_answers[r].data(), recv_counts[r] * sizeof(PetscInt), MPI_BYTE, r, 101, comm, &req);
             requests.push_back(req);
         }
     }
@@ -881,8 +876,7 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
     // Build the DM
     PetscInt two = 2;
     PetscInt three = 3;
-    // Pass num_points_owned instead of num_points_on_owned_triangles_and_orphans, and coords_points_owned instead of coords
-    (void*)DMPlexCreateFromCellListParallelPetsc(MPI_COMM_WORLD, two, num_tris_owned, num_points_owned, PETSC_DECIDE, \
+    (void*)DMPlexCreateFromCellListParallelPetsc(comm, two, num_tris_owned, num_points_owned, PETSC_DECIDE, \
          three, PETSC_TRUE, cells.data(), two, coords_points_owned.data(), NULL, NULL, &dm);
     return dm;
 }
@@ -890,7 +884,7 @@ DM CreateDM(const std::vector<Point>& points_on_owned_triangles_and_orphans, con
 // ~~~~~~~~~~~~~~~~~
 
 // Label boundary faces and vertices based on geometric location
-void LabelBoundaries(DM dm) {
+static void LabelBoundaries(DM dm) {
 
     // Create a label named "Face Sets" (standard name for boundary markers)
     // Values: 1=Bottom, 2=Right, 3=Top, 4=Left
@@ -980,7 +974,10 @@ void LabelBoundaries(DM dm) {
 // ~~~~~~~~~~~~~~~~~
 
 // Print mesh statistics on rank 0
-void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned, int rank, int size) {
+static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
 
     // 1. Compute load imbalance & Connectivity
     long points_owned = 0;
@@ -1000,17 +997,17 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
     }
 
     long min_points_owned_global, max_points_owned_global, num_points_owned_global;
-    MPI_Reduce(&points_owned, &min_points_owned_global, 1, MPI_LONG, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&points_owned, &max_points_owned_global, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&points_owned, &num_points_owned_global, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&points_owned, &min_points_owned_global, 1, MPI_LONG, MPI_MIN, 0, comm);
+    MPI_Reduce(&points_owned, &max_points_owned_global, 1, MPI_LONG, MPI_MAX, 0, comm);
+    MPI_Reduce(&points_owned, &num_points_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
 
     long global_conn_bins[MAX_CONN] = {0};
-    MPI_Reduce(local_conn_bins, global_conn_bins, MAX_CONN, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_conn_bins, global_conn_bins, MAX_CONN, MPI_LONG, MPI_SUM, 0, comm);
 
     // 2. Triangle Statistics (Volume & Angles)
     long num_tris_owned = triangles_owned.size();
     long num_tris_owned_global;
-    MPI_Reduce(&num_tris_owned, &num_tris_owned_global, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&num_tris_owned, &num_tris_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
 
     double local_min_volume = 1e30, local_max_volume = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
@@ -1092,13 +1089,13 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
     double global_min_volume, global_max_volume;
     double global_min_angle, global_max_angle;
 
-    MPI_Reduce(&local_min_volume, &global_min_volume, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_max_volume, &global_max_volume, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_min_angle, &global_min_angle, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_max_angle, &global_max_angle, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_min_volume, &global_min_volume, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+    MPI_Reduce(&local_max_volume, &global_max_volume, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    MPI_Reduce(&local_min_angle, &global_min_angle, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+    MPI_Reduce(&local_max_angle, &global_max_angle, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
 
     std::vector<long> global_bins(18);
-    MPI_Reduce(local_bins.data(), global_bins.data(), 18, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_bins.data(), global_bins.data(), 18, MPI_LONG, MPI_SUM, 0, comm);
 
     // Output stats to rank 0
     if (rank == 0) {
@@ -1146,25 +1143,16 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
 
 // ~~~~~~~~~~~~~~~~~
 
-int main(int argc, char** argv) {
+DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length) {
+    int comm_rank, comm_size;
+    MPI_Comm_rank(comm, &comm_rank);
+    MPI_Comm_size(comm, &comm_size);
 
-    PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
-
-    // Parse command line options
-    PetscBool set;
-    PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &TARGET_EDGE_LENGTH, &set));
-
-    PetscBool WRITE_MESH = PETSC_FALSE;
-    PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &WRITE_MESH, NULL));
-
-    // Initialize dependent variables
+    // 1. Setup Globals
+    TARGET_EDGE_LENGTH = target_edge_length;
     TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
     TOL_LEN_SQ = TOL_LEN * TOL_LEN;
     TOL_VOLUME = TOL_LEN_SQ * 1e-2;
-
-    int comm_rank, comm_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
     // Check if comm_size is a perfect square
     int root = std::round(std::sqrt(comm_size));
@@ -1172,7 +1160,8 @@ int main(int argc, char** argv) {
         if (comm_rank == 0) {
             std::cerr << "Error: Number of MPI ranks (" << comm_size << ") must be a perfect square (e.g., 1, 4, 9, 16).\n";
         }
-        std::exit(EXIT_FAILURE);
+        // We cannot exit(1) in a library routine, return NULL or throw
+        return NULL; 
     }
     TILE_DIM = root;
 
@@ -1185,50 +1174,78 @@ int main(int argc, char** argv) {
     std::vector<Point> points_on_owned_triangles_and_orphans;
     std::vector<Triangle> triangles_owned;
 
-    // Distribute tiles cyclically among ranks
+    // 2. Distribute tiles cyclically among ranks
     for (int y = 0; y < TILE_DIM; ++y) {
         for (int x = 0; x < TILE_DIM; ++x) {
             int global_id = y * TILE_DIM + x;
             
             if (global_id % comm_size == comm_rank) {
-                process_tile(x, y, points_on_owned_triangles_and_orphans, triangles_owned);
+                process_tile(comm, x, y, points_on_owned_triangles_and_orphans, triangles_owned);
             }
         }
     }
 
     std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
-    // Print stats about the mesh
-    ComputeAndPrintStats(points_on_owned_triangles_and_orphans, triangles_owned, comm_rank, comm_size);
+    // 3. Print stats
+    ComputeAndPrintStats(comm, points_on_owned_triangles_and_orphans, triangles_owned);
 
-    // Create the DM
+    // 4. Create the DM
     if (comm_rank == 0) std::cout << "Creating DM...\n";
-    DM dm = CreateDM(points_on_owned_triangles_and_orphans, triangles_owned);
-    PetscCall(PetscObjectSetName((PetscObject)dm, "Mesh"));
+    DM dm = CreateDM(comm, points_on_owned_triangles_and_orphans, triangles_owned);
+    (void*)PetscObjectSetName((PetscObject)dm, "Mesh");
     
-    // Label boundaries
+    // 5. Label boundaries
     LabelBoundaries(dm);
 
-    if (WRITE_MESH) {
+    return dm;
+}
+
+// =========================================================
+// Main Driver
+// =========================================================
+
+int main(int argc, char** argv) {
+
+    PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
+
+    int comm_rank, comm_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);    
+
+    // Parse command line options
+    double target_len = 0.0025;
+    PetscBool set;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &target_len, &set));
+
+    PetscBool write_mesh = PETSC_FALSE;
+    PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &write_mesh, NULL));
+
+    // Generate the Dm for this mesh
+    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len);
+
+    // Write output if requested
+    // Can view this in paraview with:
+    // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
+    // then using the XDMF reader in:
+    // paraview box_mesh.xmf
+    if (write_mesh) {
         PetscViewer viewer;
-        // Can view this in paraview with:
-        // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
-        // then using the XDMF reader
-        // paraview box_mesh.xmf
         if (comm_rank == 0) {
             std::cout << "Writing out mesh...\n";        
         }
         PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
         PetscCall(DMView(dm, viewer));
         PetscCall(PetscViewerDestroy(&viewer));
+    }    
+
+    if (dm) {
+        PetscCall(DMDestroy(&dm));
+    } else {
+        PetscCall(PetscFinalize());
+        return EXIT_FAILURE;
     }
 
-    points_on_owned_triangles_and_orphans.clear();
-    triangles_owned.clear();
-
-    PetscCall(DMDestroy(&dm));
     PetscCall(PetscFinalize());
     return 0;
 }
-
-// ~~~~~~~~~~~~~~~~~
