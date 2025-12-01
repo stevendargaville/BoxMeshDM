@@ -37,7 +37,7 @@ double TARGET_EDGE_LENGTH = 0.0025; // Default value - can be overriden by comma
 // We need these to be relative to edge length to support very fine meshes
 double TOL_LEN;
 double TOL_LEN_SQ;
-double TOL_AREA;
+double TOL_VOLUME;
 
 const double EPSILON = 1e-13;     
 const double START_JITTER = 0.30;
@@ -54,6 +54,7 @@ const int FINAL_SMOOTH_ITERS = 2;
 struct Point {
     double x, y; // coordinates
     uint64_t unique_hash_id = 0; // unique id based on hashing coordinates
+    int valence = 0; // <--- Store connectivity here
 };
 struct Triangle {
     int v0, v1, v2;
@@ -321,7 +322,7 @@ double calculate_local_min_angle(int node_idx, const Point& node_pos,
 void relax_points(std::vector<Point>& points, const std::vector<Triangle>& triangles, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
     int n = points.size();
     
-    // Accumulators for Area-Weighted Centroids
+    // Accumulators for volume-Weighted Centroids
     std::vector<double> wx(n, 0.0), wy(n, 0.0);
     std::vector<double> w_sum(n, 0.0);
     
@@ -338,15 +339,15 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& trian
         double cx = (p0.x + p1.x + p2.x) / 3.0;
         double cy = (p0.y + p1.y + p2.y) / 3.0;
 
-        // 2. Calculate Triangle Area
-        // Area = 0.5 * |(x1-x0)(y2-y0) - (y1-y0)(x2-x0)|
-        double area = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
+        // 2. Calculate Triangle volume
+        // volume = 0.5 * |(x1-x0)(y2-y0) - (y1-y0)(x2-x0)|
+        double volume = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
 
         // 3. Accumulate weighted centroid for all points of this triangle
-        wx[t.v0] += area * cx; wy[t.v0] += area * cy; w_sum[t.v0] += area;
-        wx[t.v1] += area * cx; wy[t.v1] += area * cy; w_sum[t.v1] += area;
-        wx[t.v2] += area * cx; wy[t.v2] += area * cy; w_sum[t.v2] += area;
-        
+        wx[t.v0] += volume * cx; wy[t.v0] += volume * cy; w_sum[t.v0] += volume;
+        wx[t.v1] += volume * cx; wy[t.v1] += volume * cy; w_sum[t.v1] += volume;
+        wx[t.v2] += volume * cx; wy[t.v2] += volume * cy; w_sum[t.v2] += volume;
+
         point_to_tris[t.v0].push_back(k);
         point_to_tris[t.v1].push_back(k);
         point_to_tris[t.v2].push_back(k);
@@ -356,12 +357,12 @@ void relax_points(std::vector<Point>& points, const std::vector<Triangle>& trian
     std::vector<double> candidate_factors = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7};
 
     for (int i=0; i<n; ++i) {
-        if (w_sum[i] < TOL_AREA) continue;
+        if (w_sum[i] < TOL_VOLUME) continue;
         
         // Update if in valid safe zone (ignoring deep ghost layers)
         if (points[i].x > min_safe_x && points[i].x < max_safe_x && points[i].y > min_safe_y && points[i].y < max_safe_y) {
             
-            // Target is the area-weighted average of surrounding triangle centroids
+            // Target is the volume-weighted average of surrounding triangle centroids
             double tx = wx[i] / w_sum[i]; 
             double ty = wy[i] / w_sum[i];
             
@@ -626,6 +627,26 @@ void process_tile(int tile_x, int tile_y,
     // Final mesh
     triangles_with_halos = triangulation(points_with_halos);
     
+    // CALCULATE VALENCE (Connectivity)
+    // We do this here because we have the full halo information.
+    // For owned points (which are internal to this haloed mesh), this gives the correct global valence.
+    // We use a set to count unique neighbors (edges), which handles both internal and boundary nodes correctly.
+    std::vector<std::set<uint64_t>> adj(points_with_halos.size());
+    for(const auto& t : triangles_with_halos) {
+        adj[t.v0].insert(points_with_halos[t.v1].unique_hash_id);
+        adj[t.v0].insert(points_with_halos[t.v2].unique_hash_id);
+        
+        adj[t.v1].insert(points_with_halos[t.v0].unique_hash_id);
+        adj[t.v1].insert(points_with_halos[t.v2].unique_hash_id);
+        
+        adj[t.v2].insert(points_with_halos[t.v0].unique_hash_id);
+        adj[t.v2].insert(points_with_halos[t.v1].unique_hash_id);
+    }
+    
+    for(size_t i=0; i<points_with_halos.size(); ++i) {
+        points_with_halos[i].valence = adj[i].size();
+    }
+
     // We only keep triangles that are geometrically "owned" by this tile
     for (const auto& tri : triangles_with_halos) {
         const Point& p0 = points_with_halos[tri.v0];
@@ -961,11 +982,20 @@ void LabelBoundaries(DM dm) {
 // Print mesh statistics on rank 0
 void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned, int rank, int size) {
 
-    // 1. Compute load imbalance
+    // 1. Compute load imbalance & Connectivity
     long points_owned = 0;
+    const int MAX_CONN = 30;
+    long local_conn_bins[MAX_CONN] = {0};
+    
+    // Bin the valences
     for (const auto& p : points_on_owned_triangles_and_orphans) {
         if (get_owner_rank(p.x, p.y, size) == rank) {
             points_owned++;
+            
+            // Bin Connectivity using pre-calculated valence
+            int degree = p.valence;
+            if (degree >= MAX_CONN) degree = MAX_CONN - 1;
+            local_conn_bins[degree]++;
         }
     }
 
@@ -974,12 +1004,15 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
     MPI_Reduce(&points_owned, &max_points_owned_global, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&points_owned, &num_points_owned_global, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    // 2. Triangle Statistics (Area & Angles)
+    long global_conn_bins[MAX_CONN] = {0};
+    MPI_Reduce(local_conn_bins, global_conn_bins, MAX_CONN, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    // 2. Triangle Statistics (Volume & Angles)
     long num_tris_owned = triangles_owned.size();
     long num_tris_owned_global;
     MPI_Reduce(&num_tris_owned, &num_tris_owned_global, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    double local_min_area = 1e30, local_max_area = -1.0;
+    double local_min_volume = 1e30, local_max_volume = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
 
     // 3. Edge Orientation Statistics
@@ -991,10 +1024,10 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
         const Point& p1 = points_on_owned_triangles_and_orphans[t.v1];
         const Point& p2 = points_on_owned_triangles_and_orphans[t.v2];
 
-        // Area
-        double area = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
-        if (area < local_min_area) local_min_area = area;
-        if (area > local_max_area) local_max_area = area;
+        // volume
+        double volume = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
+        if (volume < local_min_volume) local_min_volume = volume;
+        if (volume > local_max_volume) local_max_volume = volume;
 
         // Angles
         double d01_sq = std::pow(p1.x-p0.x, 2) + std::pow(p1.y-p0.y, 2);
@@ -1052,15 +1085,15 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
     }
 
     if (triangles_owned.empty()) {
-        local_min_area = 1e30; local_max_area = -1.0;
+        local_min_volume = 1e30; local_max_volume = -1.0;
         local_min_angle = 360.0; local_max_angle = -1.0;
     }
 
-    double global_min_area, global_max_area;
+    double global_min_volume, global_max_volume;
     double global_min_angle, global_max_angle;
 
-    MPI_Reduce(&local_min_area, &global_min_area, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_max_area, &global_max_area, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_min_volume, &global_min_volume, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_max_volume, &global_max_volume, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_min_angle, &global_min_angle, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_max_angle, &global_max_angle, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
@@ -1076,11 +1109,23 @@ void ComputeAndPrintStats(const std::vector<Point>& points_on_owned_triangles_an
         std::cout << "  Max per Rank: " << max_points_owned_global << "\n";
         std::cout << "  Imbalance Ratio (Max/Avg): " << (double)max_points_owned_global / ((double)num_points_owned_global / size) << "\n";
         
+        std::cout << "Connectivity (Valence):\n";
+        for(int i=0; i<MAX_CONN; ++i) {
+            if (global_conn_bins[i] > 0) {
+                double pct = 100.0 * global_conn_bins[i] / num_points_owned_global;
+                std::cout << "  Degree " << std::setw(2) << i << ": " 
+                          << std::setw(8) << global_conn_bins[i] 
+                          << " (" << std::fixed << std::setprecision(2) << pct << "%)\n";
+            }
+        }
+
         std::cout << "Triangles:\n";
         std::cout << "  Total: " << num_tris_owned_global << "\n";
-        std::cout << "  Area Min: " << global_min_area << "\n";
-        std::cout << "  Area Max: " << global_max_area << "\n";
-        std::cout << "  Area Ratio: " << (global_min_area > 0 ? global_max_area / global_min_area : -1.0) << "\n";
+        std::cout << "  Volume Min: " << std::scientific << global_min_volume << "\n";
+        std::cout << "  Volume Max: " << std::scientific << global_max_volume << "\n";
+        
+        std::cout << std::defaultfloat << std::setprecision(6);
+        std::cout << "  Volume Ratio: " << (global_min_volume > 0 ? global_max_volume / global_min_volume : -1.0) << "\n";
         std::cout << "  Angle Min: " << global_min_angle << " deg\n";
         std::cout << "  Angle Max: " << global_max_angle << " deg\n";
 
@@ -1115,7 +1160,7 @@ int main(int argc, char** argv) {
     // Initialize dependent variables
     TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
     TOL_LEN_SQ = TOL_LEN * TOL_LEN;
-    TOL_AREA = TOL_LEN_SQ * 1e-2;
+    TOL_VOLUME = TOL_LEN_SQ * 1e-2;
 
     int comm_rank, comm_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
