@@ -56,6 +56,7 @@ struct Point {
     double x, y; // coordinates
     uint64_t unique_hash_id = 0; // unique id based on hashing coordinates
     int valence = 0; // <--- Store connectivity here
+    int fixed_owner = -1; // <--- NEW: Explicit ownership override
 };
 struct Triangle {
     int v0, v1, v2;
@@ -121,11 +122,15 @@ static void FiniOutput_Triangle(struct triangulateio *outputCtx)
 // ~~~~~~~~~~~~~~~~~
 
 // Helper to determine which rank owns a point based on spatial location
-static int get_owner_rank(double x, double y, int size) {
+static int get_owner_rank(const Point& p, int size) {
+
+   // Use fixed owner if it is available
+   if (p.fixed_owner != -1) return p.fixed_owner;
+
     double tile_s_x = DOMAIN_SIZE / TILE_DIM_X;
     double tile_s_y = DOMAIN_SIZE / TILE_DIM_Y;
-    int tx = std::floor(x / tile_s_x);
-    int ty = std::floor(y / tile_s_y);
+    int tx = std::floor(p.x / tile_s_x);
+    int ty = std::floor(p.y / tile_s_y);
     
     // Clamp to handle numerical noise at upper boundaries
     if (tx < 0) tx = 0; 
@@ -136,6 +141,171 @@ static int get_owner_rank(double x, double y, int size) {
     int global_tile_id = ty * TILE_DIM_X + tx;
     // With 1 tile per rank, the tile ID is the rank
     return global_tile_id;
+}
+
+// NEW: Deterministically resolve ownership of boundary nodes
+static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    struct Claim {
+        uint64_t id;
+        int geo_rank;
+        double x, y; // Include coordinates for synchronization
+    };
+
+    // 1. Identify points near boundary to exchange
+    // We use a safe margin to catch any point that might be ambiguous
+    double margin = TARGET_EDGE_LENGTH * 2.0; 
+    
+    std::vector<std::vector<Claim>> send_buffers(size);
+    std::set<uint64_t> involved_ids; // Only resolve points near boundaries
+    
+    // Simple neighbor discovery: check all ranks (for small scale) or use grid logic
+    // Here we use the grid logic to only send to actual neighbors
+    int tx = rank % TILE_DIM_X;
+    int ty = rank / TILE_DIM_X;
+    
+    for (auto& p : points) {
+        // Check if point is near a tile boundary
+        double t_min_x = tx * (DOMAIN_SIZE / TILE_DIM_X);
+        double t_max_x = (tx + 1) * (DOMAIN_SIZE / TILE_DIM_X);
+        double t_min_y = ty * (DOMAIN_SIZE / TILE_DIM_Y);
+        double t_max_y = (ty + 1) * (DOMAIN_SIZE / TILE_DIM_Y);
+
+        // Strict bounding box check:
+        // A rank should only claim a point if it is within its tile (plus margin).
+        if (p.x < t_min_x - margin || p.x > t_max_x + margin ||
+            p.y < t_min_y - margin || p.y > t_max_y + margin) {
+            continue;
+        }
+
+        bool near_x = (std::abs(p.x - t_min_x) < margin) || (std::abs(p.x - t_max_x) < margin);
+        bool near_y = (std::abs(p.y - t_min_y) < margin) || (std::abs(p.y - t_max_y) < margin);
+
+        if (near_x || near_y) {
+            involved_ids.insert(p.unique_hash_id);
+            // Let's reset the fixed owner in case we have moved the point again
+            p.fixed_owner = -1;
+            int my_geo_rank = get_owner_rank(p, size); // fixed_owner is -1 here
+
+            // It's a boundary candidate. Send to neighbors.
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = tx + dx;
+                    int ny = ty + dy;
+                    if (nx >= 0 && nx < TILE_DIM_X && ny >= 0 && ny < TILE_DIM_Y) {
+                        int n_rank = ny * TILE_DIM_X + nx;
+                        send_buffers[n_rank].push_back({p.unique_hash_id, my_geo_rank, p.x, p.y});
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Exchange Candidates
+    std::vector<int> send_counts(size), recv_counts(size);
+    for(int r=0; r<size; ++r) send_counts[r] = send_buffers[r].size();
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+
+    std::vector<std::vector<Claim>> recv_buffers(size);
+    std::vector<MPI_Request> requests;
+
+    for(int r=0; r<size; ++r) {
+        if (recv_counts[r] > 0) {
+            recv_buffers[r].resize(recv_counts[r]);
+            MPI_Request req;
+            MPI_Irecv(recv_buffers[r].data(), recv_counts[r] * sizeof(Claim), MPI_BYTE, r, 999, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    for(int r=0; r<size; ++r) {
+        if (send_counts[r] > 0) {
+            MPI_Request req;
+            MPI_Isend(send_buffers[r].data(), send_counts[r] * sizeof(Claim), MPI_BYTE, r, 999, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    if (!requests.empty()) MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+
+    // 3. Resolve Ownership
+    // We track:
+    //  - The set of geometric ranks calculated by all claimers (to detect disagreement)
+    //  - The lowest rank that claimed the point (to pick a winner)
+    //  - The coordinates associated with that lowest rank (to sync geometry)
+    struct ResolutionData {
+        std::set<int> observed_geo_ranks;
+        int best_rank = 999999;
+        double best_x = 0, best_y = 0;
+    };
+    std::map<uint64_t, ResolutionData> resolution_map;
+    
+    // Initialize with self ONLY for involved points
+    for(const auto& p : points) {
+        if (involved_ids.count(p.unique_hash_id)) {
+            int my_geo_rank = get_owner_rank(p, size);
+            ResolutionData& data = resolution_map[p.unique_hash_id];
+            data.observed_geo_ranks.insert(my_geo_rank);
+            data.best_rank = rank;
+            data.best_x = p.x;
+            data.best_y = p.y;
+        }
+    }
+
+    // Update with neighbors
+    for(int r=0; r<size; ++r) {
+        for(const auto& claim : recv_buffers[r]) {
+            involved_ids.insert(claim.id); // Mark as involved if a neighbor claims it
+            ResolutionData& data = resolution_map[claim.id];
+            
+            data.observed_geo_ranks.insert(claim.geo_rank);
+            
+            // Update best rank (lowest wins) and its coordinates
+            if (r < data.best_rank) {
+                data.best_rank = r;
+                data.best_x = claim.x;
+                data.best_y = claim.y;
+            }
+        }
+    }
+
+    // 4. Apply to points
+    for(auto& p : points) {
+        // Only process points involved in the boundary resolution
+        if (involved_ids.count(p.unique_hash_id)) {
+            const ResolutionData& data = resolution_map[p.unique_hash_id];
+
+            // double old_x = p.x;
+            // double old_y = p.y;
+            
+            // 4a. Synchronize Coordinates
+            // Everyone adopts the coordinates of the 'best_rank' to ensure geometric consistency
+            p.x = data.best_x;
+            p.y = data.best_y;
+
+            // 4b. Resolve Ownership Conflict
+            // Check if there is disagreement on the geometric rank
+            if (data.observed_geo_ranks.size() > 1) {
+                
+                // Disagreement exists! We must enforce a fixed owner.
+                // Strategy: Lowest rank ID among those who claimed it wins.
+                const std::set<int>& claims = data.observed_geo_ranks;
+                if (!claims.empty()) {
+                    int resolved_rank = *claims.begin(); // Lowest rank wins
+                    
+                    p.fixed_owner = resolved_rank;
+
+                  //   // print out all of the ranks which disagree on ownership
+                  //   std::cout << "[Rank " << rank << "] Point (" << std::setprecision(6) << old_x << ", " << old_y << " - new (" << p.x << ", " << p.y
+                  //             << ") CONFLICT. Geo Ranks: ";
+                  //   for(int g : data.observed_geo_ranks) std::cout << g << " ";
+                  //   std::cout << ". Assigned to Rank " << resolved_rank << "\n";
+                }
+            }
+        }
+    }
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -617,16 +787,25 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         apply_jitter(points_with_halos, current_jitter, iter);
         triangles_with_halos = triangulation(points_with_halos);
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+
+        // NEW: Sync boundary points immediately to prevent divergence
+        ResolveBoundaryOwnership(comm, points_with_halos);        
     }
     // Final smooth iterations without jitter
     for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
         triangles_with_halos = triangulation(points_with_halos);
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+
+        // NEW: Sync boundary points immediately to prevent divergence
+        ResolveBoundaryOwnership(comm, points_with_halos);        
     }
     
     // Final mesh
     triangles_with_halos = triangulation(points_with_halos);
     
+    // NEW: Resolve ownership before filtering
+    ResolveBoundaryOwnership(comm, points_with_halos);
+
     // CALCULATE VALENCE (Connectivity)
     // We do this here because we have the full halo information.
     // For owned points (which are internal to this haloed mesh), this gives the correct global valence.
@@ -665,8 +844,8 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         if (p1.unique_hash_id == min_hash_id) min_p = &p1;
         if (p2.unique_hash_id == min_hash_id) min_p = &p2;
 
-        // Check if WE own this determining point
-        int owner = get_owner_rank(min_p->x, min_p->y, comm_size);
+        // Check if WE own this determining point (using fixed_owner via overload)
+        int owner = get_owner_rank(*min_p, comm_size);
 
         if (owner == comm_rank) {
             Triangle new_t;
@@ -692,7 +871,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     // triangles connected to it (due to the min_id rule giving them to neighbors).
     // We must still track this point so we can assign it a Global ID and answer requests.
     for (const auto& p : points_with_halos) {
-        if (get_owner_rank(p.x, p.y, comm_size) == comm_rank) {
+        if (get_owner_rank(p, comm_size) == comm_rank) {
              uint64_t pid = p.unique_hash_id;
              if (id_to_idx.find(pid) == id_to_idx.end()) {
                  int new_idx = points_on_owned_triangles_and_orphans.size();
@@ -718,7 +897,7 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
 
     // 1. Identify Owned points
     for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
-        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size) == comm_rank) {
             num_points_owned++;
         }
     }
@@ -730,7 +909,7 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     // 3. Assign Global IDs to Owned points
     PetscInt current_id = start_id;
     for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
-        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size) == comm_rank) {
             global_ids[i] = current_id++;
         }
     }
@@ -743,7 +922,7 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
         // If we don't own it we need to find out who does and ask them for the global id
         if (global_ids[i] == -1) {
-            int owner = get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size);
+            int owner = get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size);
             // We send the unique hash id to identify the point
             send_ids[owner].push_back(points_on_owned_triangles_and_orphans[i].unique_hash_id);
             send_req_indices[owner].push_back(i);
@@ -795,7 +974,7 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     // We need a map for fast lookup between the unique hash id and the global id
     std::map<uint64_t, PetscInt> points_owned_l2g_map;
     for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
-        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size) == comm_rank) {
             points_owned_l2g_map[points_on_owned_triangles_and_orphans[i].unique_hash_id] = global_ids[i];
         }
     }
@@ -871,7 +1050,7 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     coords_points_owned.reserve(num_points_owned * 2);
     
     for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
-        if (get_owner_rank(points_on_owned_triangles_and_orphans[i].x, points_on_owned_triangles_and_orphans[i].y, comm_size) == comm_rank) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size) == comm_rank) {
             coords_points_owned.push_back(points_on_owned_triangles_and_orphans[i].x);
             coords_points_owned.push_back(points_on_owned_triangles_and_orphans[i].y);
         }
@@ -987,7 +1166,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_o
     // 1. Count Owned Points (needed for Euler)
     long num_points_owned = 0;
     for (const auto& p : points_on_owned_triangles_and_orphans) {
-        if (get_owner_rank(p.x, p.y, size) == rank) {
+        if (get_owner_rank(p, size) == rank) {
             num_points_owned++;
         }
     }
@@ -1106,7 +1285,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
     
     // Bin the valences
     for (const auto& p : points_on_owned_triangles_and_orphans) {
-        if (get_owner_rank(p.x, p.y, size) == rank) {
+        if (get_owner_rank(p, size) == rank) {
             points_owned++;
             
             // Bin Connectivity using pre-calculated valence
@@ -1183,7 +1362,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
                 double mx = (ep1.x + ep2.x) * 0.5;
                 double my = (ep1.y + ep2.y) * 0.5;
                 
-                if (get_owner_rank(mx, my, size) == rank) {
+                if (get_owner_rank(Point{mx, my}, size) == rank) {
                     double dx = ep2.x - ep1.x;
                     double dy = ep2.y - ep1.y;
                     // Angle in [0, 180)
