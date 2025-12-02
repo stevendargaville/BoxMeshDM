@@ -31,7 +31,8 @@
 // 4. Constraint: Boundary nodes only move tangentially.
 // =========================================================
 
-static int TILE_DIM = -1;
+static int TILE_DIM_X = -1;
+static int TILE_DIM_Y = -1;
 const double DOMAIN_SIZE = 1.0;
 static double TARGET_EDGE_LENGTH = 0.0025; 
 
@@ -121,18 +122,20 @@ static void FiniOutput_Triangle(struct triangulateio *outputCtx)
 
 // Helper to determine which rank owns a point based on spatial location
 static int get_owner_rank(double x, double y, int size) {
-    double tile_s = DOMAIN_SIZE / TILE_DIM;
-    int tx = std::floor(x / tile_s);
-    int ty = std::floor(y / tile_s);
+    double tile_s_x = DOMAIN_SIZE / TILE_DIM_X;
+    double tile_s_y = DOMAIN_SIZE / TILE_DIM_Y;
+    int tx = std::floor(x / tile_s_x);
+    int ty = std::floor(y / tile_s_y);
     
     // Clamp to handle numerical noise at upper boundaries
     if (tx < 0) tx = 0; 
-    if (tx >= TILE_DIM) tx = TILE_DIM - 1;
+    if (tx >= TILE_DIM_X) tx = TILE_DIM_X - 1;
     if (ty < 0) ty = 0; 
-    if (ty >= TILE_DIM) ty = TILE_DIM - 1;
+    if (ty >= TILE_DIM_Y) ty = TILE_DIM_Y - 1;
 
-    int global_tile_id = ty * TILE_DIM + tx;
-    return global_tile_id % size;
+    int global_tile_id = ty * TILE_DIM_X + tx;
+    // With 1 tile per rank, the tile ID is the rank
+    return global_tile_id;
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -452,9 +455,10 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);      
     
-    double tile_s = DOMAIN_SIZE / TILE_DIM;
-    double t_min_x = tile_x * tile_s; double t_max_x = (tile_x + 1) * tile_s;
-    double t_min_y = tile_y * tile_s; double t_max_y = (tile_y + 1) * tile_s;
+    double tile_s_x = DOMAIN_SIZE / TILE_DIM_X;
+    double tile_s_y = DOMAIN_SIZE / TILE_DIM_Y;
+    double t_min_x = tile_x * tile_s_x; double t_max_x = (tile_x + 1) * tile_s_x;
+    double t_min_y = tile_y * tile_s_y; double t_max_y = (tile_y + 1) * tile_s_y;
     
     // UNIFIED PADDING LOGIC
     // We generate a halo large enough to absorb the boundary effects of annealing.
@@ -465,9 +469,10 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     // Safety Check: Ensure the required halo doesn't exceed the tile size.
     // In a domain decomposition, needing a halo larger than the subdomain 
     // implies we need data from neighbors-of-neighbors, which is inefficient/complex.
-    if (pad > tile_s/2.0) {
+    double min_dim = std::min(tile_s_x, tile_s_y);
+    if (pad > min_dim/2.0) {
         std::cerr << "Error: Annealing iters (" << ANNEAL_ITERS << ") require a halo of " 
-                  << pad << ", which exceeds the tile size (" << tile_s << ").\n"
+                  << pad << ", which exceeds the tile size (" << min_dim << ").\n"
                   << "Reduce ANNEAL_ITERS or increase tile size (by having fewer tiles or more points per tile).\n";
         std::exit(EXIT_FAILURE);
     }    
@@ -1154,32 +1159,33 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length) {
     TOL_LEN_SQ = TOL_LEN * TOL_LEN;
     TOL_VOLUME = TOL_LEN_SQ * 1e-2;
 
-    // Check if comm_size is a perfect square
-    int root = std::round(std::sqrt(comm_size));
-    if (root * root != comm_size) {
-        if (comm_rank == 0) {
-            std::cerr << "Error: Number of MPI ranks (" << comm_size << ") must be a perfect square (e.g., 1, 4, 9, 16).\n";
-        }
-        // We cannot exit(1) in a library routine, return NULL or throw
-        return NULL; 
+    // Factorize comm_size into M x N such that M*N = comm_size and M, N are as close as possible
+    // This minimizes the perimeter (halo) for a given area.
+    int m = std::round(std::sqrt(comm_size));
+    while (comm_size % m != 0) {
+        m--;
     }
-    TILE_DIM = root;
+    int n = comm_size / m;
+    
+    TILE_DIM_X = m;
+    TILE_DIM_Y = n;
 
     if (comm_rank == 0) {
         std::cout << "Generating Unstructured Mesh of 2D box...\n";
         std::cout << "Target Edge Length: " << TARGET_EDGE_LENGTH << "\n";
-        std::cout << "Running on " << comm_size << " MPI ranks for " << TILE_DIM << "x" << TILE_DIM << " tiles.\n";
+        std::cout << "Running on " << comm_size << " MPI ranks with decomposition " << TILE_DIM_X << "x" << TILE_DIM_Y << ".\n";
     }
 
     std::vector<Point> points_on_owned_triangles_and_orphans;
     std::vector<Triangle> triangles_owned;
 
-    // 2. Distribute tiles cyclically among ranks
-    for (int y = 0; y < TILE_DIM; ++y) {
-        for (int x = 0; x < TILE_DIM; ++x) {
-            int global_id = y * TILE_DIM + x;
+    // 2. Distribute tiles (1 per rank)
+    for (int y = 0; y < TILE_DIM_Y; ++y) {
+        for (int x = 0; x < TILE_DIM_X; ++x) {
+            int global_id = y * TILE_DIM_X + x;
             
-            if (global_id % comm_size == comm_rank) {
+            // Since we have exactly comm_size tiles, global_id maps directly to rank
+            if (global_id == comm_rank) {
                 process_tile(comm, x, y, points_on_owned_triangles_and_orphans, triangles_owned);
             }
         }
