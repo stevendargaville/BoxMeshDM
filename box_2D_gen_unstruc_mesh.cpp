@@ -1350,25 +1350,27 @@ int main(int argc, char** argv) {
     PetscBool print_stats = PETSC_TRUE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-print_stats", &print_stats, NULL));
 
-    // Generate the Dm for this mesh
-    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, print_stats);
+    // Generate the DMPlex for this mesh
+    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, print_stats); 
 
-    // Write output if requested
-    // Can view this in paraview with:
-    // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
-    // then using the XDMF reader in:
-    // paraview box_mesh.xmf
-    if (write_mesh) {
-        PetscViewer viewer;
-        if (comm_rank == 0) {
-            std::cout << "Writing out mesh...\n";        
-        }
-        PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
-        PetscCall(DMView(dm, viewer));
-        PetscCall(PetscViewerDestroy(&viewer));
-    }    
-
+    // Check a valid mesh has been generated
     if (dm) {
+
+        // Write output if requested
+        // Can view this in paraview with:
+        // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
+        // then using the XDMF reader in:
+        // paraview box_mesh.xmf
+        if (write_mesh) {
+           PetscViewer viewer;
+           if (comm_rank == 0) {
+                 std::cout << "Writing out mesh...\n";        
+           }
+           PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
+           PetscCall(DMView(dm, viewer));
+           PetscCall(PetscViewerDestroy(&viewer));
+        }         
+
         PetscCall(DMDestroy(&dm));
     } else {
         PetscCall(PetscFinalize());
