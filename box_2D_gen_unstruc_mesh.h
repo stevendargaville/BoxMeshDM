@@ -8,8 +8,9 @@
  * 
  * @param comm The MPI communicator to use.
  * @param target_edge_length The target edge length for the mesh.
+ * @param print_stats Whether to print mesh generation statistics.
  * @return DM The generated distributed DMPlex.
  */
-DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length);
+DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_stats);
 
 #endif

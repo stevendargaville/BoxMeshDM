@@ -1175,7 +1175,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
 
 // ~~~~~~~~~~~~~~~~~
 
-DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length) {
+DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_stats) {
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
@@ -1221,7 +1221,7 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length) {
     std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
     // 3. Print stats
-    ComputeAndPrintStats(comm, points_on_owned_triangles_and_orphans, triangles_owned);
+    if (print_stats)ComputeAndPrintStats(comm, points_on_owned_triangles_and_orphans, triangles_owned);
 
     // 4. Create the DM
     if (comm_rank == 0) std::cout << "Creating DM...\n";
@@ -1251,11 +1251,14 @@ int main(int argc, char** argv) {
     PetscBool set;
     PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &target_len, &set));
 
-    PetscBool write_mesh = PETSC_FALSE;
+    PetscBool write_mesh = PETSC_TRUE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &write_mesh, NULL));
 
+    PetscBool print_stats = PETSC_TRUE;
+    PetscCall(PetscOptionsGetBool(NULL, NULL, "-print_stats", &print_stats, NULL));
+
     // Generate the Dm for this mesh
-    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len);
+    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, print_stats);
 
     // Write output if requested
     // Can view this in paraview with:
