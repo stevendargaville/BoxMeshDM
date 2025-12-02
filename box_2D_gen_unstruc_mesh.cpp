@@ -463,8 +463,8 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     // UNIFIED PADDING LOGIC
     // We generate a halo large enough to absorb the boundary effects of annealing.
     // The distortion from the boundary travels approx 1 edge per iter.
-    // We add +6 for safety 
-    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITERS + 6);
+    // We add +8 for safety 
+    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITERS + 8);
 
     // Safety Check: Ensure the required halo doesn't exceed the tile size.
     // In a domain decomposition, needing a halo larger than the subdomain 
