@@ -978,6 +978,121 @@ static void LabelBoundaries(DM dm) {
 
 // ~~~~~~~~~~~~~~~~~
 
+// Perform rigorous checks on mesh topology and geometry
+static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    // 1. Count Owned Points (needed for Euler)
+    long num_points_owned = 0;
+    for (const auto& p : points_on_owned_triangles_and_orphans) {
+        if (get_owner_rank(p.x, p.y, size) == rank) {
+            num_points_owned++;
+        }
+    }
+
+    // 2. Accumulate Local Stats
+    double local_total_area = 0.0;
+    double local_boundary_len = 0.0;
+    long local_boundary_edge_count = 0;
+    long local_bad_edge_count = 0;
+    double local_max_edge_len = 0.0;
+    
+    const double MAX_EDGE_RATIO = 3.0; 
+    const double THRESHOLD_LEN = TARGET_EDGE_LENGTH * MAX_EDGE_RATIO;
+
+    for (const auto& t : triangles_owned) {
+        const Point& p0 = points_on_owned_triangles_and_orphans[t.v0];
+        const Point& p1 = points_on_owned_triangles_and_orphans[t.v1];
+        const Point& p2 = points_on_owned_triangles_and_orphans[t.v2];
+
+        // Edge Lengths
+        double d01_sq = std::pow(p1.x-p0.x, 2) + std::pow(p1.y-p0.y, 2);
+        double d12_sq = std::pow(p2.x-p1.x, 2) + std::pow(p2.y-p1.y, 2);
+        double d20_sq = std::pow(p0.x-p2.x, 2) + std::pow(p0.y-p2.y, 2);
+        
+        double d01 = std::sqrt(d01_sq);
+        double d12 = std::sqrt(d12_sq);
+        double d20 = std::sqrt(d20_sq);
+
+        local_max_edge_len = std::max({local_max_edge_len, d01, d12, d20});
+
+        if (d01 > THRESHOLD_LEN || d12 > THRESHOLD_LEN || d20 > THRESHOLD_LEN) {
+            local_bad_edge_count++;
+        }
+
+        // Area
+        double volume = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
+        local_total_area += volume;
+
+        // Boundary Consistency
+        Point pts[3] = {p0, p1, p2};
+        for (int i = 0; i < 3; i++) {
+            Point& ep1 = pts[i];
+            Point& ep2 = pts[(i + 1) % 3];
+            
+            bool is_bdy = false;
+            if (std::abs(ep1.x) < EPSILON && std::abs(ep2.x) < EPSILON) is_bdy = true; 
+            else if (std::abs(ep1.x - DOMAIN_SIZE) < EPSILON && std::abs(ep2.x - DOMAIN_SIZE) < EPSILON) is_bdy = true; 
+            else if (std::abs(ep1.y) < EPSILON && std::abs(ep2.y) < EPSILON) is_bdy = true; 
+            else if (std::abs(ep1.y - DOMAIN_SIZE) < EPSILON && std::abs(ep2.y - DOMAIN_SIZE) < EPSILON) is_bdy = true; 
+            
+            if (is_bdy) {
+                double len = std::sqrt(std::pow(ep1.x-ep2.x, 2) + std::pow(ep1.y-ep2.y, 2));
+                local_boundary_len += len;
+                local_boundary_edge_count++;
+            }
+        }
+    }
+
+    // 3. Global Reductions
+    long num_tris_owned = triangles_owned.size();
+    long num_tris_owned_global, num_points_owned_global;
+    double global_total_area, global_boundary_len;
+    long global_boundary_edge_count, global_bad_edge_count;
+    double global_max_edge_len;
+
+    MPI_Reduce(&num_tris_owned, &num_tris_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&num_points_owned, &num_points_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_total_area, &global_total_area, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_boundary_len, &global_boundary_len, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_boundary_edge_count, &global_boundary_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_bad_edge_count, &global_bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_max_edge_len, &global_max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+
+    int success = 1;
+    if (rank == 0) {
+        long long total_degrees = (long long)num_tris_owned_global * 3;
+        long long double_edges = total_degrees + global_boundary_edge_count;
+        long long E_total = double_edges / 2;
+        long long V_total = num_points_owned_global;
+        long long F_total = num_tris_owned_global;
+        long long euler = V_total - E_total + F_total;
+
+        bool area_pass = std::abs(global_total_area - 1.0) < 1e-6;
+        bool perim_pass = std::abs(global_boundary_len - 4.0) < 1e-4;
+        bool euler_pass = (euler == 1);
+        bool edge_pass = (global_bad_edge_count == 0);
+
+        if (!area_pass || !perim_pass || !euler_pass || !edge_pass) {
+            success = 0;
+            std::cout << "\n!!! MESH INTEGRITY CHECK FAILED !!!\n";
+            if (!area_pass) std::cout << "  [FAIL] Total Area: " << std::fixed << std::setprecision(6) << global_total_area << " (Expected 1.0)\n";
+            if (!perim_pass) std::cout << "  [FAIL] Boundary Perimeter: " << global_boundary_len << " (Expected 4.0)\n";
+            if (!euler_pass) std::cout << "  [FAIL] Euler Characteristic: " << euler << " (Expected 1)\n";
+            if (!edge_pass) {
+                std::cout << "  [FAIL] Bad Edges: " << global_bad_edge_count << " edges > " << MAX_EDGE_RATIO << "x target.\n";
+                std::cout << "         Max Edge: " << global_max_edge_len << "\n";
+            }
+            std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+        }
+    }
+    
+    MPI_Bcast(&success, 1, MPI_INT, 0, comm);
+    return (success == 1);
+}
+
 // Print mesh statistics on rank 0
 static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
     int rank, size;
@@ -1017,17 +1132,6 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
     double local_min_volume = 1e30, local_max_volume = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
 
-    // NEW: Global Geometry Accumulators
-    double local_total_area = 0.0;
-    double local_boundary_len = 0.0;
-    long local_boundary_edge_count = 0;
-
-    // ERROR CHECK VARS
-    long local_bad_edge_count = 0;
-    double local_max_edge_len = 0.0;
-    const double MAX_EDGE_RATIO = 3.0; // Warn if edge > 3x target
-    const double THRESHOLD_LEN = TARGET_EDGE_LENGTH * MAX_EDGE_RATIO;
-
     // 3. Edge Orientation Statistics
     std::vector<long> local_bins(18, 0);
     std::set<std::pair<int, int>> processed_edges;
@@ -1037,7 +1141,6 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
         const Point& p1 = points_on_owned_triangles_and_orphans[t.v1];
         const Point& p2 = points_on_owned_triangles_and_orphans[t.v2];
 
-        // CHECK EDGE LENGTHS
         double d01_sq = std::pow(p1.x-p0.x, 2) + std::pow(p1.y-p0.y, 2);
         double d12_sq = std::pow(p2.x-p1.x, 2) + std::pow(p2.y-p1.y, 2);
         double d20_sq = std::pow(p0.x-p2.x, 2) + std::pow(p0.y-p2.y, 2);
@@ -1046,40 +1149,10 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
         double d12 = std::sqrt(d12_sq);
         double d20 = std::sqrt(d20_sq);
 
-        local_max_edge_len = std::max({local_max_edge_len, d01, d12, d20});
-
-        if (d01 > THRESHOLD_LEN || d12 > THRESHOLD_LEN || d20 > THRESHOLD_LEN) {
-            local_bad_edge_count++;
-        }
-
         // volume
         double volume = 0.5 * std::abs((p1.x - p0.x)*(p2.y - p0.y) - (p1.y - p0.y)*(p2.x - p0.x));
         if (volume < local_min_volume) local_min_volume = volume;
         if (volume > local_max_volume) local_max_volume = volume;
-
-        // NEW: Accumulate Area
-        local_total_area += volume;
-
-        // NEW: Check Geometric Boundary Consistency
-        // We check if edges lie exactly on the domain boundary lines.
-        Point pts[3] = {p0, p1, p2};
-        for (int i = 0; i < 3; i++) {
-            Point& ep1 = pts[i];
-            Point& ep2 = pts[(i + 1) % 3];
-            
-            bool is_bdy = false;
-            // Check geometric boundary conditions (x=0, x=1, y=0, y=1)
-            if (std::abs(ep1.x) < EPSILON && std::abs(ep2.x) < EPSILON) is_bdy = true; 
-            else if (std::abs(ep1.x - DOMAIN_SIZE) < EPSILON && std::abs(ep2.x - DOMAIN_SIZE) < EPSILON) is_bdy = true; 
-            else if (std::abs(ep1.y) < EPSILON && std::abs(ep2.y) < EPSILON) is_bdy = true; 
-            else if (std::abs(ep1.y - DOMAIN_SIZE) < EPSILON && std::abs(ep2.y - DOMAIN_SIZE) < EPSILON) is_bdy = true; 
-            
-            if (is_bdy) {
-                double len = std::sqrt(std::pow(ep1.x-ep2.x, 2) + std::pow(ep1.y-ep2.y, 2));
-                local_boundary_len += len;
-                local_boundary_edge_count++;
-            }
-        }
 
         // Angles
         if (d01 > 1e-14 && d12 > 1e-14 && d20 > 1e-14) {
@@ -1136,24 +1209,10 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
     double global_min_volume, global_max_volume;
     double global_min_angle, global_max_angle;
 
-    // NEW: Global Reductions for Checks
-    double global_total_area, global_boundary_len;
-    long global_boundary_edge_count;
-
     MPI_Reduce(&local_min_volume, &global_min_volume, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
     MPI_Reduce(&local_max_volume, &global_max_volume, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     MPI_Reduce(&local_min_angle, &global_min_angle, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
     MPI_Reduce(&local_max_angle, &global_max_angle, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-
-    MPI_Reduce(&local_total_area, &global_total_area, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-    MPI_Reduce(&local_boundary_len, &global_boundary_len, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-    MPI_Reduce(&local_boundary_edge_count, &global_boundary_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
-
-    // Reduce Error Checks
-    long global_bad_edge_count = 0;
-    double global_max_edge_len = 0.0;
-    MPI_Reduce(&local_bad_edge_count, &global_bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
-    MPI_Reduce(&local_max_edge_len, &global_max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
 
     std::vector<long> global_bins(18);
     MPI_Reduce(local_bins.data(), global_bins.data(), 18, MPI_LONG, MPI_SUM, 0, comm);
@@ -1161,48 +1220,6 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
     // Output stats to rank 0
     if (rank == 0) {
         std::cout << "\n=== Mesh Statistics ===\n";
-        
-        // NEW: Perform Global Checks
-        // Calculate Euler Characteristic: V - E + F = 1
-        // We derive E (Total Edges) from the sum of triangle degrees and boundary edges.
-        // 3*F = 2*E_internal + 1*E_boundary
-        // E_total = E_internal + E_boundary
-        // Therefore: 2*E_total = 3*F + E_boundary
-        long long total_degrees = (long long)num_tris_owned_global * 3;
-        long long double_edges = total_degrees + global_boundary_edge_count;
-        long long E_total = double_edges / 2;
-        long long V_total = num_points_owned_global;
-        long long F_total = num_tris_owned_global;
-        long long euler = V_total - E_total + F_total;
-
-        std::cout << "Global Integrity Checks:\n";
-        
-        bool area_pass = std::abs(global_total_area - 1.0) < 1e-6;
-        std::cout << "  [1] Total Area: " << std::fixed << std::setprecision(6) << global_total_area 
-                  << " (Target: 1.000000) -> " << (area_pass ? "PASS" : "FAIL") << "\n";
-        
-        bool perim_pass = std::abs(global_boundary_len - 4.0) < 1e-4;
-        std::cout << "  [2] Boundary Perimeter: " << global_boundary_len 
-                  << " (Target: 4.000000) -> " << (perim_pass ? "PASS" : "FAIL") << "\n";
-                  
-        bool euler_pass = (euler == 1);
-        std::cout << "  [3] Euler Characteristic (V-E+F): " << euler 
-                  << " (Target: 1) -> " << (euler_pass ? "PASS" : "FAIL") << "\n";
-
-        if (!area_pass || !perim_pass || !euler_pass) {
-            std::cout << "!!! CRITICAL ERROR: Mesh failed integrity checks. Do not use for simulation. !!!\n";
-        } else {
-            std::cout << "  >> Mesh Topology is Valid.\n";
-        }
-        std::cout << "-----------------------\n";
-
-        if (global_bad_edge_count > 0) {
-            std::cout << "!!! WARNING: MESH QUALITY ISSUE !!!\n";
-            std::cout << "  Found " << global_bad_edge_count << " triangles with edges > " << MAX_EDGE_RATIO << "x Target Length.\n";
-            std::cout << "  Max Edge Length Found: " << global_max_edge_len << " (" << (global_max_edge_len/TARGET_EDGE_LENGTH) << "x Target)\n";
-            std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
-        }
-
         std::cout << "Points:\n";
         std::cout << "  Total: " << num_points_owned_global << "\n";
         std::cout << "  Min per Rank: " << min_points_owned_global << "\n";
@@ -1291,15 +1308,20 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
 
     std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
-    // 3. Print stats
-    if (print_stats)ComputeAndPrintStats(comm, points_on_owned_triangles_and_orphans, triangles_owned);
+    // 3. Check Integrity
+    if (!CheckMeshIntegrity(comm, points_on_owned_triangles_and_orphans, triangles_owned)) {
+        return NULL;
+    }
 
-    // 4. Create the DM
+    // 4. Print stats
+    if (print_stats) ComputeAndPrintStats(comm, points_on_owned_triangles_and_orphans, triangles_owned);
+
+    // 5. Create the DM
     if (comm_rank == 0) std::cout << "Creating DM...\n";
     DM dm = CreateDM(comm, points_on_owned_triangles_and_orphans, triangles_owned);
     (void*)PetscObjectSetName((PetscObject)dm, "Mesh");
     
-    // 5. Label boundaries
+    // 6. Label boundaries
     LabelBoundaries(dm);
 
     return dm;
