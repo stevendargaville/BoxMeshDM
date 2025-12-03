@@ -1485,7 +1485,7 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
         }
     }
 
-    if (print_stats) std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
+    //if (print_stats) std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
     // 3. Check Integrity
     if (!CheckMeshIntegrity(comm, points_on_owned_triangles_and_orphans, triangles_owned)) {
@@ -1496,7 +1496,7 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
     if (print_stats) ComputeAndPrintStats(comm, points_on_owned_triangles_and_orphans, triangles_owned);
 
     // 5. Create the DM
-    if (comm_rank == 0) std::cout << "Creating DM...\n";
+    if (comm_rank == 0 && print_stats) std::cout << "Creating DM...\n";
     DM dm = CreateDM(comm, points_on_owned_triangles_and_orphans, triangles_owned);
     (void*)PetscObjectSetName((PetscObject)dm, "Mesh");
     
@@ -1542,7 +1542,7 @@ int main(int argc, char** argv) {
         // paraview box_mesh.xmf
         if (write_mesh) {
            PetscViewer viewer;
-           if (comm_rank == 0) {
+           if (comm_rank == 0 && print_stats) {
                  std::cout << "Writing out mesh...\n";        
            }
            PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
