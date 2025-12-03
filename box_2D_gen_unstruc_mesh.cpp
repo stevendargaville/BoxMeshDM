@@ -440,34 +440,35 @@ static std::vector<Triangle> triangulation(const std::vector<Point>& points) {
 // Helper: Calculate minimum angle (degrees) of a triangle
 static double clamp_val(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
 
-// Gets the smallest angle in a triangle in degrees
-static double get_min_angle_deg(const Point& a, const Point& b, const Point& c) {
-    double ab2 = (a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y);
-    double bc2 = (b.x-c.x)*(b.x-c.x) + (b.y-c.y)*(b.y-c.y);
-    double ca2 = (c.x-a.x)*(c.x-a.x) + (c.y-a.y)*(c.y-a.y);
+// Helper: Calculate max cosine of a triangle (proxy for min angle)
+// Returns 1.0 for degenerate triangles (worst case, angle 0)
+static double get_max_cosine_tri(const Point& a, const Point& b, const Point& c) {
+    double ab_sq = (a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y);
+    double bc_sq = (b.x-c.x)*(b.x-c.x) + (b.y-c.y)*(b.y-c.y);
+    double ca_sq = (c.x-a.x)*(c.x-a.x) + (c.y-a.y)*(c.y-a.y);
     
-    double ab = std::sqrt(ab2);
-    double bc = std::sqrt(bc2);
-    double ca = std::sqrt(ca2);
+    double ab = std::sqrt(ab_sq);
+    double bc = std::sqrt(bc_sq);
+    double ca = std::sqrt(ca_sq);
 
-    if (ab < TOL_LEN || bc < TOL_LEN || ca < TOL_LEN) return 0.0;
+    if (ab < TOL_LEN || bc < TOL_LEN || ca < TOL_LEN) return 1.0; // Degenerate
 
-    // Law of Cosines
-    double ang_a = std::acos(clamp_val((ab2 + ca2 - bc2) / (2.0 * ab * ca)));
-    double ang_b = std::acos(clamp_val((ab2 + bc2 - ca2) / (2.0 * ab * bc)));
-    double ang_c = std::acos(clamp_val((ca2 + bc2 - ab2) / (2.0 * ca * bc)));
+    // Law of Cosines: cos A = (b^2 + c^2 - a^2) / 2bc
+    double cos_a = (ab_sq + ca_sq - bc_sq) / (2.0 * ab * ca);
+    double cos_b = (ab_sq + bc_sq - ca_sq) / (2.0 * ab * bc);
+    double cos_c = (ca_sq + bc_sq - ab_sq) / (2.0 * ca * bc);
 
-    return std::min({ang_a, ang_b, ang_c}) * 180.0 / 3.14159265358979323846;
+    return std::max({cos_a, cos_b, cos_c});
 }
 
 // ~~~~~~~~~~~~~~~~~
 
-// Helper for relax_points to calculate local min angle
-static double calculate_local_min_angle(int node_idx, const Point& node_pos, 
+// Helper for relax_points to calculate local max cosine
+static double calculate_local_max_cosine(int node_idx, const Point& node_pos, 
                                  const std::vector<Point>& points, 
                                  const std::vector<Triangle>& triangles, 
                                  const std::vector<int>& connected_tris) {
-    double min_a = 180.0;
+    double max_cos = -2.0;
     for (int t_idx : connected_tris) {
         const auto& tri = triangles[t_idx];
         Point p1, p2;
@@ -476,10 +477,10 @@ static double calculate_local_min_angle(int node_idx, const Point& node_pos,
         else if (tri.v1 == node_idx) { p1 = points[tri.v0]; p2 = points[tri.v2]; }
         else { p1 = points[tri.v0]; p2 = points[tri.v1]; }
 
-        double ang = get_min_angle_deg(node_pos, p1, p2);
-        if (ang < min_a) min_a = ang;
+        double mc = get_max_cosine_tri(node_pos, p1, p2);
+        if (mc > max_cos) max_cos = mc;
     }
-    return min_a;
+    return max_cos;
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -538,10 +539,12 @@ static void relax_points(std::vector<Point>& points, const std::vector<Triangle>
             double full_dx = tx - points[i].x;
             double full_dy = ty - points[i].y;
 
-            double current_min_angle = calculate_local_min_angle(i, points[i], points, triangles, point_to_tris[i]);
+            // Minimize the maximum cosine is the same as maximizing the minimum angle, but without
+            // needing an acos which is expensive
+            double current_max_cos = calculate_local_max_cosine(i, points[i], points, triangles, point_to_tris[i]);
             
             Point best_candidate = points[i];
-            double best_angle = current_min_angle;
+            double best_max_cos = current_max_cos;
 
             // Test each relaxation factor
             for (double factor : candidate_factors) {
@@ -549,31 +552,24 @@ static void relax_points(std::vector<Point>& points, const std::vector<Triangle>
                 double dy = full_dy * factor;
 
                 // TEST: Boundary Projection
-                apply_boundary_constraint(points[i], dx, dy);
                 // We need to be careful not to modify points[i] permanently yet.
                 // Let's create a temp point for the constraint check.
                 Point temp_p = points[i];
                 apply_boundary_constraint(temp_p, dx, dy); 
                 
-                Point candidate = points[i];
-                candidate.x = temp_p.x + dx;
-                candidate.y = temp_p.y + dy;
+                Point candidate = temp_p;
+                candidate.x += dx;
+                candidate.y += dy;
 
-                double candidate_angle = calculate_local_min_angle(i, candidate, points, triangles, point_to_tris[i]);
+                double candidate_max_cos = calculate_local_max_cosine(i, candidate, points, triangles, point_to_tris[i]);
 
-                // Optimization Logic:
-                // We prefer the move if it improves the angle.
-                // If multiple factors improve it, we pick the one with the best angle.
-                if (candidate_angle > best_angle) {
-                    best_angle = candidate_angle;
+                // Optimization Logic: Minimize Max Cosine
+                if (candidate_max_cos < best_max_cos) {
+                    best_max_cos = candidate_max_cos;
                     best_candidate = candidate;
                 }
             }
 
-            // Apply the best move found (if any improved the state, or if we want to enforce a move)
-            // Here we only move if we found a better state or if the current state is valid and the new state is also valid (smoothing).
-            // But strictly following "best angle" is safest.
-            // However, if ALL moves make it worse, we should probably stay put (which is covered since best_candidate starts as points[i]).
             points[i] = best_candidate;
         }
     }
