@@ -144,7 +144,7 @@ static int get_owner_rank(const Point& p, int size) {
 }
 
 // NEW: Deterministically resolve ownership of boundary nodes
-static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points) {
+static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, double min_x, double min_y, double max_x, double max_y) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
@@ -154,10 +154,6 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points) 
         int geo_rank;
         double x, y; // Include coordinates for synchronization
     };
-
-    // 1. Identify points near boundary to exchange
-    // We use a safe margin to catch any point that might be ambiguous
-    double margin = TARGET_EDGE_LENGTH * 2.0; 
     
     std::vector<std::vector<Claim>> send_buffers(size);
     std::set<uint64_t> involved_ids; // Only resolve points near boundaries
@@ -168,23 +164,9 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points) 
     int ty = rank / TILE_DIM_X;
     
     for (auto& p : points) {
-        // Check if point is near a tile boundary
-        double t_min_x = tx * (DOMAIN_SIZE / TILE_DIM_X);
-        double t_max_x = (tx + 1) * (DOMAIN_SIZE / TILE_DIM_X);
-        double t_min_y = ty * (DOMAIN_SIZE / TILE_DIM_Y);
-        double t_max_y = (ty + 1) * (DOMAIN_SIZE / TILE_DIM_Y);
-
-        // Strict bounding box check:
-        // A rank should only claim a point if it is within its tile (plus margin).
-        if (p.x < t_min_x - margin || p.x > t_max_x + margin ||
-            p.y < t_min_y - margin || p.y > t_max_y + margin) {
-            continue;
-        }
-
-        bool near_x = (std::abs(p.x - t_min_x) < margin) || (std::abs(p.x - t_max_x) < margin);
-        bool near_y = (std::abs(p.y - t_min_y) < margin) || (std::abs(p.y - t_max_y) < margin);
-
-        if (near_x || near_y) {
+        // Check if point is within the resolution box
+        // We use strict inequality to match relax_points logic (points on the exact edge of the box are frozen)
+        if (p.x > min_x && p.x < max_x && p.y > min_y && p.y < max_y) {
             involved_ids.insert(p.unique_hash_id);
             // Let's reset the fixed owner in case we have moved the point again
             p.fixed_owner = -1;
@@ -263,6 +245,8 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points) 
             data.observed_geo_ranks.insert(claim.geo_rank);
             
             // Update best rank (lowest wins) and its coordinates
+            // CRITICAL: We ALWAYS take the coordinates from the lowest rank,
+            // regardless of whether there is an ownership dispute.
             if (r < data.best_rank) {
                 data.best_rank = r;
                 data.best_x = claim.x;
@@ -282,6 +266,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points) 
             
             // 4a. Synchronize Coordinates
             // Everyone adopts the coordinates of the 'best_rank' to ensure geometric consistency
+            // This happens for ALL shared points now.
             p.x = data.best_x;
             p.y = data.best_y;
 
@@ -768,12 +753,20 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     // If we relax the very edge, it collapses inward due to lack of outer neighbors.
     // This collapse propagates errors inward.
     // We freeze a strip of width ~ 1.5 * spacing.
-    double frozen_margin = TARGET_EDGE_LENGTH * 1.5;
+    
+    // UPDATE: To prevent drift between ranks, we synchronize ALL points that are allowed to move.
+    // The "Frozen Zone" is the outer rim of the halo (width ~1.5*L).
+    // The "Active Zone" is everything inside that.
+    // We set the sync_margin to cover the entire Active Zone.
+    // This ensures that if a point moves, its position is synchronized across ranks.
+    
+    double frozen_width = TARGET_EDGE_LENGTH * 1.5;
+    double sync_margin = pad - frozen_width;
 
-    double s_min_x = search_min_x + frozen_margin; 
-    double s_max_x = search_max_x - frozen_margin;
-    double s_min_y = search_min_y + frozen_margin; 
-    double s_max_y = search_max_y - frozen_margin;
+    double s_min_x = t_min_x - sync_margin; 
+    double s_max_x = t_max_x + sync_margin;
+    double s_min_y = t_min_y - sync_margin; 
+    double s_max_y = t_max_y + sync_margin;
 
     std::vector<Triangle> triangles_with_halos;
     double current_jitter = START_JITTER;
@@ -785,7 +778,8 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
 
         // NEW: Sync boundary points immediately to prevent divergence
-        ResolveBoundaryOwnership(comm, points_with_halos);        
+        // We pass the calculated sync_margin to the function so it knows how far to look
+        ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);        
     }
     // Final smooth iterations without jitter
     for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
@@ -793,14 +787,14 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
 
         // NEW: Sync boundary points immediately to prevent divergence
-        ResolveBoundaryOwnership(comm, points_with_halos);        
+        ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);        
     }
     
     // Final mesh
     triangles_with_halos = triangulation(points_with_halos);
     
     // NEW: Resolve ownership before filtering
-    ResolveBoundaryOwnership(comm, points_with_halos);
+    ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
 
     // CALCULATE VALENCE (Connectivity)
     // We do this here because we have the full halo information.
@@ -1177,6 +1171,9 @@ static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_o
     const double MAX_EDGE_RATIO = 3.0; 
     const double THRESHOLD_LEN = TARGET_EDGE_LENGTH * MAX_EDGE_RATIO;
 
+    int bad_edge_print_count = 0;
+    const int MAX_BAD_PRINTS = 5;
+
     for (const auto& t : triangles_owned) {
         const Point& p0 = points_on_owned_triangles_and_orphans[t.v0];
         const Point& p1 = points_on_owned_triangles_and_orphans[t.v1];
@@ -1195,6 +1192,14 @@ static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_o
 
         if (d01 > THRESHOLD_LEN || d12 > THRESHOLD_LEN || d20 > THRESHOLD_LEN) {
             local_bad_edge_count++;
+            if (bad_edge_print_count < MAX_BAD_PRINTS) {
+                std::cout << "[Rank " << rank << "] BAD TRIANGLE: Edge len " 
+                          << std::max({d01, d12, d20}) << " vs target " << TARGET_EDGE_LENGTH << "\n";
+                std::cout << "   P0: (" << p0.x << ", " << p0.y << ") Owner: " << get_owner_rank(p0, size) << " ID: " << p0.unique_hash_id << "\n";
+                std::cout << "   P1: (" << p1.x << ", " << p1.y << ") Owner: " << get_owner_rank(p1, size) << " ID: " << p1.unique_hash_id << "\n";
+                std::cout << "   P2: (" << p2.x << ", " << p2.y << ") Owner: " << get_owner_rank(p2, size) << " ID: " << p2.unique_hash_id << "\n";
+                bad_edge_print_count++;
+            }
         }
 
         // Area
