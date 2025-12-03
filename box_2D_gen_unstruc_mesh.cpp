@@ -1464,7 +1464,7 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
     TILE_DIM_X = m;
     TILE_DIM_Y = n;
 
-    if (comm_rank == 0) {
+    if (comm_rank == 0 && print_stats) {
         std::cout << "Generating Unstructured Mesh of 2D box...\n";
         std::cout << "Target Edge Length: " << TARGET_EDGE_LENGTH << "\n";
         std::cout << "Running on " << comm_size << " MPI ranks with decomposition " << TILE_DIM_X << "x" << TILE_DIM_Y << ".\n";
@@ -1485,7 +1485,7 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
         }
     }
 
-    std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
+    if (print_stats) std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
     // 3. Check Integrity
     if (!CheckMeshIntegrity(comm, points_on_owned_triangles_and_orphans, triangles_owned)) {
