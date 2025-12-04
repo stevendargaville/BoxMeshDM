@@ -140,7 +140,8 @@ static int get_owner_rank(const Point& p, int size) {
 }
 
 // NEW: Deterministically resolve ownership of boundary nodes
-static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, double min_x, double min_y, double max_x, double max_y) {
+static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, double min_x, double min_y, double max_x, double max_y, 
+                                    double interior_min_x, double interior_min_y, double interior_max_x, double interior_max_y) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
@@ -184,7 +185,10 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
     for (auto& p : points) {
         // Check if point is within the resolution box
         // We use strict inequality to match relax_points logic (points on the exact edge of the box are frozen)
-        if (p.x > min_x && p.x < max_x && p.y > min_y && p.y < max_y) {
+        // but we also don't send purely interior points as they are not shared
+        if (p.x > min_x && p.x < max_x && p.y > min_y && p.y < max_y &&
+            (p.x <= interior_min_x || p.x >= interior_max_x || p.y <= interior_min_y || p.y >= interior_max_y)) {
+               
             involved_ids.insert(p.unique_hash_id);
             int my_geo_rank = get_owner_rank(p, size);
 
@@ -626,6 +630,9 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     double search_min_x = t_min_x - pad; double search_max_x = t_max_x + pad;
     double search_min_y = t_min_y - pad; double search_max_y = t_max_y + pad;
 
+    double interior_min_x = t_min_x + pad; double interior_max_x = t_max_x - pad;
+    double interior_min_y = t_min_y + pad; double interior_max_y = t_max_y - pad;    
+
     std::vector<Point> points_with_halos;
 
     // 1. EXPLICIT CORNERS
@@ -774,7 +781,8 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
 
         // NEW: Sync boundary points immediately to prevent divergence
         // We pass the calculated sync_margin to the function so it knows how far to look
-        ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);        
+        ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y, \
+               interior_min_x, interior_min_y, interior_max_x, interior_max_y);        
     }
     // Final smooth iterations without jitter
     for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
@@ -782,14 +790,16 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
 
         // NEW: Sync boundary points immediately to prevent divergence
-        ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);        
+        ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y, \
+               interior_min_x, interior_min_y, interior_max_x, interior_max_y);        
     }
     
     // Final mesh
     triangles_with_halos = triangulation(points_with_halos);
     
     // NEW: Resolve ownership before filtering
-    ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+    ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y, \
+           interior_min_x, interior_min_y, interior_max_x, interior_max_y);
 
     // CALCULATE VALENCE (Connectivity)
     // We do this here because we have the full halo information.
