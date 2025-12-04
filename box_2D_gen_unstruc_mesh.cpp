@@ -597,9 +597,6 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
                   std::vector<Point>& points_on_owned_triangles_and_orphans, 
                   std::vector<Triangle>& triangles_owned) {
 
-    // Local map to track points added to the accumulator for this tile
-    std::map<uint64_t, int> id_to_idx;
-
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);      
@@ -814,6 +811,10 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         points_with_halos[i].valence = adj[i].size();
     }
 
+    // OPTIMIZATION: Pre-allocate remapping array. 
+    // -1 indicates the point hasn't been added to the owned list yet.
+    std::vector<int> local_to_owned_idx(points_with_halos.size(), -1);
+
     // We only keep triangles that are geometrically "owned" by this tile
     for (const auto& tri : triangles_with_halos) {
         const Point& p0 = points_with_halos[tri.v0];
@@ -837,38 +838,34 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
 
         if (owner == comm_rank) {
             Triangle new_t;
-            Point* pts[3] = { (Point*)&p0, (Point*)&p1, (Point*)&p2 };
-            int*   v_idx[3] = { &new_t.v0, &new_t.v1, &new_t.v2 };
+            // Map local halo indices to owned indices directly
+            int* src_idx[3] = { (int*)&tri.v0, (int*)&tri.v1, (int*)&tri.v2 };
+            int* dst_idx[3] = { &new_t.v0, &new_t.v1, &new_t.v2 };
 
-            // This builds a mapping between the unique hash id and its index in the output array
             for(int k=0; k<3; ++k) {
-                uint64_t pid = pts[k]->unique_hash_id;
-                if (id_to_idx.find(pid) == id_to_idx.end()) {
+                int local_idx = *src_idx[k];
+                if (local_to_owned_idx[local_idx] == -1) {
                     int new_idx = points_on_owned_triangles_and_orphans.size();
-                    points_on_owned_triangles_and_orphans.push_back(*pts[k]);
-                    id_to_idx[pid] = new_idx;
+                    points_on_owned_triangles_and_orphans.push_back(points_with_halos[local_idx]);
+                    local_to_owned_idx[local_idx] = new_idx;
                 }
-                *v_idx[k] = id_to_idx[pid];
+                *dst_idx[k] = local_to_owned_idx[local_idx];
             }
             triangles_owned.push_back(new_t);
         }
     }
 
     // Explicitly add "orphaned" points that we own spatially.
-    // It is possible to own a point spatially (it's in our tile) but NOT own any of the
-    // triangles connected to it (due to the min_id rule giving them to neighbors).
-    // We must still track this point so we can assign it a Global ID and answer requests.
-    for (const auto& p : points_with_halos) {
+    for (size_t i = 0; i < points_with_halos.size(); ++i) {
+        const auto& p = points_with_halos[i];
         if (get_owner_rank(p, comm_size) == comm_rank) {
-             uint64_t pid = p.unique_hash_id;
-             if (id_to_idx.find(pid) == id_to_idx.end()) {
+             if (local_to_owned_idx[i] == -1) {
                  int new_idx = points_on_owned_triangles_and_orphans.size();
                  points_on_owned_triangles_and_orphans.push_back(p);
-                 id_to_idx[pid] = new_idx;
+                 local_to_owned_idx[i] = new_idx;
              }
         }
     }
-    id_to_idx.clear();
 }
 
 // ~~~~~~~~~~~~~~~~~
