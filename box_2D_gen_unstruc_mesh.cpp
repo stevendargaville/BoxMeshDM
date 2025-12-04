@@ -154,6 +154,28 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
         int geo_rank;
         double x, y; // Include coordinates for synchronization
     };
+
+    // Create MPI Datatype for Claim
+    // This maps the struct layout so MPI knows how to send it as a single unit
+    MPI_Datatype MPI_CLAIM;
+    {
+        int blocklengths[3] = {1, 1, 2}; // 1 uint64, 1 int, 2 doubles (x, y)
+        MPI_Aint displacements[3];
+        MPI_Datatype types[3] = {MPI_UINT64_T, MPI_INT, MPI_DOUBLE};
+        
+        Claim dummy;
+        MPI_Aint base_addr;
+        MPI_Get_address(&dummy, &base_addr);
+        MPI_Get_address(&dummy.id, &displacements[0]);
+        MPI_Get_address(&dummy.geo_rank, &displacements[1]);
+        MPI_Get_address(&dummy.x, &displacements[2]);
+        
+        // Make displacements relative to the start of the struct
+        for(int i=0; i<3; i++) displacements[i] -= base_addr;
+        
+        MPI_Type_create_struct(3, blocklengths, displacements, types, &MPI_CLAIM);
+        MPI_Type_commit(&MPI_CLAIM);
+    }
     
     std::vector<std::vector<Claim>> send_buffers(size);
     std::set<uint64_t> involved_ids; // Only resolve points near boundaries
@@ -199,18 +221,23 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
         if (recv_counts[r] > 0) {
             recv_buffers[r].resize(recv_counts[r]);
             MPI_Request req;
-            MPI_Irecv(recv_buffers[r].data(), recv_counts[r] * sizeof(Claim), MPI_BYTE, r, 999, comm, &req);
+            // Use MPI_CLAIM type, count is number of items (not bytes)
+            MPI_Irecv(recv_buffers[r].data(), recv_counts[r], MPI_CLAIM, r, 999, comm, &req);
             requests.push_back(req);
         }
     }
     for(int r=0; r<size; ++r) {
         if (send_counts[r] > 0) {
             MPI_Request req;
-            MPI_Isend(send_buffers[r].data(), send_counts[r] * sizeof(Claim), MPI_BYTE, r, 999, comm, &req);
+            // Use MPI_CLAIM type, count is number of items (not bytes)
+            MPI_Isend(send_buffers[r].data(), send_counts[r], MPI_CLAIM, r, 999, comm, &req);
             requests.push_back(req);
         }
     }
     if (!requests.empty()) MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+
+    // Clean up the custom type
+    MPI_Type_free(&MPI_CLAIM);    
 
     // 3. Resolve Ownership
     // We track:
