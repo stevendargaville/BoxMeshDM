@@ -885,9 +885,10 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
+    PetscInt neg_one = -1;
 
     PetscInt num_points_on_owned_triangles_and_orphans = points_on_owned_triangles_and_orphans.size();
-    std::vector<PetscInt> global_ids(num_points_on_owned_triangles_and_orphans, -1);
+    std::vector<PetscInt> global_ids(num_points_on_owned_triangles_and_orphans, neg_one);
     PetscInt num_points_owned = 0;
 
     // 1. Identify Owned points
@@ -916,7 +917,7 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
 
     for (int i = 0; i < num_points_on_owned_triangles_and_orphans; ++i) {
         // If we don't own it we need to find out who does and ask them for the global id
-        if (global_ids[i] == -1) {
+        if (global_ids[i] == neg_one) {
             int owner = get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size);
             // We send the unique hash id to identify the point
             send_ids[owner].push_back(points_on_owned_triangles_and_orphans[i].unique_hash_id);
