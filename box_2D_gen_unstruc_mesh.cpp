@@ -56,7 +56,6 @@ struct Point {
     double x, y; // coordinates
     uint64_t unique_hash_id = 0; // unique id based on hashing coordinates
     int valence = 0; // <--- Store connectivity here
-    int fixed_owner = -1; // <--- NEW: Explicit ownership override
 };
 struct Triangle {
     int v0, v1, v2;
@@ -124,9 +123,6 @@ static void FiniOutput_Triangle(struct triangulateio *outputCtx)
 // Helper to determine which rank owns a point based on spatial location
 static int get_owner_rank(const Point& p, int size) {
 
-   // Use fixed owner if it is available
-   if (p.fixed_owner != -1) return p.fixed_owner;
-
     double tile_s_x = DOMAIN_SIZE / TILE_DIM_X;
     double tile_s_y = DOMAIN_SIZE / TILE_DIM_Y;
     int tx = std::floor(p.x / tile_s_x);
@@ -190,9 +186,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
         // We use strict inequality to match relax_points logic (points on the exact edge of the box are frozen)
         if (p.x > min_x && p.x < max_x && p.y > min_y && p.y < max_y) {
             involved_ids.insert(p.unique_hash_id);
-            // Let's reset the fixed owner in case we have moved the point again
-            p.fixed_owner = -1;
-            int my_geo_rank = get_owner_rank(p, size); // fixed_owner is -1 here
+            int my_geo_rank = get_owner_rank(p, size);
 
             // It's a boundary candidate. Send to neighbors.
             for (int dy = -1; dy <= 1; ++dy) {
@@ -287,35 +281,12 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
         // Only process points involved in the boundary resolution
         if (involved_ids.count(p.unique_hash_id)) {
             const ResolutionData& data = resolution_map[p.unique_hash_id];
-
-            // double old_x = p.x;
-            // double old_y = p.y;
             
             // 4a. Synchronize Coordinates
             // Everyone adopts the coordinates of the 'best_rank' to ensure geometric consistency
             // This happens for ALL shared points now.
             p.x = data.best_x;
             p.y = data.best_y;
-
-            // 4b. Resolve Ownership Conflict
-            // Check if there is disagreement on the geometric rank
-            if (data.observed_geo_ranks.size() > 1) {
-                
-                // Disagreement exists! We must enforce a fixed owner.
-                // Strategy: Lowest rank ID among those who claimed it wins.
-                const std::set<int>& claims = data.observed_geo_ranks;
-                if (!claims.empty()) {
-                    int resolved_rank = *claims.begin(); // Lowest rank wins
-                    
-                    p.fixed_owner = resolved_rank;
-
-                  //   // print out all of the ranks which disagree on ownership
-                  //   std::cout << "[Rank " << rank << "] Point (" << std::setprecision(6) << old_x << ", " << old_y << " - new (" << p.x << ", " << p.y
-                  //             << ") CONFLICT. Geo Ranks: ";
-                  //   for(int g : data.observed_geo_ranks) std::cout << g << " ";
-                  //   std::cout << ". Assigned to Rank " << resolved_rank << "\n";
-                }
-            }
         }
     }
 }
@@ -861,7 +832,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         if (p1.unique_hash_id == min_hash_id) min_p = &p1;
         if (p2.unique_hash_id == min_hash_id) min_p = &p2;
 
-        // Check if WE own this determining point (using fixed_owner via overload)
+        // Check if WE own this determining point
         int owner = get_owner_rank(*min_p, comm_size);
 
         if (owner == comm_rank) {
