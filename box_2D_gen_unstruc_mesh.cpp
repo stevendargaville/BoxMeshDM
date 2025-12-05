@@ -1388,6 +1388,10 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
     // 3. Edge Orientation Statistics
     std::vector<long> local_bins(18, 0);
     std::set<std::pair<int, int>> processed_edges;
+    
+    // NEW: Accumulators for edge length stats
+    double local_total_edge_len = 0.0;
+    long local_edge_count = 0;
 
     for (const auto& t : triangles_owned) {
         const Point& p0 = points_on_owned_triangles_and_orphans[t.v0];
@@ -1439,6 +1443,12 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
                 if (get_owner_rank(Point{mx, my}, size) == rank) {
                     double dx = ep2.x - ep1.x;
                     double dy = ep2.y - ep1.y;
+                    
+                    // NEW: Accumulate length
+                    double len = std::sqrt(dx*dx + dy*dy);
+                    local_total_edge_len += len;
+                    local_edge_count++;
+
                     // Angle in [0, 180)
                     double angle = std::atan2(dy, dx) * 180.0 / 3.14159265358979323846;
                     if (angle < 0) angle += 180.0;
@@ -1461,6 +1471,12 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
 
     double global_min_volume, global_max_volume;
     double global_min_angle, global_max_angle;
+    
+    // NEW: Global reduction for edge stats
+    double global_total_edge_len;
+    long global_edge_count;
+    MPI_Reduce(&local_total_edge_len, &global_total_edge_len, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_edge_count, &global_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
 
     MPI_Reduce(&local_min_volume, &global_min_volume, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
     MPI_Reduce(&local_max_volume, &global_max_volume, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
@@ -1494,10 +1510,13 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
         std::cout << "  Volume Min: " << std::scientific << global_min_volume << "\n";
         std::cout << "  Volume Max: " << std::scientific << global_max_volume << "\n";
         
-        std::cout << std::defaultfloat << std::setprecision(6);
+        std::cout << std::defaultfloat << std::setprecision(16);
         std::cout << "  Volume Ratio: " << (global_min_volume > 0 ? global_max_volume / global_min_volume : -1.0) << "\n";
         std::cout << "  Angle Min: " << global_min_angle << " deg\n";
         std::cout << "  Angle Max: " << global_max_angle << " deg\n";
+        
+        // NEW: Print average edge length
+        std::cout << "  Avg Edge Len: " << (global_edge_count > 0 ? global_total_edge_len / global_edge_count : 0.0) << "\n";
 
         std::cout << "Edge Orientations (10 deg bins):\n";
         long total_edges = 0;
