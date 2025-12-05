@@ -327,6 +327,24 @@ static bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
     return on_boundary;
 }
 
+// NEW: Ensure interior points stay interior by reflecting them back if they cross the boundary
+static void keep_interior_point_inside(Point& p) {
+    // Reflect X
+    if (p.x < 0.0) p.x = -p.x;
+    else if (p.x > DOMAIN_SIZE) p.x = DOMAIN_SIZE - (p.x - DOMAIN_SIZE);
+    
+    // Reflect Y
+    if (p.y < 0.0) p.y = -p.y;
+    else if (p.y > DOMAIN_SIZE) p.y = DOMAIN_SIZE - (p.y - DOMAIN_SIZE);
+
+    // Enforce strict interiority (keep away from EPSILON capture zone)
+    // This prevents an interior point from becoming a boundary point in the next iteration
+    if (p.x <= EPSILON) p.x = EPSILON * 2.0;
+    if (p.x >= DOMAIN_SIZE - EPSILON) p.x = DOMAIN_SIZE - EPSILON * 2.0;
+    if (p.y <= EPSILON) p.y = EPSILON * 2.0;
+    if (p.y >= DOMAIN_SIZE - EPSILON) p.y = DOMAIN_SIZE - EPSILON * 2.0;
+}
+
 // ~~~~~~~~~~~~~~~~~
 
 static uint64_t splitmix64(uint64_t& x) {
@@ -373,10 +391,20 @@ static void apply_jitter(std::vector<Point>& points, double amount, int seed_off
         double jy = (next_double(rng) - 0.5) * 2.0 * amount * TARGET_EDGE_LENGTH;
 
         // CRITICAL: Boundary nodes effectively ignore perpendicular jitter here
-        apply_boundary_constraint(points[i], jx, jy);
+        bool was_boundary = apply_boundary_constraint(points[i], jx, jy);
 
         points[i].x += jx;
         points[i].y += jy;
+        
+        if (!was_boundary) {
+            keep_interior_point_inside(points[i]);
+        } else {
+            // Clamp boundary points strictly to [0, DOMAIN] to handle float drift
+            if (points[i].x < 0) points[i].x = 0;
+            if (points[i].x > DOMAIN_SIZE) points[i].x = DOMAIN_SIZE;
+            if (points[i].y < 0) points[i].y = 0;
+            if (points[i].y > DOMAIN_SIZE) points[i].y = DOMAIN_SIZE;
+        }
     }
 }
 
@@ -542,11 +570,20 @@ static void relax_points(std::vector<Point>& points, const std::vector<Triangle>
                 // We need to be careful not to modify points[i] permanently yet.
                 // Let's create a temp point for the constraint check.
                 Point temp_p = points[i];
-                apply_boundary_constraint(temp_p, dx, dy); 
+                bool was_boundary = apply_boundary_constraint(temp_p, dx, dy); 
                 
                 Point candidate = temp_p;
                 candidate.x += dx;
                 candidate.y += dy;
+
+                if (!was_boundary) {
+                    keep_interior_point_inside(candidate);
+                } else {
+                    if (candidate.x < 0) candidate.x = 0;
+                    if (candidate.x > DOMAIN_SIZE) candidate.x = DOMAIN_SIZE;
+                    if (candidate.y < 0) candidate.y = 0;
+                    if (candidate.y > DOMAIN_SIZE) candidate.y = DOMAIN_SIZE;
+                }
 
                 double candidate_max_cos = calculate_local_max_cosine(i, candidate, points, triangles, point_to_tris[i]);
 
