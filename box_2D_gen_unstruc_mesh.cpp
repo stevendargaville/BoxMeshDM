@@ -1556,8 +1556,8 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
     TARGET_EDGE_LENGTH = target_edge_length;
 
     // SAFETY CHECK: Ensure edge length is not too small for 31-bit indexing
-    // Max index is ~2 billion. 1.0 / 2.1e9 = 4.7e-10
-    if (TARGET_EDGE_LENGTH < 4.7e-10) {
+    // Max index is ~2 billion. 1.0 / 2e9 = 5e-10
+    if (TARGET_EDGE_LENGTH < 5e-10) {
         if (comm_rank == 0) {
             std::cerr << "WARNING: Target edge length " << TARGET_EDGE_LENGTH 
                       << " is extremely small. It approaches the limit of the 31-bit index hashing scheme.\n"
