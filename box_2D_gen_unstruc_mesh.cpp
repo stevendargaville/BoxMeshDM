@@ -866,6 +866,9 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     }
 
     // Explicitly add "orphaned" points that we own spatially.
+    // It is possible to own a point spatially (it's in our tile) but NOT own any of the
+    // triangles connected to it (due to the min_id rule giving them to neighbors).
+    // We must still track this point so we can assign it a Global ID and answer requests.    
     for (size_t i = 0; i < points_with_halos.size(); ++i) {
         const auto& p = points_with_halos[i];
         if (get_owner_rank(p, comm_size) == comm_rank) {
@@ -1158,6 +1161,18 @@ static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_o
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
+   
+    // Check if we have any points not on a triangle (isolated vertices)
+    long local_isolated_count = 0;
+    for(size_t i=0; i<points_on_owned_triangles_and_orphans.size(); ++i) {
+      const auto& p = points_on_owned_triangles_and_orphans[i];
+      // Only check points owned by this rank to avoid double counting ghosts
+      if (p.valence == 0 && get_owner_rank(p, size) == rank) {
+         local_isolated_count++;
+         std::cout << "[Rank " << rank << "] ORPHAN POINT: (" << p.x << ", " << p.y 
+                  << ") ID: " << p.unique_hash_id << " Valence (Halo): " << p.valence << "\n";
+      }
+    }
 
     // 1. Count Owned Points (needed for Euler)
     long num_points_owned = 0;
