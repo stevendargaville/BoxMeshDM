@@ -719,12 +719,16 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     // which results in an aspect ratio of ~3:1 (acceptable).
     double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.35); 
 
+    // Let's just make sure we don't have any hash collisions
+    std::set<uint64_t> existing_hashes;
+
     for (int iy = min_iy; iy <= max_iy; ++iy) {
         for (int ix = min_ix; ix <= max_ix; ++ix) {
             // Deterministic RNG based on global grid index
-            uint64_t h = 0;
-            hash_combine(h, (double)ix);
-            hash_combine(h, (double)iy);
+            // FIX: Use bit-packing to guarantee unique seed for every (ix, iy) pair.
+            // Previous hash_combine method had collisions for certain integer pairs.
+            uint64_t h = ((uint64_t)(uint32_t)ix << 32) | (uint32_t)iy;
+            h = splitmix64(h); 
             RngState rng = {h};
 
             // Random position within the cell [0, 1)
@@ -740,10 +744,24 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
             if (cy < exclusion) continue;
             if (cy > DOMAIN_SIZE - exclusion) continue;
 
+            Point p = create_point_with_unique_hash_id(cx, cy);
+
+            // If hash is unique
+            if (existing_hashes.find(p.unique_hash_id) == existing_hashes.end())
+            {
+               existing_hashes.insert(p.unique_hash_id);
+            }
+            else
+            {
+               std::cerr << "Warning: Hash collision detected for point (" << cx << ", " << cy << ").\n";
+               MPI_Abort(comm, EXIT_FAILURE);
+            }
+
             // Only add point if strictly away from boundaries
-            points_with_halos.push_back(create_point_with_unique_hash_id(cx, cy));
+            points_with_halos.push_back(p);
         }
     }
+    existing_hashes.clear();
 
     // Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
     remove_duplicates(points_with_halos);
@@ -872,9 +890,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     for (size_t i = 0; i < points_with_halos.size(); ++i) {
         const auto& p = points_with_halos[i];
         if (get_owner_rank(p, comm_size) == comm_rank) {
-             // Only add if the point is actually connected to something in the halo.
-             // If valence is 0, it's floating dust (unused by triangulation) and should be discarded.         
-             if (local_to_owned_idx[i] == -1&& p.valence >0) {
+             if (local_to_owned_idx[i] == -1) {
                  int new_idx = points_on_owned_triangles_and_orphans.size();
                  points_on_owned_triangles_and_orphans.push_back(p);
                  local_to_owned_idx[i] = new_idx;
@@ -1163,33 +1179,14 @@ static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_o
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
-
-    // DIAGNOSTIC: Check for isolated vertices (orphans)
-    std::vector<char> is_used(points_on_owned_triangles_and_orphans.size(), 0);
-    for(const auto& t : triangles_owned) {
-        is_used[t.v0] = 1;
-        is_used[t.v1] = 1;
-        is_used[t.v2] = 1;
-    }
     
-    long local_isolated_count = 0;
     for(size_t i=0; i<points_on_owned_triangles_and_orphans.size(); ++i) {
+        const auto& p = points_on_owned_triangles_and_orphans[i];
         // Only check points owned by this rank to avoid double counting ghosts
-        if (!is_used[i] && get_owner_rank(points_on_owned_triangles_and_orphans[i], size) == rank) {
-            local_isolated_count++;
-            if (local_isolated_count <= 5) {
-                 const auto& p = points_on_owned_triangles_and_orphans[i];
-                 std::cout << "[Rank " << rank << "] ORPHAN POINT: (" << p.x << ", " << p.y 
-                           << ") ID: " << p.unique_hash_id << " Valence (Halo): " << p.valence << "\n";
-            }
+        if (p.valence == 0 && get_owner_rank(p, size) == rank) {
+            std::cout << "[Rank " << rank << "] UNCONNECTED POINT: (" << p.x << ", " << p.y 
+                     << ") ID: " << p.unique_hash_id << " Valence (Halo): " << p.valence << "\n";
         }
-    }
-    
-    long global_isolated_count;
-    MPI_Reduce(&local_isolated_count, &global_isolated_count, 1, MPI_LONG, MPI_SUM, 0, comm);
-    
-    if (rank == 0 && global_isolated_count > 0) {
-        std::cout << "WARNING: Found " << global_isolated_count << " isolated vertices in the mesh!\n";
     }
 
     // 1. Count Owned Points (needed for Euler)
