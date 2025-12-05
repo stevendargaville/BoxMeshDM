@@ -358,19 +358,16 @@ static double next_double(RngState& state) {
     return (splitmix64(state.s) >> 11) * (1.0 / 9007199254740992.0);
 }
 
-// Helper for hashing
-static void hash_combine(uint64_t& h, double v) {
-    union { double d; uint64_t u; } c;
-    c.d = v;
-    h ^= c.u + 0x9e3779b9 + (h << 6) + (h >> 2);
-}
-
-// Helper to create a point with a unique hash ID based on initial position
-static Point create_point_with_unique_hash_id(double x, double y) {
-    uint64_t h = 0;
-    hash_combine(h, x);
-    hash_combine(h, y);
-    return {x, y, h};
+// Helper to create a point with a unique ID based on grid indices
+// type: 0=Interior, 1=Boundary/Corner
+// ix, iy: Grid indices (can be up to 2 billion)
+static Point create_point_with_unique_hash_id(double x, double y, int ix, int iy, int type) {
+    // Pack: [Type: 2 bits] [ix: 31 bits] [iy: 31 bits]
+    // This guarantees uniqueness as long as (ix, iy) are unique within a type.
+    uint64_t id = ((uint64_t)(type & 0x3) << 62) | 
+                  ((uint64_t)(ix & 0x7FFFFFFF) << 31) | 
+                  ((uint64_t)(iy & 0x7FFFFFFF));
+    return {x, y, id};
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -674,26 +671,32 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
 
     // 1. EXPLICIT CORNERS
     // Add corners if they are in the search box.
-    
+    // We use type=1 (Boundary) and arbitrary unique indices for corners
+    // (0,0) -> 0,0
+    // (1,0) -> Max,0
+    // (0,1) -> 0,Max
+    // (1,1) -> Max,Max
+    int max_idx = 2000000000; // Just a large number for the "1.0" side
+
     // (0,0)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
         search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        points_with_halos.push_back(create_point_with_unique_hash_id(0.0, 0.0));
+        points_with_halos.push_back(create_point_with_unique_hash_id(0.0, 0.0, 0, 0, 1));
     }
     // (1,0)
     if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
         search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, 0.0));
+        points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, 0.0, max_idx, 0, 1));
     }
     // (0,1)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
         search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        points_with_halos.push_back(create_point_with_unique_hash_id(0.0, DOMAIN_SIZE));
+        points_with_halos.push_back(create_point_with_unique_hash_id(0.0, DOMAIN_SIZE, 0, max_idx, 1));
     }
     // (1,1)
     if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
         search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, DOMAIN_SIZE));
+        points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, DOMAIN_SIZE, max_idx, max_idx, 1));
     }
 
     // 2. EXPLICIT BOUNDARY GENERATION (Edges only)
@@ -706,7 +709,9 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double y = i * TARGET_EDGE_LENGTH;
-            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_point_with_unique_hash_id(0.0, y));
+            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) {
+                points_with_halos.push_back(create_point_with_unique_hash_id(0.0, y, 0, i, 1));
+            }
         }
     }
     // Right (x=1)
@@ -715,7 +720,9 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double y = i * TARGET_EDGE_LENGTH;
-            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, y));
+            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) {
+                points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, y, max_idx, i, 1));
+            }
         }
     }
     // Bottom (y=0)
@@ -724,7 +731,9 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double x = i * TARGET_EDGE_LENGTH;
-            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_point_with_unique_hash_id(x, 0.0));
+            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) {
+                points_with_halos.push_back(create_point_with_unique_hash_id(x, 0.0, i, 0, 1));
+            }
         }
     }
     // Top (y=1)
@@ -733,7 +742,9 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double x = i * TARGET_EDGE_LENGTH;
-            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) points_with_halos.push_back(create_point_with_unique_hash_id(x, DOMAIN_SIZE));
+            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) {
+                points_with_halos.push_back(create_point_with_unique_hash_id(x, DOMAIN_SIZE, i, max_idx, 1));
+            }
         }
     }
 
@@ -781,7 +792,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
             if (cy < exclusion) continue;
             if (cy > DOMAIN_SIZE - exclusion) continue;
 
-            Point p = create_point_with_unique_hash_id(cx, cy);
+            Point p = create_point_with_unique_hash_id(cx, cy, ix, iy, 0);
 
             // If hash is unique
             if (existing_hashes.find(p.unique_hash_id) == existing_hashes.end())
@@ -790,11 +801,12 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
             }
             else
             {
-               std::cerr << "Warning: Hash collision detected for point (" << cx << ", " << cy << ").\n";
+               std::cerr << "Warning: Hash collision detected for point (" << cx << ", " << cy << ") ID: " << p.unique_hash_id << "\n";
                MPI_Abort(comm, EXIT_FAILURE);
             }
 
             // Only add point if strictly away from boundaries
+            // Type 0 (Interior)
             points_with_halos.push_back(p);
         }
     }
