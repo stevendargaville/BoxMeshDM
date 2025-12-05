@@ -872,7 +872,9 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     for (size_t i = 0; i < points_with_halos.size(); ++i) {
         const auto& p = points_with_halos[i];
         if (get_owner_rank(p, comm_size) == comm_rank) {
-             if (local_to_owned_idx[i] == -1) {
+             // Only add if the point is actually connected to something in the halo.
+             // If valence is 0, it's floating dust (unused by triangulation) and should be discarded.         
+             if (local_to_owned_idx[i] == -1&& p.valence >0) {
                  int new_idx = points_on_owned_triangles_and_orphans.size();
                  points_on_owned_triangles_and_orphans.push_back(p);
                  local_to_owned_idx[i] = new_idx;
@@ -1161,17 +1163,33 @@ static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_o
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
-   
-    // Check if we have any points not on a triangle (isolated vertices)
+
+    // DIAGNOSTIC: Check for isolated vertices (orphans)
+    std::vector<char> is_used(points_on_owned_triangles_and_orphans.size(), 0);
+    for(const auto& t : triangles_owned) {
+        is_used[t.v0] = 1;
+        is_used[t.v1] = 1;
+        is_used[t.v2] = 1;
+    }
+    
     long local_isolated_count = 0;
     for(size_t i=0; i<points_on_owned_triangles_and_orphans.size(); ++i) {
-      const auto& p = points_on_owned_triangles_and_orphans[i];
-      // Only check points owned by this rank to avoid double counting ghosts
-      if (p.valence == 0 && get_owner_rank(p, size) == rank) {
-         local_isolated_count++;
-         std::cout << "[Rank " << rank << "] ORPHAN POINT: (" << p.x << ", " << p.y 
-                  << ") ID: " << p.unique_hash_id << " Valence (Halo): " << p.valence << "\n";
-      }
+        // Only check points owned by this rank to avoid double counting ghosts
+        if (!is_used[i] && get_owner_rank(points_on_owned_triangles_and_orphans[i], size) == rank) {
+            local_isolated_count++;
+            if (local_isolated_count <= 5) {
+                 const auto& p = points_on_owned_triangles_and_orphans[i];
+                 std::cout << "[Rank " << rank << "] ORPHAN POINT: (" << p.x << ", " << p.y 
+                           << ") ID: " << p.unique_hash_id << " Valence (Halo): " << p.valence << "\n";
+            }
+        }
+    }
+    
+    long global_isolated_count;
+    MPI_Reduce(&local_isolated_count, &global_isolated_count, 1, MPI_LONG, MPI_SUM, 0, comm);
+    
+    if (rank == 0 && global_isolated_count > 0) {
+        std::cout << "WARNING: Found " << global_isolated_count << " isolated vertices in the mesh!\n";
     }
 
     // 1. Count Owned Points (needed for Euler)
