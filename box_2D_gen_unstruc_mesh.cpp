@@ -772,9 +772,10 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
             h = splitmix64(h); 
             RngState rng = {h};
 
-            // Random position within the cell [0, 1)
-            double r1 = next_double(rng);
-            double r2 = next_double(rng);
+            // Restrict random range to [0.1, 0.9]
+            // This keeps points centered in their cells and guarantees separation.
+            double r1 = 0.1 + next_double(rng) * 0.8;
+            double r2 = 0.1 + next_double(rng) * 0.8;
 
             double cx = (ix + r1) * TARGET_EDGE_LENGTH;
             double cy = (iy + r2) * TARGET_EDGE_LENGTH;
