@@ -42,8 +42,6 @@ static double TOL_VOLUME;
 
 const double EPSILON = 1e-13;     
 const double START_JITTER = 0.30;
-// This is the goal, it isn't necessarily achieved
-double MIN_ANGLE_THRESHOLD = 30.0;
 
 // Jitter + smooth iterations first
 const int ANNEAL_ITERS = 3; 
