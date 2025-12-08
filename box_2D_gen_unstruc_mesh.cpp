@@ -48,7 +48,7 @@ double MIN_ANGLE_THRESHOLD = 30.0;
 // Jitter + smooth iterations first
 const int ANNEAL_ITERS = 3; 
 // Then just smooth iterations
-const int FINAL_SMOOTH_ITERS = 2;
+static int FINAL_SMOOTH_ITERS = 2;
 
 // ~~~~~~~~~~~~~~~~~
 
@@ -1501,6 +1501,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
     // Output stats to rank 0
     if (rank == 0) {
         std::cout << "\n=== Mesh Statistics ===\n";
+        std::cout << "Final Smooth Iterations: " << FINAL_SMOOTH_ITERS << "\n";
         std::cout << "Points:\n";
         std::cout << "  Total: " << num_points_owned_global << "\n";
         std::cout << "  Min per Rank: " << min_points_owned_global << "\n";
@@ -1645,6 +1646,10 @@ int main(int argc, char** argv) {
 
     PetscBool print_stats = PETSC_TRUE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-print_stats", &print_stats, NULL));
+
+    PetscInt final_smooth_its = 2;
+    PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, &set));
+    FINAL_SMOOTH_ITERS = final_smooth_its;
 
     // Generate the DMPlex for this mesh
     DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, print_stats); 
