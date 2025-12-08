@@ -748,16 +748,11 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         }
     }
 
-    // 3. INTERIOR GENERATION (Stratified Sampling)
-    // To match the density of a hex grid (optimal for triangles_owned), we scale the spacing.
-    // Hex Density: 1 pt / (sqrt(3)/2 * L^2). Square Density: 1 pt / S^2.
-    // S = L * sqrt(sqrt(3)/2) ~ 0.9306 * L
-    double strat_spacing = TARGET_EDGE_LENGTH * 0.9306;
-
-    int min_ix = floor(search_min_x / strat_spacing);
-    int max_ix = ceil(search_max_x / strat_spacing);
-    int min_iy = floor(search_min_y / strat_spacing);
-    int max_iy = ceil(search_max_y / strat_spacing);
+    // 3. INTERIOR GENERATION
+    int min_ix = floor(search_min_x / TARGET_EDGE_LENGTH);
+    int max_ix = ceil(search_max_x / TARGET_EDGE_LENGTH);
+    int min_iy = floor(search_min_y / TARGET_EDGE_LENGTH);
+    int max_iy = ceil(search_max_y / TARGET_EDGE_LENGTH);
     
     // Distance from wall to reject interior points
     // Must be larger than max jitter to prevent collision with boundary
@@ -783,8 +778,8 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
             double r1 = next_double(rng);
             double r2 = next_double(rng);
 
-            double cx = (ix + r1) * strat_spacing;
-            double cy = (iy + r2) * strat_spacing;
+            double cx = (ix + r1) * TARGET_EDGE_LENGTH;
+            double cy = (iy + r2) * TARGET_EDGE_LENGTH;
             
             // Rejection Sampling for Exclusion Zone
             if (cx < exclusion) continue;
