@@ -535,7 +535,7 @@ static void relax_points(std::vector<Point>& points, const std::vector<Triangle>
     }
 
     // Define candidate relaxation factors to test per point
-    std::vector<double> candidate_factors = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7};
+    std::vector<double> candidate_factors = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9};
 
     for (int i=0; i<n; ++i) {
         if (w_sum[i] < TOL_VOLUME) continue;
