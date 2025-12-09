@@ -46,7 +46,7 @@ const double START_JITTER = 0.30;
 // Jitter + smooth iterations first
 const int ANNEAL_ITERS = 3; 
 // Then just smooth iterations
-static int FINAL_SMOOTH_ITERS = 2;
+static int FINAL_SMOOTH_ITERS = 4;
 
 // ~~~~~~~~~~~~~~~~~
 
@@ -613,6 +613,97 @@ static void relax_points(std::vector<Point>& points, const std::vector<Triangle>
     }
 }
 
+// Spring-Force Relaxation
+// Moves points to minimize edge length deviation from TARGET_EDGE_LENGTH
+static void relax_points_spring(std::vector<Point>& points, const std::vector<Triangle>& triangles, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
+    int n = points.size();
+    
+    std::vector<double> force_x(n, 0.0), force_y(n, 0.0);
+    std::vector<int> valence(n, 0); // Count neighbors to scale force
+
+    // Iterate over edges (implicitly via triangles)
+    // We need to be careful not to double-count edges, but for a force sum it just changes the magnitude scale.
+    // Iterating triangles is fine if we scale appropriately.
+    
+    for (const auto& t : triangles) {
+        int v[3] = {t.v0, t.v1, t.v2};
+        for (int i = 0; i < 3; ++i) {
+            int idx1 = v[i];
+            int idx2 = v[(i + 1) % 3];
+            
+            double dx = points[idx2].x - points[idx1].x;
+            double dy = points[idx2].y - points[idx1].y;
+            double dist = std::sqrt(dx*dx + dy*dy);
+            
+            if (dist < 1e-14) continue;
+
+            // Spring Force: F = k * (current_len - target_len)
+            // We want to PUSH if too close (dist < target), PULL if too far (dist > target).
+            // Direction for idx1: towards idx2.
+            // If dist < target (compressed), (dist - target) is negative. Force is away from idx2. Correct.
+            
+            double force_mag = (dist - TARGET_EDGE_LENGTH);
+            
+            // Normalize direction
+            double nx = dx / dist;
+            double ny = dy / dist;
+            
+            double fx = force_mag * nx;
+            double fy = force_mag * ny;
+
+            // Apply to idx1
+            force_x[idx1] += fx;
+            force_y[idx1] += fy;
+            valence[idx1]++;
+
+            // Apply opposite to idx2
+            force_x[idx2] -= fx;
+            force_y[idx2] -= fy;
+            valence[idx2]++;
+        }
+    }
+
+    // Time step / Damping factor
+    // 0.1 is a safe starting point for explicit integration
+    double dt = 0.1;
+
+    for (int i=0; i<n; ++i) {
+        // Only move if we have neighbors
+        if (valence[i] == 0) continue;
+        
+        // Update if in valid safe zone (ignoring deep ghost layers)
+        if (points[i].x > min_safe_x && points[i].x < max_safe_x && points[i].y > min_safe_y && points[i].y < max_safe_y) {
+            
+            // Average the force by valence to keep scaling consistent
+            // (This effectively makes it "force per neighbor")
+            double fx = force_x[i] / valence[i];
+            double fy = force_y[i] / valence[i];
+
+            double dx = fx * dt; // Move proportional to force
+            double dy = fy * dt;
+
+            // Apply constraints and move
+            Point temp_p = points[i];
+            bool was_boundary = apply_boundary_constraint(temp_p, dx, dy); 
+            
+            Point candidate = temp_p;
+            candidate.x += dx;
+            candidate.y += dy;
+
+            if (!was_boundary) {
+                keep_interior_point_inside(candidate);
+            } else {
+                if (candidate.x < 0) candidate.x = 0;
+                if (candidate.x > DOMAIN_SIZE) candidate.x = DOMAIN_SIZE;
+                if (candidate.y < 0) candidate.y = 0;
+                if (candidate.y > DOMAIN_SIZE) candidate.y = DOMAIN_SIZE;
+            }
+
+            points[i] = candidate;
+        }
+    }
+}
+
 // ~~~~~~~~~~~~~~~~~
 
 // Helper to remove duplicates from cloud
@@ -856,6 +947,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
         apply_jitter(points_with_halos, current_jitter, iter);
         triangles_with_halos = triangulation(points_with_halos);
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+        relax_points_spring(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
 
         // NEW: Sync boundary points immediately to prevent divergence
         // We pass the calculated sync_margin to the function so it knows how far to look
@@ -866,6 +958,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
         triangles_with_halos = triangulation(points_with_halos);
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+        relax_points_spring(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
 
         // NEW: Sync boundary points immediately to prevent divergence
         ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y, \
