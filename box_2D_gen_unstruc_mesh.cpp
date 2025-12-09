@@ -775,9 +775,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     // Must be larger than max jitter to prevent collision with boundary
     // Max jitter is START_JITTER * TARGET_EDGE_LENGTH. 
     // We need a larger safety margin to prevent slivers.
-    // 0.6 ensures that even with 0.3 jitter, the closest approach is ~0.3L, 
-    // which results in an aspect ratio of ~3:1 (acceptable).
-    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.35); 
+    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.25); 
 
     // Let's just make sure we don't have any hash collisions
     std::set<uint64_t> existing_hashes;
