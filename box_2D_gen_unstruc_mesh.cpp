@@ -665,7 +665,7 @@ static void relax_points_spring(std::vector<Point>& points, const std::vector<Tr
 
     // Time step / Damping factor
     // 0.1 is a safe starting point for explicit integration
-    double dt = 0.1;
+    double dt = 0.3;
 
     for (int i=0; i<n; ++i) {
         // Only move if we have neighbors
