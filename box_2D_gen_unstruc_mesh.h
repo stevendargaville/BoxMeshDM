@@ -3,6 +3,10 @@
 
 #include <petscdmplex.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Generates a 2D unstructured mesh of a box [0,1]x[0,1] and returns a PETSc DM
  * 
@@ -13,5 +17,9 @@
  * @return DM The generated distributed DMPlex.
  */
 DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool print_stats);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
