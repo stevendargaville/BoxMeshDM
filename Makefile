@@ -66,12 +66,19 @@ OBJS := box_2D_gen_unstruc_mesh.o
 .DEFAULT_GOAL := all		  	
 # This builds the executable with main in it
 all: $(OUT)
+
+# Add STANDALONE define only if not building the library
+ifndef BUILD_LIB
 override CXXFLAGS += -DSTANDALONE_MESH_GEN
+endif
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Create the library (either static or dynamic depending on what petsc was configured with)
-lib: $(OBJS)
+# Create the library - use recursive make to set BUILD_LIB and avoid the define
+lib:
+	$(MAKE) $(LIB_OUT) BUILD_LIB=1
+
+$(LIB_OUT): $(OBJS)
 ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)	
 	$(AR) $(AR_FLAGS) $(LIB_OUT) $(OBJS)
 	$(RANLIB) $(LIB_OUT)
