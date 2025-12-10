@@ -45,8 +45,6 @@ const double START_JITTER = 0.30;
 
 // Jitter + smooth iterations first
 const int ANNEAL_ITERS = 3; 
-// Then just smooth iterations
-static int FINAL_SMOOTH_ITERS = 4;
 
 // ~~~~~~~~~~~~~~~~~
 
@@ -739,7 +737,7 @@ static void remove_duplicates(std::vector<Point>& points) {
 // ~~~~~~~~~~~~~~~~~
 
 // Builds a tile, creates points and triangulates
-static void process_tile(MPI_Comm comm, int tile_x, int tile_y, 
+static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int tile_y, 
                   std::vector<Point>& points_on_owned_triangles_and_orphans, 
                   std::vector<Triangle>& triangles_owned) {
 
@@ -756,7 +754,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
     // We generate a halo large enough to absorb the boundary effects of annealing.
     // The distortion from the boundary travels approx 1 edge per iter.
     // We add +8 for safety 
-    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITERS + 8);
+    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + final_smooth_its + 8);
 
     // Safety Check: Ensure the required halo doesn't exceed the tile size.
     // In a domain decomposition, needing a halo larger than the subdomain 
@@ -955,7 +953,7 @@ static void process_tile(MPI_Comm comm, int tile_x, int tile_y,
                interior_min_x, interior_min_y, interior_max_x, interior_max_y, pad);        
     }
     // Final smooth iterations without jitter
-    for(int k=0; k<FINAL_SMOOTH_ITERS; ++k) {
+    for(int k=0; k<final_smooth_its; ++k) {
         triangles_with_halos = triangulation(points_with_halos);
         relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
         relax_points_spring(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
@@ -1463,7 +1461,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_o
 }
 
 // Print mesh statistics on rank 0
-static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
+static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
@@ -1605,7 +1603,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
     // Output stats to rank 0
     if (rank == 0) {
         std::cout << "\n=== Mesh Statistics ===\n";
-        std::cout << "Final Smooth Iterations: " << FINAL_SMOOTH_ITERS << "\n";
+        std::cout << "Final Smooth Iterations: " << final_smooth_its << "\n";
         std::cout << "Points:\n";
         std::cout << "  Total: " << num_points_owned_global << "\n";
         std::cout << "  Min per Rank: " << min_points_owned_global << "\n";
@@ -1652,7 +1650,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, const std::vector<Point>& points
 
 // ~~~~~~~~~~~~~~~~~
 
-DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_stats) {
+DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool print_stats) {
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
@@ -1702,7 +1700,7 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
             
             // Since we have exactly comm_size tiles, global_id maps directly to rank
             if (global_id == comm_rank) {
-                process_tile(comm, x, y, points_on_owned_triangles_and_orphans, triangles_owned);
+                process_tile(comm, final_smooth_its, x, y, points_on_owned_triangles_and_orphans, triangles_owned);
             }
         }
     }
@@ -1715,7 +1713,7 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
     }
 
     // 4. Print stats
-    if (print_stats) ComputeAndPrintStats(comm, points_on_owned_triangles_and_orphans, triangles_owned);
+    if (print_stats) ComputeAndPrintStats(comm, final_smooth_its, points_on_owned_triangles_and_orphans, triangles_owned);
 
     // 5. Create the DM
     if (comm_rank == 0 && print_stats) std::cout << "Creating DM...\n";
@@ -1731,7 +1729,7 @@ DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_s
 // =========================================================
 // Main Driver
 // =========================================================
-
+#ifdef STANDALONE_MESH_GEN
 int main(int argc, char** argv) {
 
     PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
@@ -1751,12 +1749,12 @@ int main(int argc, char** argv) {
     PetscBool print_stats = PETSC_TRUE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-print_stats", &print_stats, NULL));
 
-    PetscInt final_smooth_its = 2;
+    PetscInt final_smooth_its = 4;
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, &set));
-    FINAL_SMOOTH_ITERS = final_smooth_its;
+    int final_smooths = final_smooth_its;
 
     // Generate the DMPlex for this mesh
-    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, print_stats); 
+    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, final_smooths, print_stats); 
 
     // Check a valid mesh has been generated
     if (dm) {
@@ -1785,3 +1783,4 @@ int main(int argc, char** argv) {
     PetscCall(PetscFinalize());
     return 0;
 }
+#endif

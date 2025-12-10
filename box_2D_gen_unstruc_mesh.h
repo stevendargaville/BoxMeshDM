@@ -8,9 +8,10 @@
  * 
  * @param comm The MPI communicator to use.
  * @param target_edge_length The target edge length for the mesh.
+ * @param final_smooth_its The number of final smoothing iterations to perform.
  * @param print_stats Whether to print mesh generation statistics.
  * @return DM The generated distributed DMPlex.
  */
-DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, PetscBool print_stats);
+DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool print_stats);
 
 #endif

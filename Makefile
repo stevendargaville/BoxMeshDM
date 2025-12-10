@@ -30,12 +30,22 @@ export PETSC_HAVE_TRIANGLE := $(if $(call _have_conf,PETSC_HAVE_TRIANGLE),1,0)
 ifeq ($(PETSC_HAVE_TRIANGLE),0)
 $(error PETSc has not been configured with Triangle support. Reconfigure PETSc with --download-triangle)
 endif
+export PETSC_USE_SHARED_LIBRARIES := $(if $(call _have_conf,PETSC_USE_SHARED_LIBRARIES),1,0)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~
 # ~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Library to output
+# On macOS, strip any -Wl,-rpath,* when linking the shared library to avoid duplicate LC_RPATH
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
+PETSC_LINK_LIBS_NORPATH := $(strip $(foreach w,$(LDLIBS),$(if $(findstring -Wl,-rpath,$(w)),,$(w))))
+else
+PETSC_LINK_LIBS_NORPATH := $(LDLIBS)
+endif
+
+# Output executable name
 OUT := box_2D_gen_unstruc_mesh
+# Output library name
+LIB_OUT := libbox_2D_gen_unstruc_mesh
 
 # All the files required by box_2D_gen_unstruc_mesh
 OBJS := box_2D_gen_unstruc_mesh.o
@@ -44,9 +54,29 @@ OBJS := box_2D_gen_unstruc_mesh.o
 # Rules
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .DEFAULT_GOAL := all		  	
+# This builds the executable with main in it
 all: $(OUT)
+override CXXFLAGS += -DSTANDALONE_MESH_GEN
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Create the library (either static or dynamic depending on what petsc was configured with)
+lib: $(OBJS)
+ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)	
+	$(AR) $(AR_FLAGS) $(LIB_OUT) $(OBJS)
+	$(RANLIB) $(LIB_OUT)
+else
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
+# macOS: Use -dynamiclib and set a relocatable @rpath install_name. Do not embed rpaths.
+	$(LINK.F) -dynamiclib -o $(LIB_OUT) $(OBJS) $(PETSC_LINK_LIBS_NORPATH) -install_name @rpath/$(notdir $(LIB_OUT))
+else	
+# Linux: Use -shared and set the soname.
+	$(LINK.F) -shared -o $(LIB_OUT) $(OBJS) $(PETSC_LINK_LIBS) -Wl,-soname,$(notdir $(LIB_OUT))
+endif
+endif
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Cleanup
 clean::
-	$(RM) box_2D_gen_unstruc_mesh
-	$(RM) *.dat
+	$(RM) $(OUT) $(LIB_OUT) $(OBJS) *.dat
