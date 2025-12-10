@@ -52,6 +52,11 @@ struct Point {
     double x, y; // coordinates
     uint64_t unique_hash_id = 0; // unique id based on hashing coordinates
     int valence = 0; // <--- Store connectivity here
+    
+    // Constructors for C++11 compatibility
+    Point() : x(0), y(0), unique_hash_id(0), valence(0) {}
+    Point(double x_, double y_) : x(x_), y(y_), unique_hash_id(0), valence(0) {}
+    Point(double x_, double y_, uint64_t id) : x(x_), y(y_), unique_hash_id(id), valence(0) {}
 };
 struct Triangle {
     int v0, v1, v2;
