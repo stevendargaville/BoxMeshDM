@@ -44,8 +44,18 @@ endif
 
 # Output executable name
 OUT := box_2D_gen_unstruc_mesh
-# Output library name
-LIB_OUT := libbox_2D_gen_unstruc_mesh
+
+# Output the library - either static or dynamic
+ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)
+LIB_OUT = libbox_2D_gen_unstruc_mesh.a
+else
+# mac osx name is different
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
+LIB_OUT = libbox_2D_gen_unstruc_mesh.dylib
+else
+LIB_OUT = libbox_2D_gen_unstruc_mesh.so
+endif
+endif
 
 # All the files required by box_2D_gen_unstruc_mesh
 OBJS := box_2D_gen_unstruc_mesh.o
