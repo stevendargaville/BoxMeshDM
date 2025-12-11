@@ -4,7 +4,7 @@ This code builds unstructured meshes for a 2D square [0,1]x[0,1] in parallel wit
 
 To build an executable which can be called from the terminal make sure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
-There are four variables that can be enabled from the command line, ``-target_edge_length 0.0025``, ``-final_smooth_its 2``, ``-write_mesh true`` and ``-print_stats true`` which are set by default. For large scale parallel testing you probably want to set ``-write_mesh false``.
+There are four variables that can be enabled from the command line, ``-target_edge_length 0.0025``, ``-final_smooth_its 4``, ``-write_mesh true`` and ``-print_stats true`` which are set by default. For large scale parallel testing you probably want to set ``-write_mesh false``.
 
 To visualise the mesh, enable ``-write_mesh true``, then on the command line run ``${PETSC_DIR}/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5``. The resulting ``.xmf`` file can be visualised in Paraview with the XDMF reader.
 
