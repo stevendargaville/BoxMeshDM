@@ -1281,6 +1281,7 @@ static void LabelBoundaries(DM dm) {
             if (val != 0) PetscCallVoid(DMLabelSetValue(label, v, val));
         }
     }
+    PetscCallVoid(DMPlexLabelComplete(dm, label));
     
     PetscCallVoid(DMCreateLabel(dm, "markers"));
     PetscCallVoid(DMGetLabel(dm, "markers", &label));
@@ -1326,6 +1327,19 @@ static void LabelBoundaries(DM dm) {
     }
 
     PetscCallVoid(VecRestoreArrayRead(coordsVec, &coords));
+    PetscCallVoid(DMPlexLabelComplete(dm, label));
+}
+
+// ~~~~~~~~~~~~~~~~~
+
+// Add these callback functions before LabelBoundaries:
+static PetscErrorCode RefineHook_LabelBoundaries(DM dm, DM dmf, void *ctx) {
+    PetscFunctionBeginUser;
+    // Label the fine (refined) mesh
+    LabelBoundaries(dmf);
+    // Also add the hook to the refined mesh so further refinements work
+    PetscCall(DMRefineHookAdd(dmf, RefineHook_LabelBoundaries, NULL, NULL));
+    PetscFunctionReturn(PETSC_SUCCESS);
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -1727,6 +1741,9 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     
     // 6. Label boundaries
     LabelBoundaries(dm);
+
+    // 7. Add refinement hook so labels are applied after any refinement
+    (void*)DMRefineHookAdd(dm, RefineHook_LabelBoundaries, NULL, NULL);    
 
     return dm;
 }
