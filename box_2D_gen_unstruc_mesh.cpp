@@ -1655,7 +1655,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
 
 // ~~~~~~~~~~~~~~~~~
 
-DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool print_stats) {
+PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool print_stats) {
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
