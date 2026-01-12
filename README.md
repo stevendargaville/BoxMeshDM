@@ -1,4 +1,4 @@
-This code builds unstructured meshes for a 2D square [0,1]x[0,1] in parallel with MPI. It relies on PETSc configured with triangle and hdf5 (``--download-triangle --download-hdf5``).
+This code builds unstructured meshes for a 2D square [0,1]x[0,1] in parallel with MPI. It relies on PETSc configured with triangle and hdf5 (``--download-triangle --download-hdf5``). To generate large meshes ensure PETSc is configured with 64-bit integers.
 
 ### Executable
 
@@ -16,4 +16,4 @@ Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then
 
 #### Notes
 
-This should be used to generate large meshes, it is not robust when the number of elements per MPI rank is small (say <100k).
+This should be used to generate large meshes, it is not robust when the number of elements per MPI rank is small (say <100k). Tested up to 32k MPI ranks and 32B elements.
