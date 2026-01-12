@@ -140,7 +140,7 @@ static int get_owner_rank(const Point& p, int size) {
     return global_tile_id;
 }
 
-// NEW: Deterministically resolve ownership of boundary nodes
+// Deterministically resolve ownership of boundary nodes
 static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, double min_x, double min_y, double max_x, double max_y, 
                                     double interior_min_x, double interior_min_y, double interior_max_x, double interior_max_y, double pad) {
     int rank, size;
@@ -201,7 +201,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
                     int ny = ty + dy;
                     if (nx >= 0 && nx < TILE_DIM_X && ny >= 0 && ny < TILE_DIM_Y) {
                         
-                        // OPTIMIZATION: Only send if point could be in the neighbor halo
+                        // Only send if point could be in the neighbor halo
                         double tile_s_x = DOMAIN_SIZE / TILE_DIM_X;
                         double tile_s_y = DOMAIN_SIZE / TILE_DIM_Y;
                         double n_min_x = nx * tile_s_x; double n_max_x = (nx + 1) * tile_s_x;
@@ -259,9 +259,9 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
 
     // 3. Resolve Ownership
     // We track:
-    //  - The set of geometric ranks calculated by all claimers (to detect disagreement)
-    //  - The lowest rank that claimed the point (to pick a winner)
-    //  - The coordinates associated with that lowest rank (to sync geometry)
+    // - The set of geometric ranks calculated by all claimers (to detect disagreement)
+    // - The lowest rank that claimed the point (to pick a winner)
+    // - The coordinates associated with that lowest rank (to sync geometry)
     struct ResolutionData {
         std::set<int> observed_geo_ranks;
         int best_rank = 999999;
@@ -347,7 +347,7 @@ static bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
     return on_boundary;
 }
 
-// NEW: Ensure interior points stay interior by reflecting them back if they cross the boundary
+// Ensure interior points stay interior by reflecting them back if they cross the boundary
 static void keep_interior_point_inside(Point& p) {
     // Reflect X
     if (p.x < 0.0) p.x = -p.x;
@@ -520,7 +520,7 @@ static double calculate_local_max_cosine(int node_idx, const Point& node_pos,
 // Lloyd-smoothing - only smooths points within a certain box
 // that way we can lock the outermost points in the halo, so the halo 
 // doesn't shrink inwards
-static void relax_points(std::vector<Point>& points, const std::vector<Triangle>& triangles, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
+static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Triangle>& triangles, double min_safe_x, double min_safe_y, double max_safe_x, double max_safe_y) {
     int n = points.size();
     
     // Accumulators for volume-Weighted Centroids
@@ -949,10 +949,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
         apply_jitter(points_with_halos, current_jitter, iter);
         triangles_with_halos = triangulation(points_with_halos);
-        relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+        relax_points_lloyd(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
         relax_points_spring(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
 
-        // NEW: Sync boundary points immediately to prevent divergence
+        // Sync boundary points immediately to prevent divergence
         // We pass the calculated sync_margin to the function so it knows how far to look
         ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y, \
                interior_min_x, interior_min_y, interior_max_x, interior_max_y, pad);        
@@ -960,10 +960,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // Final smooth iterations without jitter
     for(int k=0; k<final_smooth_its; ++k) {
         triangles_with_halos = triangulation(points_with_halos);
-        relax_points(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
+        relax_points_lloyd(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
         relax_points_spring(points_with_halos, triangles_with_halos, s_min_x, s_min_y, s_max_x, s_max_y);
 
-        // NEW: Sync boundary points immediately to prevent divergence
+        // Sync boundary points immediately to prevent divergence
         ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y, \
                interior_min_x, interior_min_y, interior_max_x, interior_max_y, pad);        
     }
@@ -971,7 +971,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // Final mesh
     triangles_with_halos = triangulation(points_with_halos);
     
-    // NEW: Resolve ownership before filtering
+    // Resolve ownership before filtering
     ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y, \
            interior_min_x, interior_min_y, interior_max_x, interior_max_y, pad);
 
@@ -995,7 +995,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
         points_with_halos[i].valence = adj[i].size();
     }
 
-    // OPTIMIZATION: Pre-allocate remapping array. 
+    // Pre-allocate remapping array. 
     // -1 indicates the point hasn't been added to the owned list yet.
     std::vector<int> local_to_owned_idx(points_with_halos.size(), -1);
 
@@ -1522,7 +1522,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
     std::vector<long> local_bins(18, 0);
     std::set<std::pair<int, int>> processed_edges;
     
-    // NEW: Accumulators for edge length stats
+    // Accumulators for edge length stats
     double local_total_edge_len = 0.0;
     long local_edge_count = 0;
 
@@ -1577,7 +1577,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
                     double dx = ep2.x - ep1.x;
                     double dy = ep2.y - ep1.y;
                     
-                    // NEW: Accumulate length
+                    // Accumulate length
                     double len = std::sqrt(dx*dx + dy*dy);
                     local_total_edge_len += len;
                     local_edge_count++;
@@ -1605,7 +1605,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
     double global_min_volume, global_max_volume;
     double global_min_angle, global_max_angle;
     
-    // NEW: Global reduction for edge stats
+    // Global reduction for edge stats
     double global_total_edge_len;
     long global_edge_count;
     MPI_Reduce(&local_total_edge_len, &global_total_edge_len, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
@@ -1649,7 +1649,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
         std::cout << "  Angle Min: " << global_min_angle << " deg\n";
         std::cout << "  Angle Max: " << global_max_angle << " deg\n";
         
-        // NEW: Print average edge length
+        // Print average edge length
         std::cout << "  Avg Edge Len: " << (global_edge_count > 0 ? global_total_edge_len / global_edge_count : 0.0) << "\n";
 
         std::cout << "Edge Orientations (10 deg bins):\n";
@@ -1677,7 +1677,7 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     // 1. Setup Globals
     TARGET_EDGE_LENGTH = target_edge_length;
 
-    // SAFETY CHECK: Ensure edge length is not too small for 31-bit indexing
+    // Ensure edge length is not too small for 31-bit indexing
     // Max index is ~2 billion. 1.0 / 2e9 = 5e-10
     if (TARGET_EDGE_LENGTH < 5e-10) {
         if (comm_rank == 0) {

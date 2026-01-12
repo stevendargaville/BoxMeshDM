@@ -17,5 +17,3 @@ Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then
 #### Notes
 
 This should be used to generate large meshes, it is not robust when the number of elements per MPI rank is small (say <100k).
-
-The meshes generated should be independent of the number of MPI ranks used.
