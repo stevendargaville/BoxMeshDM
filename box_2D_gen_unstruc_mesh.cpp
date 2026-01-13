@@ -1229,16 +1229,22 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
         }
     }
 
-    DM dm;
     // Build the DM
+    DM dm;
+    PetscErrorCode ierr;
+    ierr = DMCreate(comm, &dm);
+    ierr = DMSetType(dm, DMPLEX);
+
     PetscInt two = 2;
     PetscInt three = 3;
-    (void*)DMPlexCreateFromCellListParallelPetsc(comm, two, num_tris_owned, num_points_owned, PETSC_DECIDE, \
+    ierr = DMPlexCreateFromCellListParallelPetsc(comm, two, num_tris_owned, num_points_owned, PETSC_DECIDE, \
          three, PETSC_TRUE, cells.data(), two, coords_points_owned.data(), NULL, NULL, &dm);
     
     // The DM is already distributed, we don't want to call parmetis (or equivalent)
     // by default as it's very memory heavy
-    (void*)DMPlexDistributeSetDefault(dm, PETSC_FALSE);         
+    ierr = DMPlexDistributeSetDefault(dm, PETSC_FALSE);    
+    // Have to include or -dm_view doesn't work on command line
+    ierr = DMViewFromOptions(dm, NULL, "-dm_view");     
 
     return dm;
 }
@@ -1742,13 +1748,14 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     // 5. Create the DM
     if (comm_rank == 0 && print_stats) std::cout << "Creating DM...\n";
     DM dm = CreateDM(comm, points_on_owned_triangles_and_orphans, triangles_owned);
-    (void*)PetscObjectSetName((PetscObject)dm, "Mesh");
+    PetscErrorCode ierr;
+    ierr = PetscObjectSetName((PetscObject)dm, "Mesh");
     
     // 6. Label boundaries
     LabelBoundaries(dm);
 
     // 7. Add refinement hook so labels are applied after any refinement
-    (void*)DMRefineHookAdd(dm, RefineHook_LabelBoundaries, NULL, NULL);    
+    ierr = DMRefineHookAdd(dm, RefineHook_LabelBoundaries, NULL, NULL);    
 
     return dm;
 }
