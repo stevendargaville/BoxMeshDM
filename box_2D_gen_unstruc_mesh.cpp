@@ -11,6 +11,7 @@
 #include <petsc/private/dmpleximpl.h>
 #include <petscdmplex.h>
 #include <petscviewerhdf5.h>
+#include "petscconf.h"
 #include <map>
 #include <set>
 
@@ -1777,7 +1778,7 @@ int main(int argc, char** argv) {
     PetscBool set;
     PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &target_len, &set));
 
-    PetscBool write_mesh = PETSC_TRUE;
+    PetscBool write_mesh = PETSC_FALSE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &write_mesh, NULL));
 
     PetscBool print_stats = PETSC_TRUE;
@@ -1796,17 +1797,23 @@ int main(int argc, char** argv) {
         // Write output if requested
         // Can view this in paraview with:
         // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
-        // then using the XDMF reader in:
+        // then using the XDMF reader with:
         // paraview box_mesh.xmf
         if (write_mesh) {
+#ifdef PETSC_HAVE_HDF5         
            PetscViewer viewer;
            if (comm_rank == 0 && print_stats) {
                  std::cout << "Writing out mesh...\n";        
            }
            PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
            PetscCall(DMView(dm, viewer));
-           PetscCall(PetscViewerDestroy(&viewer));
-        }         
+           PetscCall(PetscViewerDestroy(&viewer));     
+#else 
+           if (comm_rank == 0) {
+               std::cerr << "-write_mesh not available without HDF5 enabled in PETSc.\n";
+           } 
+#endif
+         }
 
         PetscCall(DMDestroy(&dm));
     } else {

@@ -1,4 +1,4 @@
-This code builds triangular unstructured meshes for a 2D square [0,1] x [0,1] in parallel with MPI. It relies on PETSc configured with triangle and hdf5 (``--download-triangle --download-hdf5``). To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
+This code builds triangular unstructured meshes for a 2D square [0,1] x [0,1] in parallel with MPI. It relies on PETSc configured with triangle (``--download-triangle``). To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
 
 This code was designed for testing numerical methods (see [PFLARE](https://github.com/PFLAREProject/PFLARE)) on large, fully unstructured meshes in parallel, suitable for exascale. Most freely available meshing tools only feature OpenMP parallelism, require file I/O or require load-balancing with a mesh partitioning tool (such as ParMETIS) which can be very expensive. 
 
@@ -32,15 +32,19 @@ Weak scaling results on ARCHER2 show this code is reasonably performant and scal
 
 To build an executable which can be called from the command line for small scale testing, ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
-There are four input variables that can be changed from the command line. Their default values are: ``-target_edge_length 0.0025``, ``-final_smooth_its 4``, ``-write_mesh true`` and ``-print_stats true``. For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
+There are four input variables that can be changed from the command line. Their default values are: ``-target_edge_length 0.0025``, ``-final_smooth_its 4``, ``-write_mesh false`` and ``-print_stats true``. For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
 
-     mpiexec -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.0025 -final_smooth_its 4 -write_mesh -print_stats
+     mpiexec -n 2 ./box_2D_gen_unstruc_mesh
 
-To visualise the mesh, ensure ``-write_mesh true``, then on the command line run ``${PETSC_DIR}/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5``. The resulting ``.xmf`` file can be visualised in Paraview with the XDMF reader.
+which will generate a mesh with the default parameters. To decrease the edge length for example, 
+
+     mpiexec -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.001
+
+To visualise the mesh, ensure PETSc has been configured with HDF5 (``--download-hdf5``), run the code with ``-write_mesh true``, then on the command line run ``${PETSC_DIR}/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5``. The resulting ``.xmf`` file can be visualised in Paraview with the XDMF reader.
 
 ### Library
 
-Rather than building an executable, the code can be compiled as a library. Hence rather than writing out the mesh at scale, the routine ``GenerateBoxMeshDM`` can be called directly from existing code as it returns a parallel, load balanced PETSc DM that can be used without I/O. 
+Rather than building an executable, the code can be compiled as a library. Hence instead of writing out the mesh at scale, the routine ``GenerateBoxMeshDM`` can be called directly from existing code as it returns a parallel, load balanced PETSc DM that can be used without I/O. 
 
 Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make lib``. You then need to include the ``.h`` file in your code and link to the output library ``libbox_2D_gen_unstruc_mesh``. 
 
