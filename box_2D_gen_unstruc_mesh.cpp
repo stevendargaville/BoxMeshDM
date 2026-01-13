@@ -1235,6 +1235,11 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     PetscInt three = 3;
     (void*)DMPlexCreateFromCellListParallelPetsc(comm, two, num_tris_owned, num_points_owned, PETSC_DECIDE, \
          three, PETSC_TRUE, cells.data(), two, coords_points_owned.data(), NULL, NULL, &dm);
+    
+    // The DM is already distributed, we don't want to call parmetis (or equivalent)
+    // by default as it's very memory heavy
+    (void*)DMPlexDistributeSetDefault(dm, PETSC_FALSE);         
+
     return dm;
 }
 
