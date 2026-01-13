@@ -18,11 +18,11 @@ To enable this several compromises were made, namely:
    - Not fully optimised for speed.
    - Not robust when the number of elements per MPI rank is small (say <100k).
 
-So far this code has been tested up to 32k MPI ranks and 32B elements on ARCHER2, with the mesh generation time less than 2 mins.
+So far this code has been tested up to 32k MPI ranks and 32B elements on ARCHER2, with the mesh generation time less than 2 mins wall time.
 
 ### Executable
 
-To build an executable which can be called from the command line make sure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
+To build an executable which can be called from the command line for small scale testing, ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
 There are four input variables that can be changed from the command line. Their default values are: ``-target_edge_length 0.0025``, ``-final_smooth_its 4``, ``-write_mesh true`` and ``-print_stats true``. For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
 
