@@ -1,4 +1,4 @@
-This code builds triangular unstructured meshes for a 2D square [0,1]x[0,1] in parallel with MPI. It relies on PETSc configured with triangle and hdf5 (``--download-triangle --download-hdf5``). To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
+This code builds triangular unstructured meshes for a 2D square [0,1] x [0,1] in parallel with MPI. It relies on PETSc configured with triangle and hdf5 (``--download-triangle --download-hdf5``). To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
 
 This code was designed for testing numerical methods (see [PFLARE](https://github.com/PFLAREProject/PFLARE)) on large, fully unstructured meshes in parallel, suitable for exascale. Most freely available meshing tools only feature OpenMP parallelism, require file I/O or require load-balancing with a mesh partitioning tool (such as ParMETIS) which can be very expensive. 
 
