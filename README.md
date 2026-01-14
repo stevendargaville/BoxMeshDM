@@ -1,4 +1,6 @@
-This code builds triangular unstructured meshes for a 2D square [0,1] x [0,1] in parallel with MPI designed for use with PETSc. It depends on PETSc configured with triangle (``--download-triangle``) and returns a parallel DMPlex object which stores the unstructured mesh. To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
+This code builds triangular unstructured meshes for a 2D square [0,1] x [0,1] in parallel with MPI, designed for use with PETSc. It depends on PETSc configured with triangle (``--download-triangle``) and returns a parallel DMPlex object which stores the unstructured mesh. To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
+
+### Motivation
 
 This code was built to enable easy testing of numerical methods (see [PFLARE](https://github.com/PFLAREProject/PFLARE)) on large, fully unstructured meshes in parallel. Most freely available meshing tools only feature OpenMP parallelism, require file I/O or require load-balancing with a mesh partitioning tool (such as ParMETIS) which can be very expensive. 
 
@@ -19,19 +21,7 @@ To enable this several compromises were made, namely:
    - Not robust when the number of elements per MPI rank is small (say <100k).
    - If differing numbers of MPI ranks are used, the mesh produced is not identical.
 
-Weak scaling results on ARCHER2 show the code is reasonably performant and scalable:
-
-   | Compute nodes  | MPI ranks | Target edge length | Elements | Min angle (degrees) | Min/max volume ratio | Load imbalance | Time (s) |
-   | --- | -- | -- | --- | --- | --- | --- |  --- |
-   | 256 | 32768 | 7.8125e-6 | 32B | 15.7 | 19.3 | 1.00131 | 114 |
-   | 64 | 8192 | 1.5626e-5 | 8.2B | 19.4 | 13.9 | 1.00133 | 102 |
-   | 16 | 2048 | 3.125e-5 | 2B | 19.4 | 14.2 | 1.00126 | 108 |   
-   | 4 | 512 | 6.25e-5 | 512M | 21.5 | 13.6 | 1.00125 | 92 |   
-   | 1 | 128 | 1.25e-4 | 128M | 16.7 | 11.4 | 1.00111 | 82 |   
-
-To improve the mesh quality increase the number of final smoothing iterations. To improve the runtime, disable the integrity check and printing of statistics.  
-
-### Executable
+### Building the code as an executable
 
 To build an executable which can be called from the command line for small scale testing, ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
@@ -54,9 +44,9 @@ which will generate a mesh with the default parameters. To decrease the edge len
 
 To visualise the mesh, ensure PETSc has been configured with HDF5 (``--download-hdf5``), run the code with ``-write_mesh true``, then on the command line run ``${PETSC_DIR}/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5``. The resulting ``.xmf`` file can be visualised in Paraview with the XDMF reader.
 
-### Library
+### Building the code as a library
 
-Rather than building an executable, the code can be compiled as a library. Hence instead of writing out the mesh at scale, the routine ``GenerateBoxMeshDM`` can be called directly from existing code as it returns a parallel, load balanced PETSc DM that can be used without I/O. 
+For large scale use, the code can be compiled as a library. Hence instead of writing out the mesh, the routine ``GenerateBoxMeshDM`` can be called directly from existing code. This returns a parallel, load balanced PETSc DMPlex object that can be used without I/O. 
 
 Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make lib``. You then need to include the ``.h`` file in your code and link to the output library ``libbox_2D_gen_unstruc_mesh``. 
 
@@ -83,3 +73,17 @@ In your code, to generate a PETSc DM that can then be used as normal, you can ca
 
      // Enable the use of command line options for this DM
      ierr = DMSetFromOptions(*dm);
+
+### Weak scaling   
+
+Weak scaling results on ARCHER2 show the code is reasonably performant when generating large meshes in parallel:
+
+   | Compute nodes  | MPI ranks | Target edge length | Elements | Min angle (degrees) | Min/max volume ratio | Load imbalance | Time (s) |
+   | --- | -- | -- | --- | --- | --- | --- |  --- |
+   | 256 | 32768 | 7.8125e-6 | 32B | 15.7 | 19.3 | 1.00131 | 114 |
+   | 64 | 8192 | 1.5625e-5 | 8.2B | 19.4 | 13.9 | 1.00133 | 102 |
+   | 16 | 2048 | 3.125e-5 | 2B | 19.4 | 14.2 | 1.00126 | 108 |   
+   | 4 | 512 | 6.25e-5 | 512M | 21.5 | 13.6 | 1.00125 | 92 |   
+   | 1 | 128 | 1.25e-4 | 128M | 16.7 | 11.4 | 1.00111 | 82 |   
+
+To improve the mesh quality increase the number of final smoothing iterations. To improve the runtime, disable both the integrity check and statistics printing.       
