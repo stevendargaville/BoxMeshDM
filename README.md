@@ -33,7 +33,7 @@ Weak scaling results on ARCHER2 show this code is reasonably performant and scal
 
 To build an executable which can be called from the command line for small scale testing, ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
-There are four input variables that can be changed from the command line. Their default values are: ``-target_edge_length 0.0025``, ``-final_smooth_its 4``, ``-write_mesh false`` and ``-print_stats true``. For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
+There are five input variables that can be changed from the command line. Their default values are: ``-target_edge_length 0.0025``, ``-final_smooth_its 4``, ``-write_mesh false``, ``-integrity_check true`` and ``-print_stats true``. For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
 
      mpiexec -n 2 ./box_2D_gen_unstruc_mesh
 
@@ -62,11 +62,13 @@ In your code, to generate a PETSc DM that can then be used as normal, you can ca
      double target_edge_length = 0.0025;
      // Set the number of smoothing iterations
      PetscInt final_smooth_its = 4;
+     // Check the integrity of the mesh and error if not valid
+     PetscBool integrity_check = PETSC_TRUE;
      // Print mesh statistics to the terminal from MPI rank 0
      PetscBool print_stats = PETSC_TRUE;
 
      // Generate the mesh stored in a parallel PETSc DM on the MPI_Comm PETSC_COMM_WORLD
-     dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, final_smooth_its, print_stats);
+     dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, final_smooth_its, integrity_check, print_stats);
 
      // Enable the use of command line options for this DM
      ierr = DMSetFromOptions(*dm);

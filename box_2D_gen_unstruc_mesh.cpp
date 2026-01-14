@@ -1410,10 +1410,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
                                std::vector<std::pair<int, int>>& unique_edges) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
-    MPI_Comm_size(comm, &size);
-
-    // Compute valence and edges once here
-    ComputeValenceAndEdges(points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges);    
+    MPI_Comm_size(comm, &size);  
 
     // Build a set of point indices that appear in owned triangles
     std::vector<bool> appears_in_triangle(points_on_owned_triangles_and_orphans.size(), false);
@@ -1744,7 +1741,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
 
 // ~~~~~~~~~~~~~~~~~
 
-PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool print_stats) {
+PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
@@ -1804,11 +1801,20 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     // 3. Check Integrity
     std::vector<int> valence;
     std::vector<std::pair<int, int>> unique_edges;
-    if (!CheckMeshIntegrity(comm, points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges)) {
-        return NULL;
+    // Compute valence and edges once here
+    if (print_stats || integrity_check)
+    {
+      ComputeValenceAndEdges(points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges);  
     }
 
-    // 4. Print stats (reuses valence and edges from integrity check)
+    if (integrity_check)
+    {
+      if (!CheckMeshIntegrity(comm, points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges)) {
+         return NULL;
+      }
+   }
+
+    // 4. Print stats
     if (print_stats) ComputeAndPrintStats(comm, final_smooth_its, points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges);
     
     // Free the valence and edge data now that we're done with stats
@@ -1853,15 +1859,18 @@ int main(int argc, char** argv) {
     PetscBool write_mesh = PETSC_FALSE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &write_mesh, NULL));
 
+    PetscBool integrity_check = PETSC_FALSE;
+    PetscCall(PetscOptionsGetBool(NULL, NULL, "-integrity_check", &integrity_check, NULL));    
+
     PetscBool print_stats = PETSC_TRUE;
-    PetscCall(PetscOptionsGetBool(NULL, NULL, "-print_stats", &print_stats, NULL));
+    PetscCall(PetscOptionsGetBool(NULL, NULL, "-print_stats", &print_stats, NULL));    
 
     PetscInt final_smooth_its = 4;
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, &set));
     int final_smooths = final_smooth_its;
 
     // Generate the DMPlex for this mesh
-    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, final_smooths, print_stats); 
+    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, final_smooths, integrity_check, print_stats); 
 
     // Check a valid mesh has been generated
     if (dm) {
