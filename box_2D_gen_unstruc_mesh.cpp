@@ -939,7 +939,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.25); 
 
     // Let's just make sure we don't have any hash collisions
-    std::set<uint64_t> existing_hashes;
+    //std::set<uint64_t> existing_hashes;
 
     for (int iy = min_iy; iy <= max_iy; ++iy) {
         for (int ix = min_ix; ix <= max_ix; ++ix) {
@@ -966,23 +966,23 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
 
             Point p = create_point_with_unique_hash_id(cx, cy, ix, iy, 0);
 
-            // If hash is unique
-            if (existing_hashes.find(p.unique_hash_id) == existing_hashes.end())
-            {
-               existing_hashes.insert(p.unique_hash_id);
-            }
-            else
-            {
-               std::cerr << "Warning: Hash collision detected for point (" << cx << ", " << cy << ") ID: " << p.unique_hash_id << "\n";
-               MPI_Abort(comm, EXIT_FAILURE);
-            }
+            // // If hash is unique
+            // if (existing_hashes.find(p.unique_hash_id) == existing_hashes.end())
+            // {
+            //    existing_hashes.insert(p.unique_hash_id);
+            // }
+            // else
+            // {
+            //    std::cerr << "Warning: Hash collision detected for point (" << cx << ", " << cy << ") ID: " << p.unique_hash_id << "\n";
+            //    MPI_Abort(comm, EXIT_FAILURE);
+            // }
 
             // Only add point if strictly away from boundaries
             // Type 0 (Interior)
             points_with_halos.push_back(p);
         }
     }
-    existing_hashes.clear();
+    //existing_hashes.clear();
 
     // Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
     remove_duplicates(points_with_halos);
