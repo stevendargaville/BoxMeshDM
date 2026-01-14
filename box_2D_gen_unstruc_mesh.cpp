@@ -52,12 +52,11 @@ const int ANNEAL_ITERS = 3;
 struct Point {
     double x, y; // coordinates
     uint64_t unique_hash_id = 0; // unique id based on hashing coordinates
-    int valence = 0; // <--- Store connectivity here
     
     // Constructors for C++11 compatibility
-    Point() : x(0), y(0), unique_hash_id(0), valence(0) {}
-    Point(double x_, double y_) : x(x_), y(y_), unique_hash_id(0), valence(0) {}
-    Point(double x_, double y_, uint64_t id) : x(x_), y(y_), unique_hash_id(id), valence(0) {}
+    Point() : x(0), y(0), unique_hash_id(0) {}
+    Point(double x_, double y_) : x(x_), y(y_), unique_hash_id(0) {}
+    Point(double x_, double y_, uint64_t id) : x(x_), y(y_), unique_hash_id(id) {}
 };
 struct Triangle {
     int v0, v1, v2;
@@ -722,6 +721,50 @@ static void relax_points_spring(std::vector<Point>& points, const std::vector<Tr
 
 // ~~~~~~~~~~~~~~~~~
 
+// Compute valence for each point and return sorted unique edge list
+// The edge list uses local indices into the points vector
+static void ComputeValenceAndEdges(const std::vector<Point>& points,
+                                   const std::vector<Triangle>& triangles,
+                                   std::vector<int>& valence,
+                                   std::vector<std::pair<int, int>>& unique_edges) {
+    size_t n = points.size();
+    valence.assign(n, 0);
+    
+    // Collect all edges as (min_idx, max_idx)
+    std::vector<std::pair<int, int>> edges;
+    edges.reserve(triangles.size() * 3);
+    
+    for (const auto& t : triangles) {
+        int v0 = t.v0, v1 = t.v1, v2 = t.v2;
+        edges.emplace_back(std::min(v0, v1), std::max(v0, v1));
+        edges.emplace_back(std::min(v1, v2), std::max(v1, v2));
+        edges.emplace_back(std::min(v0, v2), std::max(v0, v2));
+    }
+    
+    // Sort to find unique edges
+    std::sort(edges.begin(), edges.end());
+    
+    // Extract unique edges and count valence
+    unique_edges.clear();
+    unique_edges.reserve(edges.size() / 2); // Approximate: most edges shared by 2 triangles
+    
+    if (!edges.empty()) {
+        unique_edges.push_back(edges[0]);
+        valence[edges[0].first]++;
+        valence[edges[0].second]++;
+        
+        for (size_t i = 1; i < edges.size(); ++i) {
+            if (edges[i] != edges[i-1]) {
+                unique_edges.push_back(edges[i]);
+                valence[edges[i].first]++;
+                valence[edges[i].second]++;
+            }
+        }
+    }
+}
+
+// ~~~~~~~~~~~~~~~~~
+
 // Helper to remove duplicates from cloud
 static void remove_duplicates(std::vector<Point>& points) {
     if (points.empty()) return;
@@ -987,49 +1030,6 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // Resolve ownership before filtering
     ResolveBoundaryOwnership(comm, points_with_halos, s_min_x, s_min_y, s_max_x, s_max_y, \
            interior_min_x, interior_min_y, interior_max_x, interior_max_y, pad);
-
-    // CALCULATE VALENCE (Connectivity)
-    // Two-pass approach: much faster than sorting 6T tuples
-    // Pass 1: Collect unique edges (3T entries, not 6T)
-    // Pass 2: Increment valence for both endpoints of each unique edge
-    
-    std::vector<std::pair<int, int>> edges;
-    edges.reserve(triangles_with_halos.size() * 3); // 3 edges per triangle
-    
-    for(const auto& t : triangles_with_halos) {
-        int v0 = t.v0, v1 = t.v1, v2 = t.v2;
-        
-        // Store each edge once with (min, max) ordering
-        edges.emplace_back(std::min(v0, v1), std::max(v0, v1));
-        edges.emplace_back(std::min(v1, v2), std::max(v1, v2));
-        edges.emplace_back(std::min(v0, v2), std::max(v0, v2));
-    }
-    
-    // Sort to find unique edges
-    std::sort(edges.begin(), edges.end());
-    
-    // Count valence: each unique edge contributes +1 to both endpoints
-    std::vector<int> valence_count(points_with_halos.size(), 0);
-    
-    if (!edges.empty()) {
-        // Process first edge
-        valence_count[edges[0].first]++;
-        valence_count[edges[0].second]++;
-        
-        for (size_t i = 1; i < edges.size(); ++i) {
-            // Skip duplicates
-            if (edges[i] != edges[i-1]) {
-                valence_count[edges[i].first]++;
-                valence_count[edges[i].second]++;
-            }
-        }
-    }
-    
-    for(size_t i=0; i<points_with_halos.size(); ++i) {
-        points_with_halos[i].valence = valence_count[i];
-    }
-    valence_count.clear();
-    edges.clear();
     
     // Pre-allocate remapping array. 
     // -1 indicates the point hasn't been added to the owned list yet.
@@ -1403,17 +1403,24 @@ static PetscErrorCode RefineHook_LabelBoundaries(DM dm, DM dmf, void *ctx) {
 // ~~~~~~~~~~~~~~~~~
 
 // Perform rigorous checks on mesh topology and geometry
-static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
+static bool CheckMeshIntegrity(MPI_Comm comm, 
+                               const std::vector<Point>& points_on_owned_triangles_and_orphans, 
+                               const std::vector<Triangle>& triangles_owned,
+                               std::vector<int>& valence,
+                               std::vector<std::pair<int, int>>& unique_edges) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
+
+    // Compute valence and edges once here
+    ComputeValenceAndEdges(points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges);    
     
     for(size_t i=0; i<points_on_owned_triangles_and_orphans.size(); ++i) {
         const auto& p = points_on_owned_triangles_and_orphans[i];
         // Only check points owned by this rank to avoid double counting ghosts
-        if (p.valence == 0 && get_owner_rank(p, size) == rank) {
+        if (valence[i] == 0 && get_owner_rank(p, size) == rank) {
             std::cout << "[Rank " << rank << "] UNCONNECTED POINT: (" << p.x << ", " << p.y 
-                     << ") ID: " << p.unique_hash_id << " Valence (Halo): " << p.valence << "\n";
+                     << ") ID: " << p.unique_hash_id << " Valence (Halo): " << valence[i] << "\n";
         }
     }
 
@@ -1538,7 +1545,11 @@ static bool CheckMeshIntegrity(MPI_Comm comm, const std::vector<Point>& points_o
 }
 
 // Print mesh statistics on rank 0
-static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std::vector<Point>& points_on_owned_triangles_and_orphans, const std::vector<Triangle>& triangles_owned) {
+static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, 
+                                 const std::vector<Point>& points_on_owned_triangles_and_orphans, 
+                                 const std::vector<Triangle>& triangles_owned,
+                                 const std::vector<int>& valence,
+                                 const std::vector<std::pair<int, int>>& unique_edges) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
@@ -1549,12 +1560,13 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
     long local_conn_bins[MAX_CONN] = {0};
     
     // Bin the valences
-    for (const auto& p : points_on_owned_triangles_and_orphans) {
+    for (size_t i = 0; i < points_on_owned_triangles_and_orphans.size(); ++i) {
+        const auto& p = points_on_owned_triangles_and_orphans[i];
         if (get_owner_rank(p, size) == rank) {
             points_owned++;
             
             // Bin Connectivity using pre-calculated valence
-            int degree = p.valence;
+            int degree = valence[i];
             if (degree >= MAX_CONN) degree = MAX_CONN - 1;
             local_conn_bins[degree]++;
         }
@@ -1576,17 +1588,14 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
     double local_min_volume = 1e30, local_max_volume = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
 
-    // 3. Edge Orientation Statistics - use sorting instead of set
+    // 3. Edge Orientation Statistics - use the pre-computed edge list
     std::vector<long> local_bins(18, 0);
     
     // Accumulators for edge length stats
     double local_total_edge_len = 0.0;
     long local_edge_count = 0;
 
-    // Collect edges as (min_idx, max_idx) for deduplication
-    std::vector<std::pair<int, int>> edges;
-    edges.reserve(triangles_owned.size() * 3);
-
+    // First pass: compute triangle stats
     for (const auto& t : triangles_owned) {
         const Point& p0 = points_on_owned_triangles_and_orphans[t.v0];
         const Point& p1 = points_on_owned_triangles_and_orphans[t.v1];
@@ -1614,26 +1623,12 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
             local_min_angle = std::min({local_min_angle, a0, a1, a2});
             local_max_angle = std::max({local_max_angle, a0, a1, a2});
         }
-
-        // Collect edges
-        int v[3] = {t.v0, t.v1, t.v2};
-        for (int i = 0; i < 3; ++i) {
-            int idx1 = v[i];
-            int idx2 = v[(i + 1) % 3];
-            if (idx1 > idx2) std::swap(idx1, idx2);
-            edges.emplace_back(idx1, idx2);
-        }
     }
 
-    // Sort and process unique edges
-    std::sort(edges.begin(), edges.end());
-    
-    for (size_t i = 0; i < edges.size(); ++i) {
-        // Skip duplicates
-        if (i > 0 && edges[i] == edges[i-1]) continue;
-        
-        int idx1 = edges[i].first;
-        int idx2 = edges[i].second;
+    // Second pass: use pre-computed unique edges for edge stats
+    for (const auto& edge : unique_edges) {
+        int idx1 = edge.first;
+        int idx2 = edge.second;
         
         const Point& ep1 = points_on_owned_triangles_and_orphans[idx1];
         const Point& ep2 = points_on_owned_triangles_and_orphans[idx2];
@@ -1663,7 +1658,6 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
             local_bins[bin]++;
         }
     }
-    edges.clear();
     
     if (triangles_owned.empty()) {
         local_min_volume = 1e30; local_max_volume = -1.0;
@@ -1797,12 +1791,18 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     //if (print_stats) std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
     // 3. Check Integrity
-    if (!CheckMeshIntegrity(comm, points_on_owned_triangles_and_orphans, triangles_owned)) {
+    std::vector<int> valence;
+    std::vector<std::pair<int, int>> unique_edges;
+    if (!CheckMeshIntegrity(comm, points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges)) {
         return NULL;
     }
 
-    // 4. Print stats
-    if (print_stats) ComputeAndPrintStats(comm, final_smooth_its, points_on_owned_triangles_and_orphans, triangles_owned);
+    // 4. Print stats (reuses valence and edges from integrity check)
+    if (print_stats) ComputeAndPrintStats(comm, final_smooth_its, points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges);
+    
+    // Free the valence and edge data now that we're done with stats
+    valence.clear();
+    unique_edges.clear();
 
     // 5. Create the DM
     if (comm_rank == 0 && print_stats) std::cout << "Creating DM...\n";
