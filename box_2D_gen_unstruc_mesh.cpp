@@ -266,7 +266,6 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
     // - The lowest rank that claimed the point (to pick a winner)
     // - The coordinates associated with that lowest rank (to sync geometry)
     struct ResolutionData {
-        std::set<int> observed_geo_ranks;
         int best_rank = 999999;
         double best_x = 0, best_y = 0;
     };
@@ -275,9 +274,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
     // Initialize with self ONLY for involved points
     for(const auto& p : points) {
         if (involved_ids.count(p.unique_hash_id)) {
-            int my_geo_rank = get_owner_rank(p, size);
             ResolutionData& data = resolution_map[p.unique_hash_id];
-            data.observed_geo_ranks.insert(my_geo_rank);
             data.best_rank = rank;
             data.best_x = p.x;
             data.best_y = p.y;
@@ -289,9 +286,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
         for(const auto& claim : recv_buffers[r]) {
             involved_ids.insert(claim.id); // Mark as involved if a neighbor claims it
             ResolutionData& data = resolution_map[claim.id];
-            
-            data.observed_geo_ranks.insert(claim.geo_rank);
-            
+                        
             // Update best rank (lowest wins) and its coordinates
             // CRITICAL: We ALWAYS take the coordinates from the lowest rank,
             // regardless of whether there is an ownership dispute.
