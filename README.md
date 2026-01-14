@@ -12,11 +12,12 @@ This code instead:
 
 To enable this several compromises were made, namely:   
    - Can only produce meshes on a simple square domain.
-   - The mesh produced has uniform resolution.
+   - Uniform resolution throughout the domain.
    - Produces good elements (e.g., with reasonable angles and volume ratios) but not necessarily optimal.
    - The mesh has reasonably low communication volume, but is not necessarily communication minimising. A mesh partitioner like ParMETIS can be explicitly called by using ``DMPlexDistribute`` on the returned DM to further minimise the communication volume.
    - Not fully optimised for speed/memory.
    - Not robust when the number of elements per MPI rank is small (say <100k).
+   - If differing numbers of MPI ranks are used, the mesh produced is not identical.
 
 Weak scaling results on ARCHER2 show this code is reasonably performant and scalable:
 

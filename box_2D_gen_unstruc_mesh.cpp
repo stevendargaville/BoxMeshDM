@@ -1414,15 +1414,26 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
 
     // Compute valence and edges once here
     ComputeValenceAndEdges(points_on_owned_triangles_and_orphans, triangles_owned, valence, unique_edges);    
+
+    // Build a set of point indices that appear in owned triangles
+    std::vector<bool> appears_in_triangle(points_on_owned_triangles_and_orphans.size(), false);
+    for (const auto& t : triangles_owned) {
+        appears_in_triangle[t.v0] = true;
+        appears_in_triangle[t.v1] = true;
+        appears_in_triangle[t.v2] = true;
+    }    
     
     for(size_t i=0; i<points_on_owned_triangles_and_orphans.size(); ++i) {
         const auto& p = points_on_owned_triangles_and_orphans[i];
-        // Only check points owned by this rank to avoid double counting ghosts
-        if (valence[i] == 0 && get_owner_rank(p, size) == rank) {
+        // Only check points owned by this rank that appear in a triangle
+        // Orphan points (owned point but not in any owned triangle on this rank)
+        // legitimately have valence 0 here
+        if (valence[i] == 0 && appears_in_triangle[i] && get_owner_rank(p, size) == rank) {
             std::cout << "[Rank " << rank << "] UNCONNECTED POINT: (" << p.x << ", " << p.y 
-                     << ") ID: " << p.unique_hash_id << " Valence (Halo): " << valence[i] << "\n";
+                     << ") ID: " << p.unique_hash_id << " Valence: " << valence[i] << "\n";
         }
     }
+    appears_in_triangle.clear();
 
     // 1. Count Owned Points (needed for Euler)
     long num_points_owned = 0;
