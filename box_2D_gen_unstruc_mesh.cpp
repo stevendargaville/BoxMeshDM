@@ -996,24 +996,25 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // First pass: count edge contributions per vertex
     std::vector<int> valence_count(points_with_halos.size(), 0);
     
-    // Collect all edges as (min_hash, max_hash, vertex_idx) and sort to dedupe
-    std::vector<std::tuple<uint64_t, uint64_t, int>> edges;
+    // Collect all edges as (min_idx, max_idx, vertex_idx) using ints
+    std::vector<std::tuple<int, int, int>> edges;
     edges.reserve(triangles_with_halos.size() * 6); // 3 edges × 2 endpoints
     
     for(const auto& t : triangles_with_halos) {
-        uint64_t h0 = points_with_halos[t.v0].unique_hash_id;
-        uint64_t h1 = points_with_halos[t.v1].unique_hash_id;
-        uint64_t h2 = points_with_halos[t.v2].unique_hash_id;
+        int v0 = t.v0, v1 = t.v1, v2 = t.v2;
         
         // Edge 0-1
-        edges.emplace_back(std::min(h0,h1), std::max(h0,h1), t.v0);
-        edges.emplace_back(std::min(h0,h1), std::max(h0,h1), t.v1);
+        int e01_min = std::min(v0, v1), e01_max = std::max(v0, v1);
+        edges.emplace_back(e01_min, e01_max, v0);
+        edges.emplace_back(e01_min, e01_max, v1);
         // Edge 1-2
-        edges.emplace_back(std::min(h1,h2), std::max(h1,h2), t.v1);
-        edges.emplace_back(std::min(h1,h2), std::max(h1,h2), t.v2);
+        int e12_min = std::min(v1, v2), e12_max = std::max(v1, v2);
+        edges.emplace_back(e12_min, e12_max, v1);
+        edges.emplace_back(e12_min, e12_max, v2);
         // Edge 0-2
-        edges.emplace_back(std::min(h0,h2), std::max(h0,h2), t.v0);
-        edges.emplace_back(std::min(h0,h2), std::max(h0,h2), t.v2);
+        int e02_min = std::min(v0, v2), e02_max = std::max(v0, v2);
+        edges.emplace_back(e02_min, e02_max, v0);
+        edges.emplace_back(e02_min, e02_max, v2);
     }
     
     // Sort and count unique edges per vertex
@@ -1581,13 +1582,16 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
     double local_min_volume = 1e30, local_max_volume = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
 
-    // 3. Edge Orientation Statistics
+    // 3. Edge Orientation Statistics - use sorting instead of set
     std::vector<long> local_bins(18, 0);
-    std::set<std::pair<int, int>> processed_edges;
     
     // Accumulators for edge length stats
     double local_total_edge_len = 0.0;
     long local_edge_count = 0;
+
+    // Collect edges as (min_idx, max_idx) for deduplication
+    std::vector<std::pair<int, int>> edges;
+    edges.reserve(triangles_owned.size() * 3);
 
     for (const auto& t : triangles_owned) {
         const Point& p0 = points_on_owned_triangles_and_orphans[t.v0];
@@ -1617,50 +1621,56 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
             local_max_angle = std::max({local_max_angle, a0, a1, a2});
         }
 
-        // Edges
+        // Collect edges
         int v[3] = {t.v0, t.v1, t.v2};
         for (int i = 0; i < 3; ++i) {
             int idx1 = v[i];
             int idx2 = v[(i + 1) % 3];
-            
-            // Sort indices for uniqueness check
             if (idx1 > idx2) std::swap(idx1, idx2);
-            
-            if (processed_edges.find({idx1, idx2}) == processed_edges.end()) {
-                processed_edges.insert({idx1, idx2});
-                
-                const Point& ep1 = points_on_owned_triangles_and_orphans[idx1];
-                const Point& ep2 = points_on_owned_triangles_and_orphans[idx2];
-                
-                // Check ownership of edge midpoint
-                double mx = (ep1.x + ep2.x) * 0.5;
-                double my = (ep1.y + ep2.y) * 0.5;
-                
-                if (get_owner_rank(Point{mx, my}, size) == rank) {
-                    double dx = ep2.x - ep1.x;
-                    double dy = ep2.y - ep1.y;
-                    
-                    // Accumulate length
-                    double len = std::sqrt(dx*dx + dy*dy);
-                    local_total_edge_len += len;
-                    local_edge_count++;
-
-                    // Angle in [0, 180)
-                    double angle = std::atan2(dy, dx) * 180.0 / 3.14159265358979323846;
-                    if (angle < 0) angle += 180.0;
-                    if (angle >= 180.0) angle -= 180.0;
-                    
-                    int bin = static_cast<int>(angle / 10.0);
-                    if (bin < 0) bin = 0;
-                    if (bin >= 18) bin = 17;
-                    
-                    local_bins[bin]++;
-                }
-            }
+            edges.emplace_back(idx1, idx2);
         }
     }
-    processed_edges.clear();
 
+    // Sort and process unique edges
+    std::sort(edges.begin(), edges.end());
+    
+    for (size_t i = 0; i < edges.size(); ++i) {
+        // Skip duplicates
+        if (i > 0 && edges[i] == edges[i-1]) continue;
+        
+        int idx1 = edges[i].first;
+        int idx2 = edges[i].second;
+        
+        const Point& ep1 = points_on_owned_triangles_and_orphans[idx1];
+        const Point& ep2 = points_on_owned_triangles_and_orphans[idx2];
+        
+        // Check ownership of edge midpoint
+        double mx = (ep1.x + ep2.x) * 0.5;
+        double my = (ep1.y + ep2.y) * 0.5;
+        
+        if (get_owner_rank(Point{mx, my}, size) == rank) {
+            double dx = ep2.x - ep1.x;
+            double dy = ep2.y - ep1.y;
+            
+            // Accumulate length
+            double len = std::sqrt(dx*dx + dy*dy);
+            local_total_edge_len += len;
+            local_edge_count++;
+
+            // Angle in [0, 180)
+            double angle = std::atan2(dy, dx) * 180.0 / 3.14159265358979323846;
+            if (angle < 0) angle += 180.0;
+            if (angle >= 180.0) angle -= 180.0;
+            
+            int bin = static_cast<int>(angle / 10.0);
+            if (bin < 0) bin = 0;
+            if (bin >= 18) bin = 17;
+            
+            local_bins[bin]++;
+        }
+    }
+    edges.clear();
+    
     if (triangles_owned.empty()) {
         local_min_volume = 1e30; local_max_volume = -1.0;
         local_min_angle = 360.0; local_max_angle = -1.0;
