@@ -1701,7 +1701,8 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
         std::cout << "  Imbalance Ratio (Max/Avg): " << (double)max_points_owned_global / ((double)num_points_owned_global / size) << "\n";
         
         std::cout << "Connectivity (Valence):\n";
-        for(int i=0; i<MAX_CONN; ++i) {
+        // Start from 1 to skip any orphan points that falsely report valence 0
+        for(int i=1; i<MAX_CONN; ++i) {
             if (global_conn_bins[i] > 0) {
                 double pct = 100.0 * global_conn_bins[i] / num_points_owned_global;
                 std::cout << "  Degree " << std::setw(2) << i << ": " 
