@@ -985,7 +985,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     //existing_hashes.clear();
 
     // Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
-    remove_duplicates(points_with_halos);
+    // remove_duplicates(points_with_halos);
 
     // 4. ITERATIONS
     // We relax all points that are strictly inside the generated cloud.
