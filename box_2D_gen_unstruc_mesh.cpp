@@ -260,6 +260,10 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
     send_buffers.clear();
     send_counts.clear();
     recv_counts.clear();
+    // Explicitly delete the memory
+    std::vector<std::vector<Claim>>().swap(send_buffers);
+    std::vector<int>().swap(send_counts);
+    std::vector<int>().swap(recv_counts);    
 
     // 3. Resolve Ownership
     // We track:
@@ -546,6 +550,7 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
         tri_data[tri_offset[t.v2] + tri_count[t.v2]++] = k;
     }
     tri_count.clear();
+    std::vector<int>().swap(tri_count);
 
     // Define candidate relaxation factors to test per point
     std::vector<double> candidate_factors = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9};
@@ -776,35 +781,35 @@ static void ComputeValenceAndEdges(const std::vector<Point>& points,
 
 // ~~~~~~~~~~~~~~~~~
 
-// Helper to remove duplicates from cloud
-static void remove_duplicates(std::vector<Point>& points) {
-    if (points.empty()) return;
+// // Helper to remove duplicates from cloud
+// static void remove_duplicates(std::vector<Point>& points) {
+//     if (points.empty()) return;
 
-    // Use strict lexicographical sort. 
-    std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
-        if (a.x != b.x) return a.x < b.x;
-        if (a.y != b.y) return a.y < b.y;
-        return a.unique_hash_id < b.unique_hash_id; // Tie-breaker for absolute stability
-    });
+//     // Use strict lexicographical sort. 
+//     std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
+//         if (a.x != b.x) return a.x < b.x;
+//         if (a.y != b.y) return a.y < b.y;
+//         return a.unique_hash_id < b.unique_hash_id; // Tie-breaker for absolute stability
+//     });
 
-    std::vector<Point> unique_points;
-    unique_points.reserve(points.size());
-    unique_points.push_back(points[0]);
+//     std::vector<Point> unique_points;
+//     unique_points.reserve(points.size());
+//     unique_points.push_back(points[0]);
 
-    for (size_t i = 1; i < points.size(); ++i) {
-        const Point& prev = unique_points.back();
-        const Point& curr = points[i];
+//     for (size_t i = 1; i < points.size(); ++i) {
+//         const Point& prev = unique_points.back();
+//         const Point& curr = points[i];
         
-        // Check distance with tolerance
-        double dist_sq = (prev.x - curr.x)*(prev.x - curr.x) + (prev.y - curr.y)*(prev.y - curr.y);
+//         // Check distance with tolerance
+//         double dist_sq = (prev.x - curr.x)*(prev.x - curr.x) + (prev.y - curr.y)*(prev.y - curr.y);
         
-        // Only keep if distance is physically significant relative to mesh size
-        if (dist_sq > TOL_LEN_SQ) {
-            unique_points.push_back(curr);
-        }
-    }
-    points = unique_points;
-}
+//         // Only keep if distance is physically significant relative to mesh size
+//         if (dist_sq > TOL_LEN_SQ) {
+//             unique_points.push_back(curr);
+//         }
+//     }
+//     points = unique_points;
+// }
 
 // ~~~~~~~~~~~~~~~~~
 
@@ -1086,6 +1091,8 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
         }
     }
     triangles_with_halos.clear();
+    // Explicitly delete memory
+    std::vector<Triangle>().swap(triangles_with_halos);
 
     // Explicitly add "orphaned" points that we own spatially.
     // It is possible to own a point spatially (it's in our tile) but NOT own any of the
@@ -1190,6 +1197,9 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     }
     requests.clear();
     send_ids.clear();
+    // Explicitly delete memory
+    std::vector<MPI_Request>().swap(requests);
+    std::vector<std::vector<uint64_t>>().swap(send_ids);    
 
     // ---------------------------------------------------------
     // PROCESSING: Lookup Global IDs
@@ -1214,6 +1224,9 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     }
     recv_ids.clear();
     points_owned_l2g_map.clear();
+    // Explicitly delete memory
+    std::vector<std::vector<uint64_t>>().swap(recv_ids);
+    std::unordered_map<uint64_t, PetscInt>().swap(points_owned_l2g_map);    
 
     // ---------------------------------------------------------
     // PHASE 2: Exchange Global IDs (Answers)
@@ -1261,6 +1274,11 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     send_counts.clear();
     recv_counts.clear();
     recv_answers.clear();
+    // Explicitly delete memory
+    std::vector<std::vector<int>>().swap(send_req_indices);
+    std::vector<int>().swap(send_counts);
+    std::vector<int>().swap(recv_counts);
+    std::vector<std::vector<PetscInt>>().swap(recv_answers);    
 
     // 5. Build DMPlex
     PetscInt num_tris_owned = triangles_owned.size();
@@ -1272,6 +1290,8 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
         cells[i*3 + 2] = global_ids[triangles_owned[i].v2];
     }
     global_ids.clear();
+    // Explicitly delete memory
+    std::vector<PetscInt>().swap(global_ids);
 
     // Prepare coordinates for DMPlexCreateFromCellListParallelPetsc
     // points_on_owned_triangles_and_orphans contains ghosts (points of owned triangles that are owned by neighbors).
@@ -1442,6 +1462,8 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         }
     }
     appears_in_triangle.clear();
+    // Explicitly delete memory
+    std::vector<bool>().swap(appears_in_triangle);
 
     // 1. Count Owned Points (needed for Euler)
     long num_points_owned = 0;
@@ -1700,6 +1722,8 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
     std::vector<long> global_bins(18);
     MPI_Reduce(local_bins.data(), global_bins.data(), 18, MPI_LONG, MPI_SUM, 0, comm);
     local_bins.clear();
+    // Explicitly delete memory
+    std::vector<long>().swap(local_bins);
 
     // Output stats to rank 0
     if (rank == 0) {
@@ -1832,12 +1856,19 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     // Free the valence and edge data now that we're done with stats
     valence.clear();
     unique_edges.clear();
+    // Explicitly delete memory
+    std::vector<int>().swap(valence);
+    std::vector<std::pair<int,int>>().swap(unique_edges);    
 
     // 5. Create the DM
     if (comm_rank == 0 && print_stats) std::cout << "Creating DM...\n";
     DM dm = CreateDM(comm, points_on_owned_triangles_and_orphans, triangles_owned);
+
     points_on_owned_triangles_and_orphans.clear();
     triangles_owned.clear();
+    // Explicitly delete memory
+    std::vector<Point>().swap(points_on_owned_triangles_and_orphans);
+    std::vector<Triangle>().swap(triangles_owned);    
     
     PetscErrorCode ierr;
     ierr = PetscObjectSetName((PetscObject)dm, "Mesh");
