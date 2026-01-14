@@ -15,7 +15,7 @@ To enable this several compromises were made, namely:
    - The mesh produced has uniform resolution.
    - Produces good elements (e.g., with reasonable angles and volume ratios) but not necessarily optimal.
    - The mesh has reasonably low communication volume, but is not necessarily communication minimising. A mesh partitioner like ParMETIS can be explicitly called by using ``DMPlexDistribute`` on the returned DM to further minimise the communication volume.
-   - Not fully optimised for speed.
+   - Not fully optimised for speed/memory.
    - Not robust when the number of elements per MPI rank is small (say <100k).
 
 Weak scaling results on ARCHER2 show this code is reasonably performant and scalable:

@@ -257,6 +257,9 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
 
     // Clean up the custom type
     MPI_Type_free(&MPI_CLAIM);    
+    send_buffers.clear();
+    send_counts.clear();
+    recv_counts.clear();
 
     // 3. Resolve Ownership
     // We track:
@@ -314,6 +317,8 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
             p.y = data.best_y;
         }
     }
+    involved_ids.clear();
+    resolution_map.clear();
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -615,6 +620,10 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
             points[i] = best_candidate;
         }
     }
+    wx.clear();
+    wy.clear();
+    w_sum.clear();
+    point_to_tris.clear();
 }
 
 // Spring-Force Relaxation
@@ -706,6 +715,9 @@ static void relax_points_spring(std::vector<Point>& points, const std::vector<Tr
             points[i] = candidate;
         }
     }
+    force_x.clear();
+    force_y.clear();
+    valence.clear();
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -980,22 +992,51 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // We do this here because we have the full halo information.
     // For owned points (which are internal to this haloed mesh), this gives the correct global valence.
     // We use a set to count unique neighbors (edges), which handles both internal and boundary nodes correctly.
-    std::vector<std::set<uint64_t>> adj(points_with_halos.size());
+    // Use a simple counter array plus edge sorting to count unique neighbors
+    // First pass: count edge contributions per vertex
+    std::vector<int> valence_count(points_with_halos.size(), 0);
+    
+    // Collect all edges as (min_hash, max_hash, vertex_idx) and sort to dedupe
+    std::vector<std::tuple<uint64_t, uint64_t, int>> edges;
+    edges.reserve(triangles_with_halos.size() * 6); // 3 edges × 2 endpoints
+    
     for(const auto& t : triangles_with_halos) {
-        adj[t.v0].insert(points_with_halos[t.v1].unique_hash_id);
-        adj[t.v0].insert(points_with_halos[t.v2].unique_hash_id);
+        uint64_t h0 = points_with_halos[t.v0].unique_hash_id;
+        uint64_t h1 = points_with_halos[t.v1].unique_hash_id;
+        uint64_t h2 = points_with_halos[t.v2].unique_hash_id;
         
-        adj[t.v1].insert(points_with_halos[t.v0].unique_hash_id);
-        adj[t.v1].insert(points_with_halos[t.v2].unique_hash_id);
-        
-        adj[t.v2].insert(points_with_halos[t.v0].unique_hash_id);
-        adj[t.v2].insert(points_with_halos[t.v1].unique_hash_id);
+        // Edge 0-1
+        edges.emplace_back(std::min(h0,h1), std::max(h0,h1), t.v0);
+        edges.emplace_back(std::min(h0,h1), std::max(h0,h1), t.v1);
+        // Edge 1-2
+        edges.emplace_back(std::min(h1,h2), std::max(h1,h2), t.v1);
+        edges.emplace_back(std::min(h1,h2), std::max(h1,h2), t.v2);
+        // Edge 0-2
+        edges.emplace_back(std::min(h0,h2), std::max(h0,h2), t.v0);
+        edges.emplace_back(std::min(h0,h2), std::max(h0,h2), t.v2);
+    }
+    
+    // Sort and count unique edges per vertex
+    std::sort(edges.begin(), edges.end());
+    
+    if (!edges.empty()) {
+        auto prev = edges[0];
+        valence_count[std::get<2>(prev)]++;
+        for (size_t i = 1; i < edges.size(); ++i) {
+            // Only count if different edge or different vertex
+            if (edges[i] != prev) {
+                valence_count[std::get<2>(edges[i])]++;
+                prev = edges[i];
+            }
+        }
     }
     
     for(size_t i=0; i<points_with_halos.size(); ++i) {
-        points_with_halos[i].valence = adj[i].size();
+        points_with_halos[i].valence = valence_count[i];
     }
-
+    valence_count.clear();
+    edges.clear();
+    
     // Pre-allocate remapping array. 
     // -1 indicates the point hasn't been added to the owned list yet.
     std::vector<int> local_to_owned_idx(points_with_halos.size(), -1);
@@ -1039,6 +1080,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
             triangles_owned.push_back(new_t);
         }
     }
+    triangles_with_halos.clear();
 
     // Explicitly add "orphaned" points that we own spatially.
     // It is possible to own a point spatially (it's in our tile) but NOT own any of the
@@ -1054,6 +1096,8 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
              }
         }
     }
+    local_to_owned_idx.clear();
+    points_with_halos.clear();
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -1140,6 +1184,7 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
         MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
     }
     requests.clear();
+    send_ids.clear();
 
     // ---------------------------------------------------------
     // PROCESSING: Lookup Global IDs
@@ -1162,6 +1207,8 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
             }
         }
     }
+    recv_ids.clear();
+    points_owned_l2g_map.clear();
 
     // ---------------------------------------------------------
     // PHASE 2: Exchange Global IDs (Answers)
@@ -1205,6 +1252,10 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
             }
         }
     }
+    send_req_indices.clear();
+    send_counts.clear();
+    recv_counts.clear();
+    recv_answers.clear();
 
     // 5. Build DMPlex
     PetscInt num_tris_owned = triangles_owned.size();
@@ -1215,13 +1266,13 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
         cells[i*3 + 1] = global_ids[triangles_owned[i].v1];
         cells[i*3 + 2] = global_ids[triangles_owned[i].v2];
     }
+    global_ids.clear();
 
     // Prepare coordinates for DMPlexCreateFromCellListParallelPetsc
     // points_on_owned_triangles_and_orphans contains ghosts (points of owned triangles that are owned by neighbors).
     // PETSc expects 'numPoints' to be the count of locally owned points, 
     // and 'coords' to be the coordinates of those specific points
-    std::vector<PetscReal> coords_points_owned;
-    coords_points_owned.reserve(num_points_owned * 2);
+    std::vector<PetscReal> coords_points_owned(num_points_owned * 2);
     
     for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
         if (get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size) == comm_rank) {
@@ -1608,6 +1659,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
             }
         }
     }
+    processed_edges.clear();
 
     if (triangles_owned.empty()) {
         local_min_volume = 1e30; local_max_volume = -1.0;
@@ -1630,6 +1682,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
 
     std::vector<long> global_bins(18);
     MPI_Reduce(local_bins.data(), global_bins.data(), 18, MPI_LONG, MPI_SUM, 0, comm);
+    local_bins.clear();
 
     // Output stats to rank 0
     if (rank == 0) {
@@ -1677,6 +1730,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its, const std:
         }
         std::cout << "=======================\n";
     }
+    global_bins.clear();
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -1749,6 +1803,9 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     // 5. Create the DM
     if (comm_rank == 0 && print_stats) std::cout << "Creating DM...\n";
     DM dm = CreateDM(comm, points_on_owned_triangles_and_orphans, triangles_owned);
+    points_on_owned_triangles_and_orphans.clear();
+    triangles_owned.clear();
+    
     PetscErrorCode ierr;
     ierr = PetscObjectSetName((PetscObject)dm, "Mesh");
     
