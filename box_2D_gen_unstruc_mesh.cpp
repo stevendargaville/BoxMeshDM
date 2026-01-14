@@ -12,8 +12,9 @@
 #include <petscdmplex.h>
 #include <petscviewerhdf5.h>
 #include "petscconf.h"
-#include <map>
+#include <unordered_map>
 #include <set>
+#include <unordered_set>
 
 #if !defined(ANSI_DECLARATORS)
   #define ANSI_DECLARATORS
@@ -176,7 +177,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
     }
     
     std::vector<std::vector<Claim>> send_buffers(size);
-    std::set<uint64_t> involved_ids; // Only resolve points near boundaries
+    std::unordered_set<uint64_t> involved_ids; // Only resolve points near boundaries
     
     // Simple neighbor discovery: check all ranks (for small scale) or use grid logic
     // Here we use the grid logic to only send to actual neighbors
@@ -269,7 +270,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
         int best_rank = 999999;
         double best_x = 0, best_y = 0;
     };
-    std::map<uint64_t, ResolutionData> resolution_map;
+    std::unordered_map<uint64_t, ResolutionData> resolution_map;
     
     // Initialize with self ONLY for involved points
     for(const auto& p : points) {
@@ -495,28 +496,6 @@ static double get_max_cosine_tri(const Point& a, const Point& b, const Point& c)
 
 // ~~~~~~~~~~~~~~~~~
 
-// Helper for relax_points to calculate local max cosine
-static double calculate_local_max_cosine(int node_idx, const Point& node_pos, 
-                                 const std::vector<Point>& points, 
-                                 const std::vector<Triangle>& triangles, 
-                                 const std::vector<int>& connected_tris) {
-    double max_cos = -2.0;
-    for (int t_idx : connected_tris) {
-        const auto& tri = triangles[t_idx];
-        Point p1, p2;
-        // Find the other two points (neighbors)
-        if (tri.v0 == node_idx) { p1 = points[tri.v1]; p2 = points[tri.v2]; }
-        else if (tri.v1 == node_idx) { p1 = points[tri.v0]; p2 = points[tri.v2]; }
-        else { p1 = points[tri.v0]; p2 = points[tri.v1]; }
-
-        double mc = get_max_cosine_tri(node_pos, p1, p2);
-        if (mc > max_cos) max_cos = mc;
-    }
-    return max_cos;
-}
-
-// ~~~~~~~~~~~~~~~~~
-
 // Lloyd-smoothing - only smooths points within a certain box
 // that way we can lock the outermost points in the halo, so the halo 
 // doesn't shrink inwards
@@ -527,9 +506,22 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
     std::vector<double> wx(n, 0.0), wy(n, 0.0);
     std::vector<double> w_sum(n, 0.0);
     
-    // Build adjacency map for conditional check
-    std::vector<std::vector<int>> point_to_tris(n);
-
+    // CSR format for point-to-triangle adjacency
+    std::vector<int> tri_count(n, 0);
+    for (const auto& t : triangles) {
+        tri_count[t.v0]++;
+        tri_count[t.v1]++;
+        tri_count[t.v2]++;
+    }
+    
+    std::vector<int> tri_offset(n + 1, 0);
+    for (int i = 0; i < n; ++i) {
+        tri_offset[i + 1] = tri_offset[i] + tri_count[i];
+    }
+    
+    std::vector<int> tri_data(tri_offset[n]);
+    std::fill(tri_count.begin(), tri_count.end(), 0);
+    
     for (size_t k = 0; k < triangles.size(); ++k) {
         const auto& t = triangles[k];
         const Point& p0 = points[t.v0];
@@ -549,10 +541,11 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
         wx[t.v1] += volume * cx; wy[t.v1] += volume * cy; w_sum[t.v1] += volume;
         wx[t.v2] += volume * cx; wy[t.v2] += volume * cy; w_sum[t.v2] += volume;
 
-        point_to_tris[t.v0].push_back(k);
-        point_to_tris[t.v1].push_back(k);
-        point_to_tris[t.v2].push_back(k);
+        tri_data[tri_offset[t.v0] + tri_count[t.v0]++] = k;
+        tri_data[tri_offset[t.v1] + tri_count[t.v1]++] = k;
+        tri_data[tri_offset[t.v2] + tri_count[t.v2]++] = k;
     }
+    tri_count.clear();
 
     // Define candidate relaxation factors to test per point
     std::vector<double> candidate_factors = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9};
@@ -571,9 +564,23 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
             double full_dx = tx - points[i].x;
             double full_dy = ty - points[i].y;
 
+            // Use CSR data for triangle lookup
+            int start = tri_offset[i];
+            int end = tri_offset[i + 1];
+            
             // Minimize the maximum cosine is the same as maximizing the minimum angle, but without
-            // needing an acos which is expensive
-            double current_max_cos = calculate_local_max_cosine(i, points[i], points, triangles, point_to_tris[i]);
+            // needing an acos which is expensive            
+            double current_max_cos = -2.0;
+            for (int j = start; j < end; ++j) {
+                int t_idx = tri_data[j];
+                const auto& tri = triangles[t_idx];
+                Point p1, p2;
+                if (tri.v0 == i) { p1 = points[tri.v1]; p2 = points[tri.v2]; }
+                else if (tri.v1 == i) { p1 = points[tri.v0]; p2 = points[tri.v2]; }
+                else { p1 = points[tri.v0]; p2 = points[tri.v1]; }
+                double mc = get_max_cosine_tri(points[i], p1, p2);
+                if (mc > current_max_cos) current_max_cos = mc;
+            }
             
             Point best_candidate = points[i];
             double best_max_cos = current_max_cos;
@@ -583,12 +590,11 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
                 double dx = full_dx * factor;
                 double dy = full_dy * factor;
 
-                // TEST: Boundary Projection
+                // Boundary Projection
                 // We need to be careful not to modify points[i] permanently yet.
-                // Let's create a temp point for the constraint check.
+                // Let's create a temp point for the constraint check.                
                 Point temp_p = points[i];
                 bool was_boundary = apply_boundary_constraint(temp_p, dx, dy); 
-                
                 Point candidate = temp_p;
                 candidate.x += dx;
                 candidate.y += dy;
@@ -602,22 +608,32 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
                     if (candidate.y > DOMAIN_SIZE) candidate.y = DOMAIN_SIZE;
                 }
 
-                double candidate_max_cos = calculate_local_max_cosine(i, candidate, points, triangles, point_to_tris[i]);
+                // Inline max cosine calculation using CSR
+                double candidate_max_cos = -2.0;
+                for (int j = start; j < end; ++j) {
+                    int t_idx = tri_data[j];
+                    const auto& tri = triangles[t_idx];
+                    Point p1, p2;
+                    if (tri.v0 == i) { p1 = points[tri.v1]; p2 = points[tri.v2]; }
+                    else if (tri.v1 == i) { p1 = points[tri.v0]; p2 = points[tri.v2]; }
+                    else { p1 = points[tri.v0]; p2 = points[tri.v1]; }
+                    double mc = get_max_cosine_tri(candidate, p1, p2);
+                    if (mc > candidate_max_cos) candidate_max_cos = mc;
+                }
 
-                // Optimization Logic: Minimize Max Cosine
                 if (candidate_max_cos < best_max_cos) {
                     best_max_cos = candidate_max_cos;
                     best_candidate = candidate;
                 }
             }
-
             points[i] = best_candidate;
         }
     }
+    tri_data.clear();
+    tri_offset.clear();
     wx.clear();
     wy.clear();
     w_sum.clear();
-    point_to_tris.clear();
 }
 
 // Spring-Force Relaxation
@@ -1180,7 +1196,7 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     // ---------------------------------------------------------
     
     // We need a map for fast lookup between the unique hash id and the global id
-    std::map<uint64_t, PetscInt> points_owned_l2g_map;
+    std::unordered_map<uint64_t, PetscInt> points_owned_l2g_map;
     for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
         if (get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size) == comm_rank) {
             points_owned_l2g_map[points_on_owned_triangles_and_orphans[i].unique_hash_id] = global_ids[i];
