@@ -19,7 +19,7 @@ To enable this several compromises were made, namely:
    - Not robust when the number of elements per MPI rank is small (say <100k).
    - If differing numbers of MPI ranks are used, the mesh produced is not identical.
 
-Weak scaling results on ARCHER2 with a fixed number of final smoothing iterations show the code is reasonably performant and scalable:
+Weak scaling results on ARCHER2 show the code is reasonably performant and scalable:
 
    | Compute nodes  | MPI ranks | Target edge length | Elements | Min angle (degrees) | Min/max volume ratio | Load imbalance | Time (s) |
    | --- | -- | -- | --- | --- | --- | --- |  --- |
@@ -29,13 +29,22 @@ Weak scaling results on ARCHER2 with a fixed number of final smoothing iteration
    | 4 | 512 | 6.25e-5 | 512M | 21.5 | 13.6 | 1.00125 | 92 |   
    | 1 | 128 | 1.25e-4 | 128M | 16.7 | 11.4 | 1.00111 | 82 |   
 
-To improve the mesh quality increase the number of final smoothing iterations.
+To improve the mesh quality increase the number of final smoothing iterations. To improve the runtime, disable the integrity check and printing of statistics.  
 
 ### Executable
 
 To build an executable which can be called from the command line for small scale testing, ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
-There are five input variables that can be changed from the command line. Their default values are: ``-target_edge_length 0.0025``, ``-final_smooth_its 4``, ``-write_mesh false``, ``-integrity_check true`` and ``-print_stats true``. For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
+There are five input variables that can be changed from the command line:   
+   | Command line argument  | Default value | Details |
+   | --- | -- | -- |
+   | ``-target_edge_length`` | 0.0025 | Target edge length for elements. Resulting mesh will have edges close to this value. |
+   | ``-final_smooth_its`` | 4 | How many iterations of smoothing (LLoyds + springs) to do. More iterations will increase mesh quality and runtime. |
+   | ``-write_mesh`` | false | Output the PETSc DM to disk in HDF5 format. |
+   | ``-integrity_check`` | true | Run mesh integrity checks and return NULL if not valid. This takes extra memory and time. Recommend disabling this for production runs. |
+   | ``-print_stats`` | true | Print global mesh statistics on rank 0. This takes extra memory and time. Recommend disabling this for production runs. |
+ 
+ For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
 
      mpiexec -n 2 ./box_2D_gen_unstruc_mesh
 
@@ -66,7 +75,7 @@ In your code, to generate a PETSc DM that can then be used as normal, you can ca
      PetscInt final_smooth_its = 4;
      // Check the integrity of the mesh and error if not valid
      PetscBool integrity_check = PETSC_TRUE;
-     // Print mesh statistics to the terminal from MPI rank 0
+     // Print global mesh statistics from MPI rank 0
      PetscBool print_stats = PETSC_TRUE;
 
      // Generate the mesh stored in a parallel PETSc DM on the MPI_Comm PETSC_COMM_WORLD
