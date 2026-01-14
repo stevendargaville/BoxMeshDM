@@ -989,45 +989,38 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
            interior_min_x, interior_min_y, interior_max_x, interior_max_y, pad);
 
     // CALCULATE VALENCE (Connectivity)
-    // We do this here because we have the full halo information.
-    // For owned points (which are internal to this haloed mesh), this gives the correct global valence.
-    // We use a set to count unique neighbors (edges), which handles both internal and boundary nodes correctly.
-    // Use a simple counter array plus edge sorting to count unique neighbors
-    // First pass: count edge contributions per vertex
-    std::vector<int> valence_count(points_with_halos.size(), 0);
+    // Two-pass approach: much faster than sorting 6T tuples
+    // Pass 1: Collect unique edges (3T entries, not 6T)
+    // Pass 2: Increment valence for both endpoints of each unique edge
     
-    // Collect all edges as (min_idx, max_idx, vertex_idx) using ints
-    std::vector<std::tuple<int, int, int>> edges;
-    edges.reserve(triangles_with_halos.size() * 6); // 3 edges × 2 endpoints
+    std::vector<std::pair<int, int>> edges;
+    edges.reserve(triangles_with_halos.size() * 3); // 3 edges per triangle
     
     for(const auto& t : triangles_with_halos) {
         int v0 = t.v0, v1 = t.v1, v2 = t.v2;
         
-        // Edge 0-1
-        int e01_min = std::min(v0, v1), e01_max = std::max(v0, v1);
-        edges.emplace_back(e01_min, e01_max, v0);
-        edges.emplace_back(e01_min, e01_max, v1);
-        // Edge 1-2
-        int e12_min = std::min(v1, v2), e12_max = std::max(v1, v2);
-        edges.emplace_back(e12_min, e12_max, v1);
-        edges.emplace_back(e12_min, e12_max, v2);
-        // Edge 0-2
-        int e02_min = std::min(v0, v2), e02_max = std::max(v0, v2);
-        edges.emplace_back(e02_min, e02_max, v0);
-        edges.emplace_back(e02_min, e02_max, v2);
+        // Store each edge once with (min, max) ordering
+        edges.emplace_back(std::min(v0, v1), std::max(v0, v1));
+        edges.emplace_back(std::min(v1, v2), std::max(v1, v2));
+        edges.emplace_back(std::min(v0, v2), std::max(v0, v2));
     }
     
-    // Sort and count unique edges per vertex
+    // Sort to find unique edges
     std::sort(edges.begin(), edges.end());
     
+    // Count valence: each unique edge contributes +1 to both endpoints
+    std::vector<int> valence_count(points_with_halos.size(), 0);
+    
     if (!edges.empty()) {
-        auto prev = edges[0];
-        valence_count[std::get<2>(prev)]++;
+        // Process first edge
+        valence_count[edges[0].first]++;
+        valence_count[edges[0].second]++;
+        
         for (size_t i = 1; i < edges.size(); ++i) {
-            // Only count if different edge or different vertex
-            if (edges[i] != prev) {
-                valence_count[std::get<2>(edges[i])]++;
-                prev = edges[i];
+            // Skip duplicates
+            if (edges[i] != edges[i-1]) {
+                valence_count[edges[i].first]++;
+                valence_count[edges[i].second]++;
             }
         }
     }
