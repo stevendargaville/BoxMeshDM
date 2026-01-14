@@ -1273,7 +1273,8 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     // points_on_owned_triangles_and_orphans contains ghosts (points of owned triangles that are owned by neighbors).
     // PETSc expects 'numPoints' to be the count of locally owned points, 
     // and 'coords' to be the coordinates of those specific points
-    std::vector<PetscReal> coords_points_owned(num_points_owned * 2);
+    std::vector<PetscReal> coords_points_owned;
+    coords_points_owned.reserve(num_points_owned * 2);
     
     for(int i=0; i<num_points_on_owned_triangles_and_orphans; ++i) {
         if (get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size) == comm_rank) {
