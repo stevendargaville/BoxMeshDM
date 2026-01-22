@@ -1787,10 +1787,12 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
 
     // Ensure edge length is not too small for 31-bit indexing
     // Max index is ~2 billion. 1.0 / 2e9 = 5e-10
+    // That means this MPI rank can't have more than 2 billion points
+    // The distributed mesh can have more however
     if (TARGET_EDGE_LENGTH < 5e-10) {
         if (comm_rank == 0) {
             std::cerr << "WARNING: Target edge length " << TARGET_EDGE_LENGTH 
-                      << " is extremely small. It approaches the limit of the 31-bit index hashing scheme.\n"
+                      << " is extremely small. It approaches the limit of the local 31-bit index hashing scheme.\n"
                       << "Rewrite the create_point_with_unique_hash_id \n";
             MPI_Abort(comm, EXIT_FAILURE);
         }
