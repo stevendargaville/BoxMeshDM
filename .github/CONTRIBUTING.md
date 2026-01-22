@@ -1,6 +1,6 @@
 box_2D_gen_unstruc_mesh is distributed under LICENSE.txt:
 
-Copyright (c) 2026 box_2D_gen_unstruc_mesh Developers
+Copyright (c) 2025-2026 box_2D_gen_unstruc_mesh Developers
 License: MIT, http://opensource.org/licenses/MIT
 
 Guidelines
