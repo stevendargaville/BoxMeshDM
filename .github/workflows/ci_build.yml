@@ -153,7 +153,6 @@ jobs:
             --download-fblaslapack \
             --download-triangle \
             --with-make-np=3 \
-            --with-petsc4py=1 \
             --with-python-exec="${{ steps.venv.outputs.pybin }}"
           make -j3
       - name: Build box mesh (debug, CPU)
