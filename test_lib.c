@@ -21,7 +21,6 @@ int main(int argc, char** argv) {
 
     // Enable the use of command line options for this DM
     ierr = DMSetFromOptions(dm);
-    (void)ierr;
 
     // Clean up
     ierr = DMDestroy(&dm);
