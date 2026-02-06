@@ -22,10 +22,10 @@ WORKDIR /build
 # Ensure pipelines fail if any stage fails
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Clone box_2D_gen_unstruc_mesh and run all the tests
+# Copy the source code and build it
+COPY . /build/box_2D_gen_unstruc_mesh
+
 RUN set -e; \
-    echo "Cloning branch: ${CHECKOUT_BRANCH}" && \
-    git clone --depth=1 --branch ${CHECKOUT_BRANCH} https://github.com/stevendargaville/box_2D_gen_unstruc_mesh.git && \
     cd box_2D_gen_unstruc_mesh && \
     make clean && make lib && \
     make clean && make && \
