@@ -94,9 +94,32 @@ endif
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+# Test library functionality
+test_lib: test_lib.o $(LIB_OUT)
+ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)
+# Static library
+	$(LINK.cc) -o test_lib test_lib.o $(LIB_OUT) $(PETSC_LIB)
+else
+# Shared library
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
+# macOS: Link with rpath to find the dylib in current directory
+	$(LINK.cc) -o test_lib test_lib.o -L. -lbox_2D_gen_unstruc_mesh $(PETSC_LIB) -Wl,-rpath,@loader_path
+else
+# Linux: Link with rpath to find the .so in current directory
+	$(LINK.cc) -o test_lib test_lib.o -L. -lbox_2D_gen_unstruc_mesh $(PETSC_LIB) -Wl,-rpath,'$$ORIGIN'
+endif
+endif
+
+tests_lib: test_lib
+	@echo "Running tests on library..."
+	./test_lib
+	$(MPIEXEC) -n 2 ./test_lib 
+
 # Tests - check executable exists and run it
+# and also builds the library and tests it can be linked
+# against and run
 tests: box_2D_gen_unstruc_mesh
-	@echo "Running tests..."
+	@echo "Running tests on executable..."
 	./box_2D_gen_unstruc_mesh
 	./box_2D_gen_unstruc_mesh -target_edge_length 0.002
 	./box_2D_gen_unstruc_mesh -final_smooth_its 5
@@ -104,10 +127,12 @@ tests: box_2D_gen_unstruc_mesh
 	./box_2D_gen_unstruc_mesh -print_stats 0
 	./box_2D_gen_unstruc_mesh -integrity_check 0 -print_stats 0	
 	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh
+	$(MAKE) lib
+	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Cleanup
 clean::
-	$(RM) $(OUT) $(LIB_OUT) $(OBJS) *.dat
+	$(RM) $(OUT) $(LIB_OUT) $(OBJS) test_lib test_lib.o *.dat
