@@ -25,10 +25,10 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Clone box_2D_gen_unstruc_mesh and run all the tests
 RUN set -e; \
     echo "Cloning branch: ${CHECKOUT_BRANCH}" && \
-    git clone --branch ${CHECKOUT_BRANCH} https://github.com/stevendargaville/box_2D_gen_unstruc_mesh.git && \
+    git clone --depth=1 --branch ${CHECKOUT_BRANCH} https://github.com/stevendargaville/box_2D_gen_unstruc_mesh.git && \
     cd box_2D_gen_unstruc_mesh && \
-    make clean && make lib \
-    make clean && make \
+    make clean && make lib && \
+    make clean && make && \
     make clean && make tests
 
 WORKDIR /build/box_2D_gen_unstruc_mesh
