@@ -1,0 +1,174 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  # run on the 1st of the month for new petsc release
+  # do it at 2am UTC so that the CI builds have finished
+  schedule:
+    - cron: '0 2 1 * *'    
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:       
+
+jobs:
+  setup:
+    runs-on: ubuntu-22.04
+    outputs:
+      branch: ${{ steps.determine_branch.outputs.branch }}
+      commit: ${{ github.sha }}      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine branch
+        id: determine_branch
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "branch=${{ github.event.pull_request.head.ref }}" >> $GITHUB_OUTPUT
+          else
+            echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: free disk space
+        run: |
+          docker system prune --volumes -af            
+
+  gnu_debug:
+    runs-on: ubuntu-22.04
+    needs: setup
+    env:
+      BRANCH: ${{ needs.setup.outputs.branch }}
+    steps:
+      - name: Build Docker image with debug PETSc
+        uses: docker/build-push-action@v2
+        with:
+          platforms: linux/amd64
+          push: false
+          file: ./dockerfiles/Dockerfile
+          build-args: |
+            BRANCH=${{ env.BRANCH }}
+            ARCH=arch-linux-c-debug
+
+  gnu_opt:
+    runs-on: ubuntu-22.04
+    needs: [setup]
+    env:
+      BRANCH: ${{ needs.setup.outputs.branch }}
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}      
+      - name: Build Docker image for pull requests
+        uses: docker/build-push-action@v2
+        with:
+          platforms: linux/amd64
+          push: false
+          file: ./dockerfiles/Dockerfile
+          build-args: |
+            BRANCH=${{ env.BRANCH }}
+            ARCH=arch-linux-c-opt
+
+  gnu_opt_64_bit:
+    runs-on: ubuntu-22.04
+    needs: [setup]
+    env:
+      BRANCH: ${{ needs.setup.outputs.branch }}
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}        
+      - name: Build Docker image for pull requests with 64-bit PETSc
+        uses: docker/build-push-action@v2
+        with:
+          platforms: linux/amd64
+          push: false
+          file: ./dockerfiles/Dockerfile_64_bit
+          build-args: |
+            BRANCH=${{ env.BRANCH }}
+            ARCH=arch-linux-c-opt
+
+  # No docker on macos with github actions so have to just build petsc first
+  macos_debug:
+    runs-on: macos-15
+    needs: [setup]
+    env:
+      BRANCH: ${{ needs.setup.outputs.branch }}
+    steps:
+      - name: Show toolchain
+        run: |
+          sw_vers
+          clang --version
+
+      - name: Install deps
+        run: |
+          brew update
+          brew install gcc open-mpi
+
+      - name: Set up Python venv
+        id: venv
+        run: |
+          set -e
+          python3 -m venv "$RUNNER_TEMP/venv"
+          echo "pybin=$RUNNER_TEMP/venv/bin/python" >> "$GITHUB_OUTPUT"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -U pip setuptools wheel numpy Cython
+
+      - name: Locate Homebrew gfortran and create shim
+        id: gf
+        shell: bash
+        run: |
+          set -e
+          GF=$(ls "$(brew --prefix)"/bin/gfortran-* | head -n1)
+          echo "gf=$GF" >> "$GITHUB_OUTPUT"
+          SHIM_DIR="$RUNNER_TEMP/gfortran-shim"
+          mkdir -p "$SHIM_DIR"
+          ln -sf "$GF" "$SHIM_DIR/gfortran"
+          # Make shim available to future steps
+          echo "$SHIM_DIR" >> "$GITHUB_PATH"
+          # Also use it in THIS step (GITHUB_PATH only affects subsequent steps)
+          export PATH="$SHIM_DIR:$PATH"
+          gfortran --version
+          # Sanity: ensure mpifort exists and can find gfortran now
+          "$(brew --prefix open-mpi)"/bin/mpifort -showme
+
+      - name: Build PETSc (debug, CPU, Open MPI + Fortran + petsc4py)
+        shell: bash
+        env:
+          # Tell Open MPI wrappers exactly which gfortran to invoke
+          OMPI_FC: ${{ steps.gf.outputs.gf }}
+        run: |
+          set -e
+          export PETSC_DIR="$(pwd)/petsc"
+          export PETSC_ARCH="arch-darwin-c-debug"
+          git clone --depth=1 --branch=main https://gitlab.com/petsc/petsc.git
+          cd petsc
+          MPI_BIN="$(brew --prefix open-mpi)/bin"
+          "${{ steps.venv.outputs.pybin }}" configure CC="${MPI_BIN}/mpicc" CXX="${MPI_BIN}/mpicxx" FC="${MPI_BIN}/mpifort" \
+            --with-debugging=1 \
+            --download-metis \
+            --download-parmetis \
+            --download-fblaslapack \
+            --download-triangle \
+            --with-make-np=3 \
+            --with-petsc4py=1 \
+            --with-python-exec="${{ steps.venv.outputs.pybin }}"
+          make -j3
+      - name: Build box mesh (debug, CPU)
+        shell: bash
+        run: |
+          set -e
+          export PETSC_DIR="$(pwd)/petsc"
+          export PETSC_ARCH="arch-darwin-c-debug"
+          git clone -b "$BRANCH" https://github.com/stevendargaville/box_2D_gen_unstruc_mesh.git
+          cd box_2D_gen_unstruc_mesh
+          make clean && make lib
+          make clean && make

@@ -1,0 +1,28 @@
+ARG BASE_IMAGE=stevendargaville/petsc_64_bit
+
+FROM ${BASE_IMAGE}
+# Checkout the main branch by default
+ARG BRANCH=main
+# Use the optimised petsc build by default
+ARG ARCH=arch-linux-c-opt
+
+LABEL maintainer="Steven Dargaville"
+LABEL description="box_2D_gen_unstruc_mesh_64_bit"
+
+ENV CHECKOUT_BRANCH=$BRANCH
+ENV PETSC_ARCH=$ARCH
+# Ensure any test failures are caught and the build fails
+ENV PETSC_OPTIONS="-on_error_abort"
+
+WORKDIR /build
+
+# Clone box_2D_gen_unstruc_mesh and run all the tests
+RUN set -e; \
+    echo "Cloning branch: ${CHECKOUT_BRANCH}" && \
+    git clone --branch ${CHECKOUT_BRANCH} https://github.com/stevendargaville/box_2D_gen_unstruc_mesh.git && \
+    cd box_2D_gen_unstruc_mesh && \
+    make clean && make lib \
+    make clean && make \
+    make clean && make tests
+
+WORKDIR /build/box_2D_gen_unstruc_mesh
