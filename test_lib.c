@@ -8,7 +8,7 @@ int main(int argc, char** argv) {
     PetscErrorCode ierr;
 
     // Set target mesh edge length
-    double target_edge_length = 0.0025;
+    double target_edge_length = 0.007;
     // Set the number of smoothing iterations
     PetscInt final_smooth_its = 4;
     // Check the integrity of the mesh and error if not valid

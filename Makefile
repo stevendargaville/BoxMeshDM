@@ -122,10 +122,10 @@ tests: box_2D_gen_unstruc_mesh
 	@echo "Running tests on executable..."
 	./box_2D_gen_unstruc_mesh
 	./box_2D_gen_unstruc_mesh -target_edge_length 0.002
-	./box_2D_gen_unstruc_mesh -final_smooth_its 5
-	./box_2D_gen_unstruc_mesh -integrity_check 0
-	./box_2D_gen_unstruc_mesh -print_stats 0
-	./box_2D_gen_unstruc_mesh -integrity_check 0 -print_stats 0	
+	./box_2D_gen_unstruc_mesh -target_edge_length 0.003 -final_smooth_its 5
+	./box_2D_gen_unstruc_mesh -target_edge_length 0.004 -integrity_check 0
+	./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -print_stats 0
+	./box_2D_gen_unstruc_mesh -target_edge_length 0.006 -integrity_check 0 -print_stats 0	
 	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh
 	$(MAKE) lib
 	$(MAKE) tests_lib
