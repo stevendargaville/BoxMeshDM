@@ -50,7 +50,7 @@ For large scale use, the code can be compiled as a library. Hence instead of wri
 
 Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make lib``. You then need to include the ``.h`` file in your code and link to the output library ``libbox_2D_gen_unstruc_mesh``. 
 
-In your code, to generate a PETSc DM that can then be used as normal, you can call in C/C++:
+In your code, to generate a PETSc DM that can then be used as normal, you can call in C/C++ (see test_lib.c):
 
      #include "box_2D_gen_unstruc_mesh.h"
 
