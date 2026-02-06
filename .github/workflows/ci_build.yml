@@ -158,7 +158,8 @@ jobs:
           set -e
           export PETSC_DIR="$(pwd)/petsc"
           export PETSC_ARCH="arch-darwin-c-debug"
-          git clone -b "$BRANCH" https://github.com/stevendargaville/box_2D_gen_unstruc_mesh.git
+          git clone --depth=1 -b "$BRANCH" https://github.com/stevendargaville/box_2D_gen_unstruc_mesh.git
           cd box_2D_gen_unstruc_mesh
           make clean && make lib
           make clean && make
+          make clean && make tests
