@@ -450,7 +450,7 @@ static std::vector<Triangle> triangulation(const std::vector<Point>& points) {
     }
 
     char args[32];
-    (void*)PetscStrncpy(args, "ezQ", sizeof(args));    
+    (void)PetscStrncpy(args, "ezQ", sizeof(args));    
 
     triangulate(args, &in, &out, NULL);
 
@@ -1322,7 +1322,8 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
     // by default as it's very memory heavy
     ierr = DMPlexDistributeSetDefault(dm, PETSC_FALSE);    
     // Have to include or -dm_view doesn't work on command line
-    ierr = DMViewFromOptions(dm, NULL, "-dm_view");     
+    ierr = DMViewFromOptions(dm, NULL, "-dm_view");
+    (void)ierr;     
 
     return dm;
 }
@@ -1879,7 +1880,8 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     LabelBoundaries(dm);
 
     // 7. Add refinement hook so labels are applied after any refinement
-    ierr = DMRefineHookAdd(dm, RefineHook_LabelBoundaries, NULL, NULL);    
+    ierr = DMRefineHookAdd(dm, RefineHook_LabelBoundaries, NULL, NULL);
+    (void)ierr;    
 
     return dm;
 }
