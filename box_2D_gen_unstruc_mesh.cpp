@@ -1475,7 +1475,11 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         }
     }
 
-    // 2. Accumulate Local Stats
+    // 2. Calculate expected values based on domain dimensions
+    double expected_area = DOMAIN_WIDTH * DOMAIN_HEIGHT;
+    double expected_perimeter = 2.0 * (DOMAIN_WIDTH + DOMAIN_HEIGHT);
+
+    // 3. Accumulate Local Stats
     double local_total_area = 0.0;
     double local_boundary_len = 0.0;
     long local_boundary_edge_count = 0;
@@ -1564,8 +1568,8 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         long long F_total = num_tris_owned_global;
         long long euler = V_total - E_total + F_total;
 
-        bool area_pass = std::abs(global_total_area - 1.0) < 1e-6;
-        bool perim_pass = std::abs(global_boundary_len - 4.0) < 1e-4;
+    bool area_pass = std::abs(global_total_area - expected_area) < 1e-6;
+    bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 1e-4;
         bool euler_pass = (euler == 1);
         bool edge_pass = (global_bad_edge_count == 0);
 

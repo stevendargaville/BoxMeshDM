@@ -40,9 +40,7 @@ int main(int argc, char** argv) {
     double rect_width = 2.0;
     double rect_height = 1.5;
     
-    dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, 
-                          final_smooth_its, integrity_check, 
-                          print_stats, rect_width, rect_height);
+    dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, final_smooth_its, integrity_check, print_stats, rect_width, rect_height);
 
     if (dm) {
         PetscPrintf(PETSC_COMM_WORLD, "Rectangular mesh generation successful!\n");

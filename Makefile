@@ -72,6 +72,10 @@ ifndef BUILD_LIB
 override CXXFLAGS += -DSTANDALONE_MESH_GEN
 endif
 
+# Build the main executable
+$(OUT): $(OBJS)
+	$(LINK.cc) $(OBJS) $(PETSC_LIB) -o $(OUT)
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Create the library - use recursive make to set BUILD_LIB and avoid the define
