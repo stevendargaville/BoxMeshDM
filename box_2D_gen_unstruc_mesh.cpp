@@ -1461,8 +1461,8 @@ static void LabelBoundaries(DM dm) {
             
             PetscInt val = 0;
             if (std::abs(cy) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(cx - DOMAIN_SIZE) < EPSILON) val = 2; // Right
-            else if (std::abs(cy - DOMAIN_SIZE) < EPSILON) val = 3; // Top
+            else if (std::abs(cx - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
             else if (std::abs(cx) < EPSILON) val = 4;         // Left
 
             if (val != 0) {
