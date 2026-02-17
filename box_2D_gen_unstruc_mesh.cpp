@@ -1334,11 +1334,20 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
 // Label boundary faces and vertices based on geometric location
 static void LabelBoundaries(DM dm) {
 
-    // Create a label named "Face Sets" (standard name for boundary markers)
+    // Create or get "Face Sets" label (standard name for boundary markers)
     // Values: 1=Bottom, 2=Right, 3=Top, 4=Left
-    PetscCallVoid(DMCreateLabel(dm, "Face Sets"));
     DMLabel label;
     PetscCallVoid(DMGetLabel(dm, "Face Sets", &label));
+    if (!label) {
+        PetscCallVoid(DMCreateLabel(dm, "Face Sets"));
+        PetscCallVoid(DMGetLabel(dm, "Face Sets", &label));
+    } else {
+        // Clear existing strata to avoid stale labels
+        PetscCallVoid(DMLabelClearStratum(label, 1));
+        PetscCallVoid(DMLabelClearStratum(label, 2));
+        PetscCallVoid(DMLabelClearStratum(label, 3));
+        PetscCallVoid(DMLabelClearStratum(label, 4));
+    }
     
     // Get coordinates
     Vec coordsVec;
@@ -1374,12 +1383,10 @@ static void LabelBoundaries(DM dm) {
     }
     PetscCallVoid(DMPlexLabelComplete(dm, label));
     
-    PetscCallVoid(DMCreateLabel(dm, "markers"));
-    PetscCallVoid(DMGetLabel(dm, "markers", &label));
-
-    // 2. Label Edges (Depth 1 in 2D)
-    PetscInt eStart, eEnd;
-    PetscCallVoid(DMPlexGetDepthStratum(dm, 1, &eStart, &eEnd));
+    // 2. Label Edges/Facets (Height 1 in 2D = codimension-1 = facets)
+    // Need to label to BOTH "Face Sets" and "markers"
+    PetscInt eStart, eEnd;  
+    PetscCallVoid(DMPlexGetHeightStratum(dm, 1, &eStart, &eEnd));
     
     for (PetscInt e = eStart; e < eEnd; ++e) {
         PetscInt num_points;
@@ -1413,12 +1420,60 @@ static void LabelBoundaries(DM dm) {
             else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
             else if (std::abs(cx) < EPSILON) val = 4;         // Left
 
-            if (val != 0) PetscCallVoid(DMLabelSetValue(label, e, val));
+            if (val != 0) {
+                // Label to Face Sets (for boundary conditions)
+                PetscCallVoid(DMLabelSetValue(label, e, val));
+            }
+        }
+    }
+    PetscCallVoid(DMPlexLabelComplete(dm, label));
+    
+    // Also label edges to "markers" label
+    PetscCallVoid(DMCreateLabel(dm, "markers"));
+    DMLabel markersLabel;
+    PetscCallVoid(DMGetLabel(dm, "markers", &markersLabel));
+    
+    for (PetscInt e = eStart; e < eEnd; ++e) {
+        PetscInt num_points;
+        const PetscInt *points;
+        PetscCallVoid(DMPlexGetConeSize(dm, e, &num_points));
+        PetscCallVoid(DMPlexGetCone(dm, e, &points));
+        
+        // Compute centroid of edge to determine boundary
+        double cx = 0, cy = 0;
+        int count = 0;
+        
+        for(int i=0; i<num_points; ++i) {
+            PetscInt v = points[i];
+            PetscInt off, dof;
+            PetscCallVoid(PetscSectionGetDof(coordSection, v, &dof));
+            if (dof > 0) {
+                PetscCallVoid(PetscSectionGetOffset(coordSection, v, &off));
+                cx += coords[off];
+                cy += coords[off+1];
+                count++;
+            }
+        }
+        
+        if (count > 0) {
+            cx /= count;
+            cy /= count;
+            
+            PetscInt val = 0;
+            if (std::abs(cy) < EPSILON) val = 1;              // Bottom
+            else if (std::abs(cx - DOMAIN_SIZE) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - DOMAIN_SIZE) < EPSILON) val = 3; // Top
+            else if (std::abs(cx) < EPSILON) val = 4;         // Left
+
+            if (val != 0) {
+                // Label to markers
+                PetscCallVoid(DMLabelSetValue(markersLabel, e, val));
+            }
         }
     }
 
     PetscCallVoid(VecRestoreArrayRead(coordsVec, &coords));
-    PetscCallVoid(DMPlexLabelComplete(dm, label));
+    PetscCallVoid(DMPlexLabelComplete(dm, markersLabel));
 }
 
 // ~~~~~~~~~~~~~~~~~
