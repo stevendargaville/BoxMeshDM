@@ -1,4 +1,8 @@
-This code builds triangular unstructured meshes for a 2D square [0,1] x [0,1] in parallel with MPI, designed for use with PETSc. It depends on PETSc configured with triangle (``--download-triangle``) and returns a parallel DMPlex object which stores the unstructured mesh. To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
+This code builds triangular unstructured meshes for a 2D rectangular domain in parallel with MPI, designed for use with PETSc. It depends on PETSc configured with triangle (``--download-triangle``) and returns a parallel DMPlex object which stores the unstructured mesh. To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
+
+### Domain Size
+
+The domain size can be specified by passing in the ``-domain_width`` and ``-domain_height`` command line arguments. The default domain size is [0,1] x [0,1].
 
 ### Motivation
 
@@ -13,7 +17,7 @@ This code instead:
    - Produces load-balanced meshes without explicitly calling a mesh partitioner such as ParMETIS.
 
 To enable this several compromises were made, namely:   
-   - Can only produce meshes on a simple square domain.
+   - Can only produce meshes on a simple rectangular domain.
    - Uniform resolution throughout the domain.
    - Produces good elements (e.g., with reasonable angles and volume ratios) but not necessarily optimal.
    - The mesh has reasonably low communication volume, but is not necessarily communication minimising. A mesh partitioner like ParMETIS can be explicitly called by using ``DMPlexDistribute`` on the returned DM to further minimise the communication volume.
