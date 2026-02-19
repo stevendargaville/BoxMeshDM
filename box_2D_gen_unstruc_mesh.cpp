@@ -1889,6 +1889,16 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
                 best_m = m;
                 best_n = n;
             }
+            
+            // Also try the swapped decomposition (n x m) to ensure symmetry
+            // This handles cases where the domain is rotated (width vs height swapped)
+            double swapped_surface_area = 2.0 * (n * DOMAIN_HEIGHT / m + m * DOMAIN_WIDTH / n);
+            
+            if (swapped_surface_area < best_surface_area) {
+                best_surface_area = swapped_surface_area;
+                best_m = n;
+                best_n = m;
+            }
         }
     }
     
