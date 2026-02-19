@@ -1866,20 +1866,39 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     TOL_LEN_SQ = TOL_LEN * TOL_LEN;
     TOL_VOLUME = TOL_LEN_SQ * 1e-2;
 
-    // Factorize comm_size into M x N such that M*N = comm_size and M, N are as close as possible
-    // This minimizes the perimeter (halo) for a given area.
-    int m = std::round(std::sqrt(comm_size));
-    while (comm_size % m != 0) {
-        m--;
-    }
-    int n = comm_size / m;
+    // Factorize comm_size into M x N such that M*N = comm_size
+    // (Tries to match the domain aspect ratio as closely as possible
+    // by finding the minimum total halo surface area possible)
     
-    TILE_DIM_X = m;
-    TILE_DIM_Y = n;
+    int best_m = 1;
+    int best_n = comm_size;
+    double best_surface_area = 1e30;
+    
+    // Find all factor pairs of comm_size
+    for (int m = 1; m * m <= comm_size; ++m) {
+        if (comm_size % m == 0) {
+            int n = comm_size / m;
+            
+            // Calculate surface area for this decomposition
+            // Surface area = 2 * (M * tile_height + N * tile_width)
+            // where tile_width = DOMAIN_WIDTH / M, tile_height = DOMAIN_HEIGHT / N
+            double surface_area = 2.0 * (m * DOMAIN_HEIGHT / n + n * DOMAIN_WIDTH / m);
+            
+            if (surface_area < best_surface_area) {
+                best_surface_area = surface_area;
+                best_m = m;
+                best_n = n;
+            }
+        }
+    }
+    
+    TILE_DIM_X = best_m;
+    TILE_DIM_Y = best_n;
 
-    if (comm_rank == 0 && print_stats) {
+    if (comm_rank == 0) {
         std::cout << "Generating Unstructured Mesh of 2D box...\n";
         std::cout << "Target Edge Length: " << TARGET_EDGE_LENGTH << "\n";
+        std::cout << "Domain Width: " << DOMAIN_WIDTH << ", Domain Height: " << DOMAIN_HEIGHT << "\n";
         std::cout << "Running on " << comm_size << " MPI ranks with decomposition " << TILE_DIM_X << "x" << TILE_DIM_Y << ".\n";
     }
 
@@ -1954,15 +1973,6 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
 // =========================================================
 #ifdef STANDALONE_MESH_GEN
 int main(int argc, char** argv) {
-
-    // Parse domain dimensions BEFORE PetscInitialize to prevent warnings
-    double domain_width = 1.0;
-    PetscBool set;
-    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_width", &domain_width, &set));
-    
-    double domain_height = 1.0;
-    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_height", &domain_height, &set));
-
     PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
 
     int comm_rank, comm_size;
@@ -1971,6 +1981,7 @@ int main(int argc, char** argv) {
 
     // Parse command line options
     double target_len = 0.0025;
+    PetscBool set;
     PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &target_len, &set));
 
     PetscBool write_mesh = PETSC_FALSE;
@@ -1986,9 +1997,15 @@ int main(int argc, char** argv) {
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, &set));
     int final_smooths = final_smooth_its;
 
-    // Tell PETSc that we've consumed these options to prevent warnings
-    PetscCall(PetscOptionsClearValue(NULL, "-domain_width"));
-    PetscCall(PetscOptionsClearValue(NULL, "-domain_height"));
+    double domain_width = 1.0;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_width", &domain_width, &set));
+    
+    double domain_height = 1.0;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_height", &domain_height, &set));
+
+    // Update global variables with parsed values
+    DOMAIN_WIDTH = domain_width;
+    DOMAIN_HEIGHT = domain_height;
 
     // Generate the DMPlex for this mesh
     DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, final_smooths, integrity_check, print_stats, domain_width, domain_height);
