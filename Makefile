@@ -126,7 +126,9 @@ tests: box_2D_gen_unstruc_mesh
 	./box_2D_gen_unstruc_mesh -target_edge_length 0.004 -integrity_check 0
 	./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -print_stats 0
 	./box_2D_gen_unstruc_mesh -target_edge_length 0.006 -integrity_check 0 -print_stats 0	
-	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh
+	./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
+	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0
+	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
 	$(MAKE) lib
 	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"

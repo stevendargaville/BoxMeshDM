@@ -27,7 +27,7 @@
 // =========================================================
 // 
 // Strategy:
-// 1. Boundary Gen: Create points explicitly on [0,DOMAIN_SIZE]^2 boundaries.
+// 1. Boundary Gen: Create points explicitly on [0,DOMAIN_WIDTH] x [0,DOMAIN_HEIGHT] boundaries.
 // 2. Interior Gen: Create random points inside small squares, REJECTING those near boundaries.
 // 3. Iterate: jitter -> triangulate -> smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
@@ -35,8 +35,9 @@
 
 static int TILE_DIM_X = -1;
 static int TILE_DIM_Y = -1;
-const double DOMAIN_SIZE = 1.0;
-static double TARGET_EDGE_LENGTH = 0.0025; 
+static double DOMAIN_WIDTH = 1.0;
+static double DOMAIN_HEIGHT = 1.0;
+static double TARGET_EDGE_LENGTH = 0.0025;
 
 static double TOL_LEN;
 static double TOL_LEN_SQ;
@@ -125,8 +126,8 @@ static void FiniOutput_Triangle(struct triangulateio *outputCtx)
 // Helper to determine which rank owns a point based on spatial location
 static int get_owner_rank(const Point& p, int size) {
 
-    double tile_s_x = DOMAIN_SIZE / TILE_DIM_X;
-    double tile_s_y = DOMAIN_SIZE / TILE_DIM_Y;
+    double tile_s_x = DOMAIN_WIDTH / TILE_DIM_X;
+    double tile_s_y = DOMAIN_HEIGHT / TILE_DIM_Y;
     int tx = std::floor(p.x / tile_s_x);
     int ty = std::floor(p.y / tile_s_y);
     
@@ -203,8 +204,8 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
                     if (nx >= 0 && nx < TILE_DIM_X && ny >= 0 && ny < TILE_DIM_Y) {
                         
                         // Only send if point could be in the neighbor halo
-                        double tile_s_x = DOMAIN_SIZE / TILE_DIM_X;
-                        double tile_s_y = DOMAIN_SIZE / TILE_DIM_Y;
+                        double tile_s_x = DOMAIN_WIDTH / TILE_DIM_X;
+                        double tile_s_y = DOMAIN_HEIGHT / TILE_DIM_Y;
                         double n_min_x = nx * tile_s_x; double n_max_x = (nx + 1) * tile_s_x;
                         double n_min_y = ny * tile_s_y; double n_max_y = (ny + 1) * tile_s_y;
                         
@@ -332,9 +333,9 @@ static bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
         p.x = 0.0; dx = 0.0; 
         on_boundary = true;
     }
-    // Right (x=1)
-    else if (std::abs(p.x - DOMAIN_SIZE) < EPSILON) {
-        p.x = DOMAIN_SIZE; dx = 0.0;
+    // Right (x=DOMAIN_WIDTH)
+    else if (std::abs(p.x - DOMAIN_WIDTH) < EPSILON) {
+        p.x = DOMAIN_WIDTH; dx = 0.0;
         on_boundary = true;
     }
 
@@ -343,9 +344,9 @@ static bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
         p.y = 0.0; dy = 0.0; 
         on_boundary = true;
     }
-    // Top (y=1)
-    else if (std::abs(p.y - DOMAIN_SIZE) < EPSILON) {
-        p.y = DOMAIN_SIZE; dy = 0.0;
+    // Top (y=DOMAIN_HEIGHT)
+    else if (std::abs(p.y - DOMAIN_HEIGHT) < EPSILON) {
+        p.y = DOMAIN_HEIGHT; dy = 0.0;
         on_boundary = true;
     }
 
@@ -356,18 +357,18 @@ static bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
 static void keep_interior_point_inside(Point& p) {
     // Reflect X
     if (p.x < 0.0) p.x = -p.x;
-    else if (p.x > DOMAIN_SIZE) p.x = DOMAIN_SIZE - (p.x - DOMAIN_SIZE);
+    else if (p.x > DOMAIN_WIDTH) p.x = DOMAIN_WIDTH - (p.x - DOMAIN_WIDTH);
     
     // Reflect Y
     if (p.y < 0.0) p.y = -p.y;
-    else if (p.y > DOMAIN_SIZE) p.y = DOMAIN_SIZE - (p.y - DOMAIN_SIZE);
+    else if (p.y > DOMAIN_HEIGHT) p.y = DOMAIN_HEIGHT - (p.y - DOMAIN_HEIGHT);
 
     // Enforce strict interiority (keep away from EPSILON capture zone)
     // This prevents an interior point from becoming a boundary point in the next iteration
     if (p.x <= EPSILON) p.x = EPSILON * 2.0;
-    if (p.x >= DOMAIN_SIZE - EPSILON) p.x = DOMAIN_SIZE - EPSILON * 2.0;
+    if (p.x >= DOMAIN_WIDTH - EPSILON) p.x = DOMAIN_WIDTH - EPSILON * 2.0;
     if (p.y <= EPSILON) p.y = EPSILON * 2.0;
-    if (p.y >= DOMAIN_SIZE - EPSILON) p.y = DOMAIN_SIZE - EPSILON * 2.0;
+    if (p.y >= DOMAIN_HEIGHT - EPSILON) p.y = DOMAIN_HEIGHT - EPSILON * 2.0;
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -423,9 +424,9 @@ static void apply_jitter(std::vector<Point>& points, double amount, int seed_off
         } else {
             // Clamp boundary points strictly to [0, DOMAIN] to handle float drift
             if (points[i].x < 0) points[i].x = 0;
-            if (points[i].x > DOMAIN_SIZE) points[i].x = DOMAIN_SIZE;
+            if (points[i].x > DOMAIN_WIDTH) points[i].x = DOMAIN_WIDTH;
             if (points[i].y < 0) points[i].y = 0;
-            if (points[i].y > DOMAIN_SIZE) points[i].y = DOMAIN_SIZE;
+            if (points[i].y > DOMAIN_HEIGHT) points[i].y = DOMAIN_HEIGHT;
         }
     }
 }
@@ -608,9 +609,9 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
                     keep_interior_point_inside(candidate);
                 } else {
                     if (candidate.x < 0) candidate.x = 0;
-                    if (candidate.x > DOMAIN_SIZE) candidate.x = DOMAIN_SIZE;
+                    if (candidate.x > DOMAIN_WIDTH) candidate.x = DOMAIN_WIDTH;
                     if (candidate.y < 0) candidate.y = 0;
-                    if (candidate.y > DOMAIN_SIZE) candidate.y = DOMAIN_SIZE;
+                    if (candidate.y > DOMAIN_HEIGHT) candidate.y = DOMAIN_HEIGHT;
                 }
 
                 // Inline max cosine calculation using CSR
@@ -722,9 +723,9 @@ static void relax_points_spring(std::vector<Point>& points, const std::vector<Tr
                 keep_interior_point_inside(candidate);
             } else {
                 if (candidate.x < 0) candidate.x = 0;
-                if (candidate.x > DOMAIN_SIZE) candidate.x = DOMAIN_SIZE;
+                if (candidate.x > DOMAIN_WIDTH) candidate.x = DOMAIN_WIDTH;
                 if (candidate.y < 0) candidate.y = 0;
-                if (candidate.y > DOMAIN_SIZE) candidate.y = DOMAIN_SIZE;
+                if (candidate.y > DOMAIN_HEIGHT) candidate.y = DOMAIN_HEIGHT;
             }
 
             points[i] = candidate;
@@ -822,8 +823,8 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);      
     
-    double tile_s_x = DOMAIN_SIZE / TILE_DIM_X;
-    double tile_s_y = DOMAIN_SIZE / TILE_DIM_Y;
+    double tile_s_x = DOMAIN_WIDTH / TILE_DIM_X;
+    double tile_s_y = DOMAIN_HEIGHT / TILE_DIM_Y;
     double t_min_x = tile_x * tile_s_x; double t_max_x = (tile_x + 1) * tile_s_x;
     double t_min_y = tile_y * tile_s_y; double t_max_y = (tile_y + 1) * tile_s_y;
     
@@ -866,21 +867,21 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
         search_min_y <= EPSILON && search_max_y >= -EPSILON) {
         points_with_halos.push_back(create_point_with_unique_hash_id(0.0, 0.0, 0, 0, 1));
     }
-    // (1,0)
-    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
-        search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, 0.0, max_idx, 0, 1));
-    }
-    // (0,1)
-    if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
-        search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        points_with_halos.push_back(create_point_with_unique_hash_id(0.0, DOMAIN_SIZE, 0, max_idx, 1));
-    }
-    // (1,1)
-    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON && 
-        search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
-        points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, DOMAIN_SIZE, max_idx, max_idx, 1));
-    }
+        // (1,0)
+        if (search_min_x <= DOMAIN_WIDTH + EPSILON && search_max_x >= DOMAIN_WIDTH - EPSILON && 
+            search_min_y <= EPSILON && search_max_y >= -EPSILON) {
+            points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_WIDTH, 0.0, max_idx, 0, 1));
+        }
+        // (0,1)
+        if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
+            search_min_y <= DOMAIN_HEIGHT + EPSILON && search_max_y >= DOMAIN_HEIGHT - EPSILON) {
+            points_with_halos.push_back(create_point_with_unique_hash_id(0.0, DOMAIN_HEIGHT, 0, max_idx, 1));
+        }
+        // (1,1)
+        if (search_min_x <= DOMAIN_WIDTH + EPSILON && search_max_x >= DOMAIN_WIDTH - EPSILON && 
+            search_min_y <= DOMAIN_HEIGHT + EPSILON && search_max_y >= DOMAIN_HEIGHT - EPSILON) {
+            points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_WIDTH, DOMAIN_HEIGHT, max_idx, max_idx, 1));
+        }
 
     // 2. EXPLICIT BOUNDARY GENERATION (Edges only)
     // Iterate 4 boundaries. Add points if they fall within search box.
@@ -892,19 +893,19 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
         int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double y = i * TARGET_EDGE_LENGTH;
-            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) {
+            if (y > EPSILON && y < DOMAIN_HEIGHT - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(0.0, y, 0, i, 1));
             }
         }
     }
-    // Right (x=1)
-    if (search_min_x <= DOMAIN_SIZE + EPSILON && search_max_x >= DOMAIN_SIZE - EPSILON) {
+    // Right (x=DOMAIN_WIDTH)
+    if (search_min_x <= DOMAIN_WIDTH + EPSILON && search_max_x >= DOMAIN_WIDTH - EPSILON) {
         int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
         int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double y = i * TARGET_EDGE_LENGTH;
-            if (y > EPSILON && y < DOMAIN_SIZE - EPSILON) {
-                points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_SIZE, y, max_idx, i, 1));
+            if (y > EPSILON && y < DOMAIN_HEIGHT - EPSILON) {
+                points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_WIDTH, y, max_idx, i, 1));
             }
         }
     }
@@ -914,19 +915,19 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
         int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double x = i * TARGET_EDGE_LENGTH;
-            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) {
+            if (x > EPSILON && x < DOMAIN_WIDTH - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(x, 0.0, i, 0, 1));
             }
         }
     }
-    // Top (y=1)
-    if (search_min_y <= DOMAIN_SIZE + EPSILON && search_max_y >= DOMAIN_SIZE - EPSILON) {
+    // Top (y=DOMAIN_HEIGHT)
+    if (search_min_y <= DOMAIN_HEIGHT + EPSILON && search_max_y >= DOMAIN_HEIGHT - EPSILON) {
         int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
         int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
         for(int i=min_i; i<=max_i; ++i) {
             double x = i * TARGET_EDGE_LENGTH;
-            if (x > EPSILON && x < DOMAIN_SIZE - EPSILON) {
-                points_with_halos.push_back(create_point_with_unique_hash_id(x, DOMAIN_SIZE, i, max_idx, 1));
+            if (x > EPSILON && x < DOMAIN_WIDTH - EPSILON) {
+                points_with_halos.push_back(create_point_with_unique_hash_id(x, DOMAIN_HEIGHT, i, max_idx, 1));
             }
         }
     }
@@ -965,9 +966,9 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
             
             // Rejection Sampling for Exclusion Zone
             if (cx < exclusion) continue;
-            if (cx > DOMAIN_SIZE - exclusion) continue;
+            if (cx > DOMAIN_WIDTH - exclusion) continue;
             if (cy < exclusion) continue;
-            if (cy > DOMAIN_SIZE - exclusion) continue;
+            if (cy > DOMAIN_HEIGHT - exclusion) continue;
 
             Point p = create_point_with_unique_hash_id(cx, cy, ix, iy, 0);
 
@@ -1373,8 +1374,8 @@ static void LabelBoundaries(DM dm) {
             PetscInt val = 0;
             // Priority for corners: Bottom > Right > Top > Left
             if (std::abs(y) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(x - DOMAIN_SIZE) < EPSILON) val = 2; // Right
-            else if (std::abs(y - DOMAIN_SIZE) < EPSILON) val = 3; // Top
+            else if (std::abs(x - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
+            else if (std::abs(y - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
             else if (std::abs(x) < EPSILON) val = 4;         // Left
 
             if (val != 0) PetscCallVoid(DMLabelSetValue(label, v, val));
@@ -1415,8 +1416,8 @@ static void LabelBoundaries(DM dm) {
             
             PetscInt val = 0;
             if (std::abs(cy) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(cx - DOMAIN_SIZE) < EPSILON) val = 2; // Right
-            else if (std::abs(cy - DOMAIN_SIZE) < EPSILON) val = 3; // Top
+            else if (std::abs(cx - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
             else if (std::abs(cx) < EPSILON) val = 4;         // Left
 
             if (val != 0) {
@@ -1460,8 +1461,8 @@ static void LabelBoundaries(DM dm) {
             
             PetscInt val = 0;
             if (std::abs(cy) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(cx - DOMAIN_SIZE) < EPSILON) val = 2; // Right
-            else if (std::abs(cy - DOMAIN_SIZE) < EPSILON) val = 3; // Top
+            else if (std::abs(cx - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
             else if (std::abs(cx) < EPSILON) val = 4;         // Left
 
             if (val != 0) {
@@ -1529,7 +1530,11 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         }
     }
 
-    // 2. Accumulate Local Stats
+    // 2. Calculate expected values based on domain dimensions
+    double expected_area = DOMAIN_WIDTH * DOMAIN_HEIGHT;
+    double expected_perimeter = 2.0 * (DOMAIN_WIDTH + DOMAIN_HEIGHT);
+
+    // 3. Accumulate Local Stats
     double local_total_area = 0.0;
     double local_boundary_len = 0.0;
     long local_boundary_edge_count = 0;
@@ -1582,9 +1587,9 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
             
             bool is_bdy = false;
             if (std::abs(ep1.x) < EPSILON && std::abs(ep2.x) < EPSILON) is_bdy = true; 
-            else if (std::abs(ep1.x - DOMAIN_SIZE) < EPSILON && std::abs(ep2.x - DOMAIN_SIZE) < EPSILON) is_bdy = true; 
+            else if (std::abs(ep1.x - DOMAIN_WIDTH) < EPSILON && std::abs(ep2.x - DOMAIN_WIDTH) < EPSILON) is_bdy = true; 
             else if (std::abs(ep1.y) < EPSILON && std::abs(ep2.y) < EPSILON) is_bdy = true; 
-            else if (std::abs(ep1.y - DOMAIN_SIZE) < EPSILON && std::abs(ep2.y - DOMAIN_SIZE) < EPSILON) is_bdy = true; 
+            else if (std::abs(ep1.y - DOMAIN_HEIGHT) < EPSILON && std::abs(ep2.y - DOMAIN_HEIGHT) < EPSILON) is_bdy = true; 
             
             if (is_bdy) {
                 double len = std::sqrt(std::pow(ep1.x-ep2.x, 2) + std::pow(ep1.y-ep2.y, 2));
@@ -1618,8 +1623,8 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         long long F_total = num_tris_owned_global;
         long long euler = V_total - E_total + F_total;
 
-        bool area_pass = std::abs(global_total_area - 1.0) < 1e-6;
-        bool perim_pass = std::abs(global_boundary_len - 4.0) < 1e-4;
+        bool area_pass = std::abs(global_total_area - expected_area) < 1e-6;
+        bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 1e-4;
         bool euler_pass = (euler == 1);
         bool edge_pass = (global_bad_edge_count == 0);
 
@@ -1833,13 +1838,15 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
 
 // ~~~~~~~~~~~~~~~~~
 
-PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
+PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
 
     // 1. Setup Globals
     TARGET_EDGE_LENGTH = target_edge_length;
+    DOMAIN_WIDTH = domain_width;
+    DOMAIN_HEIGHT = domain_height;
 
     // Ensure edge length is not too small for 31-bit indexing
     // Max index is ~2 billion. 1.0 / 2e9 = 5e-10
@@ -1858,20 +1865,50 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     TOL_LEN_SQ = TOL_LEN * TOL_LEN;
     TOL_VOLUME = TOL_LEN_SQ * 1e-2;
 
-    // Factorize comm_size into M x N such that M*N = comm_size and M, N are as close as possible
-    // This minimizes the perimeter (halo) for a given area.
-    int m = std::round(std::sqrt(comm_size));
-    while (comm_size % m != 0) {
-        m--;
-    }
-    int n = comm_size / m;
+    // Factorize comm_size into M x N such that M*N = comm_size
+    // (Tries to match the domain aspect ratio as closely as possible
+    // by finding the minimum total halo surface area possible)
     
-    TILE_DIM_X = m;
-    TILE_DIM_Y = n;
+    int best_m = 1;
+    int best_n = comm_size;
+    double best_surface_area = 1e30;
+    
+    // Find all factor pairs of comm_size
+    for (int m = 1; m * m <= comm_size; ++m) {
+        if (comm_size % m == 0) {
+            int n = comm_size / m;
+            
+            // Calculate the total internal interface length for this decomposition.
+            // In 2D this is the communication cut length, not a surface area.
+            // There are (M - 1) vertical cuts of height DOMAIN_HEIGHT and
+            // (N - 1) horizontal cuts of width DOMAIN_WIDTH.
+            double surface_area = (m - 1) * DOMAIN_HEIGHT + (n - 1) * DOMAIN_WIDTH;
+            
+            if (surface_area < best_surface_area) {
+                best_surface_area = surface_area;
+                best_m = m;
+                best_n = n;
+            }
+            
+            // Also try the swapped decomposition (n x m) to ensure symmetry
+            // This handles cases where the domain is rotated (width vs height swapped)
+            double swapped_surface_area = (n - 1) * DOMAIN_HEIGHT + (m - 1) * DOMAIN_WIDTH;
+            
+            if (swapped_surface_area < best_surface_area) {
+                best_surface_area = swapped_surface_area;
+                best_m = n;
+                best_n = m;
+            }
+        }
+    }
+    
+    TILE_DIM_X = best_m;
+    TILE_DIM_Y = best_n;
 
     if (comm_rank == 0 && print_stats) {
         std::cout << "Generating Unstructured Mesh of 2D box...\n";
         std::cout << "Target Edge Length: " << TARGET_EDGE_LENGTH << "\n";
+        std::cout << "Domain Width: " << DOMAIN_WIDTH << ", Domain Height: " << DOMAIN_HEIGHT << "\n";
         std::cout << "Running on " << comm_size << " MPI ranks with decomposition " << TILE_DIM_X << "x" << TILE_DIM_Y << ".\n";
     }
 
@@ -1946,7 +1983,6 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
 // =========================================================
 #ifdef STANDALONE_MESH_GEN
 int main(int argc, char** argv) {
-
     PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
 
     int comm_rank, comm_size;
@@ -1971,8 +2007,18 @@ int main(int argc, char** argv) {
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, &set));
     int final_smooths = final_smooth_its;
 
+    double domain_width = 1.0;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_width", &domain_width, &set));
+    
+    double domain_height = 1.0;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_height", &domain_height, &set));
+
+    // Update global variables with parsed values
+    DOMAIN_WIDTH = domain_width;
+    DOMAIN_HEIGHT = domain_height;
+
     // Generate the DMPlex for this mesh
-    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, final_smooths, integrity_check, print_stats); 
+    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, domain_width, domain_height, final_smooths, integrity_check, print_stats);
 
     // Check a valid mesh has been generated
     if (dm) {
