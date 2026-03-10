@@ -5,8 +5,6 @@ FROM ${BASE_IMAGE}
 ARG BRANCH=main
 # Use the optimised petsc build by default
 ARG ARCH=arch-linux-c-opt
-# Don't use malloc dump by default
-ARG MALLOC_DUMP=false
 
 LABEL maintainer="Steven Dargaville"
 LABEL description="box_2D_gen_unstruc_mesh"

@@ -1,0 +1,53 @@
+ARG BASE_IMAGE=stevendargaville/petsc
+
+FROM ${BASE_IMAGE}
+# Checkout the main branch by default
+ARG BRANCH=main
+# Use the optimised petsc build by default
+ARG ARCH=arch-linux-c-opt
+
+LABEL maintainer="Steven Dargaville"
+LABEL description="box_2D_gen_unstruc_mesh_pflare"
+
+ENV CHECKOUT_BRANCH=$BRANCH
+ENV PETSC_ARCH=$ARCH
+# -on_error_abort ensures any test failures are caught and the build fails
+# fp trap turns on floating point exception trapping in petsc
+ENV PETSC_OPTIONS="-on_error_abort -fp_trap on"
+
+WORKDIR /build
+
+# Ensure pipelines fail if any stage fails
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV BOX_PREFIX=/build/box_2D_gen_unstruc_mesh
+
+# Copy the source code and build it
+COPY . /build/box_2D_gen_unstruc_mesh
+
+# Build the library version only
+RUN set -e; \
+    cd box_2D_gen_unstruc_mesh && \
+    make clean && make lib
+
+ENV CFLAGS="${CFLAGS} -I${BOX_PREFIX}" \
+    LDFLAGS="-Wl,-rpath,${BOX_PREFIX} ${LDFLAGS}" \
+    LDLIBS="${LDLIBS} -L${BOX_PREFIX} -lbox_2D_gen_unstruc_mesh" \
+    LD_LIBRARY_PATH="${BOX_PREFIX}:${LD_LIBRARY_PATH}"
+
+# Use the branch supg_box_mesh in PFLARE which modifies the supg and DG
+# tests to use the box_2D_gen_unstruc_mesh library to generate a mesh
+# Verify the solution is 1 everywhere in serial and parallel
+RUN set -e; \
+    cd /build && \
+    git clone https://github.com/PFLAREProject/PFLARE.git && \
+    cd PFLARE && \
+    git fetch origin supg_box_mesh && \
+    git merge --no-edit origin/supg_box_mesh && \
+    make clean && make -j2 build_tests && cd tests && \
+    ./adv_dg_upwind -target_edge_length 0.01 -pc_type air -verify_solution && \
+    ./adv_dg_upwind -target_edge_length 0.01 -domain_height 2.0 -pc_type air -verify_solution && \
+    mpiexec -n 2 ./adv_dg_upwind -target_edge_length 0.01 -pc_type air -verify_solution && \
+    mpiexec -n 2 ./adv_dg_upwind -target_edge_length 0.01 -domain_height 2.0 -pc_type air -verify_solution
+
+WORKDIR /build/box_2D_gen_unstruc_mesh
