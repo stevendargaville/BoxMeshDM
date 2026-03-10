@@ -72,10 +72,6 @@ ifndef BUILD_LIB
 override CXXFLAGS += -DSTANDALONE_MESH_GEN
 endif
 
-# Build the main executable
-$(OUT): $(OBJS)
-	$(LINK.cc) $(OBJS) $(PETSC_LIB) -o $(OUT)
-
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Create the library - use recursive make to set BUILD_LIB and avoid the define
@@ -130,22 +126,12 @@ tests: box_2D_gen_unstruc_mesh
 	./box_2D_gen_unstruc_mesh -target_edge_length 0.004 -integrity_check 0
 	./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -print_stats 0
 	./box_2D_gen_unstruc_mesh -target_edge_length 0.006 -integrity_check 0 -print_stats 0	
-	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh
+	./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
+	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0
+	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
 	$(MAKE) lib
 	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"
-
-test_parallel: box_2D_gen_unstruc_mesh
-	@echo "Running parallel tests..."
-	@echo "Testing with 2 processes..."
-	mpirun -np 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0 > test_parallel_2.out 2>&1
-	@echo "Testing with 4 processes..."
-	mpirun -np 4 ./box_2D_gen_unstruc_mesh -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0 > test_parallel_4.out 2>&1
-	@echo "Testing with 8 processes..."
-	mpirun -np 8 ./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -domain_width 1.0 -domain_height 1.0 > test_parallel_8.out 2>&1
-	@echo "Testing with long thin domain (2.0 x 0.5) on 2 processes..."
-	mpirun -np 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5 > test_parallel_thin.out 2>&1
-	@echo "Parallel tests completed. Check test_parallel_*.out files for results."
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -46,7 +46,9 @@ which will generate a mesh with the default parameters. To decrease the edge len
 
      mpiexec -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.001
 
-To visualise the mesh, ensure PETSc has been configured with HDF5 (``--download-hdf5``), run the code with ``-write_mesh true``, then on the command line run ``${PETSC_DIR}/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5``. The resulting ``.xmf`` file can be visualised in Paraview with the XDMF reader.
+If you wish to write out the meshes generated this way, ensure PETSc has been configured with HDF5 (``--download-hdf5``) and run the code with ``-write_mesh true``. The resulting ``.h5`` file can be read into a PETSc DMPlex with ``-dm_plex_filename box_mesh.h5``.
+
+To visualise the mesh, from the command line run ``${PETSC_DIR}/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5``. The resulting ``.xmf`` file can be visualised in Paraview with the XDMF reader.
 
 ### Building the code as a library
 
@@ -72,11 +74,15 @@ In your code, to generate a PETSc DM that can then be used as normal, you can ca
      // Print global mesh statistics from MPI rank 0
      PetscBool print_stats = PETSC_TRUE;
 
-     // Generate the mesh stored in a parallel PETSc DM on the MPI_Comm PETSC_COMM_WORLD
-     dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, final_smooth_its, integrity_check, print_stats);
+     // Generate the unit-box mesh stored in a parallel PETSc DM on the MPI_Comm PETSC_COMM_WORLD
+     dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, 1.0, 1.0, final_smooth_its, integrity_check, print_stats);
+     ierr = DMDestroy(&dm);
+
+     // Or specify a rectangular domain explicitly
+     dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, 2.0, 1.5, final_smooth_its, integrity_check, print_stats);
 
      // Enable the use of command line options for this DM
-     ierr = DMSetFromOptions(*dm);
+     ierr = DMSetFromOptions(dm);
 
 ### Weak scaling   
 

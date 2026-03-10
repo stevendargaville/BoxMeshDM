@@ -1623,8 +1623,8 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         long long F_total = num_tris_owned_global;
         long long euler = V_total - E_total + F_total;
 
-    bool area_pass = std::abs(global_total_area - expected_area) < 1e-6;
-    bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 1e-4;
+        bool area_pass = std::abs(global_total_area - expected_area) < 1e-6;
+        bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 1e-4;
         bool euler_pass = (euler == 1);
         bool edge_pass = (global_bad_edge_count == 0);
 
@@ -1838,8 +1838,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
 
 // ~~~~~~~~~~~~~~~~~
 
-
-PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats, double domain_width, double domain_height) {
+PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
@@ -1879,10 +1878,11 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
         if (comm_size % m == 0) {
             int n = comm_size / m;
             
-            // Calculate surface area for this decomposition
-            // Surface area = 2 * (M * tile_height + N * tile_width)
-            // where tile_width = DOMAIN_WIDTH / M, tile_height = DOMAIN_HEIGHT / N
-            double surface_area = 2.0 * (m * DOMAIN_HEIGHT / n + n * DOMAIN_WIDTH / m);
+            // Calculate the total internal interface length for this decomposition.
+            // In 2D this is the communication cut length, not a surface area.
+            // There are (M - 1) vertical cuts of height DOMAIN_HEIGHT and
+            // (N - 1) horizontal cuts of width DOMAIN_WIDTH.
+            double surface_area = (m - 1) * DOMAIN_HEIGHT + (n - 1) * DOMAIN_WIDTH;
             
             if (surface_area < best_surface_area) {
                 best_surface_area = surface_area;
@@ -1892,7 +1892,7 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
             
             // Also try the swapped decomposition (n x m) to ensure symmetry
             // This handles cases where the domain is rotated (width vs height swapped)
-            double swapped_surface_area = 2.0 * (n * DOMAIN_HEIGHT / m + m * DOMAIN_WIDTH / n);
+            double swapped_surface_area = (n - 1) * DOMAIN_HEIGHT + (m - 1) * DOMAIN_WIDTH;
             
             if (swapped_surface_area < best_surface_area) {
                 best_surface_area = swapped_surface_area;
@@ -1905,7 +1905,7 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, int 
     TILE_DIM_X = best_m;
     TILE_DIM_Y = best_n;
 
-    if (comm_rank == 0) {
+    if (comm_rank == 0 && print_stats) {
         std::cout << "Generating Unstructured Mesh of 2D box...\n";
         std::cout << "Target Edge Length: " << TARGET_EDGE_LENGTH << "\n";
         std::cout << "Domain Width: " << DOMAIN_WIDTH << ", Domain Height: " << DOMAIN_HEIGHT << "\n";
@@ -2018,7 +2018,7 @@ int main(int argc, char** argv) {
     DOMAIN_HEIGHT = domain_height;
 
     // Generate the DMPlex for this mesh
-    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, final_smooths, integrity_check, print_stats, domain_width, domain_height);
+    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, domain_width, domain_height, final_smooths, integrity_check, print_stats);
 
     // Check a valid mesh has been generated
     if (dm) {

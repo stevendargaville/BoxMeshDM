@@ -21,8 +21,8 @@ int main(int argc, char** argv) {
     // Generate square mesh
     double square_width = 1.0;
     double square_height = 1.0;
-    
-    dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, final_smooth_its, integrity_check, print_stats, square_width, square_height);
+
+    dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, square_width, square_height, final_smooth_its, integrity_check, print_stats);
 
     if (dm) {
         PetscPrintf(PETSC_COMM_WORLD, "Square mesh generation successful!\n");
@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
     double rect_width = 2.0;
     double rect_height = 1.5;
     
-    dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, final_smooth_its, integrity_check, print_stats, rect_width, rect_height);
+    dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, target_edge_length, rect_width, rect_height, final_smooth_its, integrity_check, print_stats);
 
     if (dm) {
         PetscPrintf(PETSC_COMM_WORLD, "Rectangular mesh generation successful!\n");
