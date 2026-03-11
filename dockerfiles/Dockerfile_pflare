@@ -42,6 +42,8 @@ RUN set -e; \
     cd /build && \
     git clone https://github.com/PFLAREProject/PFLARE.git && \
     cd PFLARE && \
+    git config user.email "ci@example.com" && \
+    git config user.name "CI" && \
     git fetch origin supg_box_mesh && \
     git merge --no-edit origin/supg_box_mesh && \
     make clean && make -j2 build_tests && cd tests && \
