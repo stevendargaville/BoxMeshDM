@@ -480,9 +480,9 @@ static double clamp_val(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v)
 
 // Helper: Calculate max cosine of a triangle given coordinates of the three vertices.
 // p=(px,py) is the "moving" vertex; (ax,ay) and (bx,by) are the fixed opposite vertices.
-// Returns 1.0 for degenerate triangles (worst case, angle 0).
-// This coordinate-based form (vs. Point-based) allows the inner candidate loop to be
-// auto-vectorized: ab_sq/ab are loop-invariant and hoisted, only pa/pb vary per candidate.
+// ab_sq and ab (the side opposite p) are precomputed by the caller and already validated
+// to be non-degenerate (ab >= TOL_LEN).
+// Returns 1.0 for degenerate pa or pb.
 static inline double get_max_cosine_tri_xy(double px, double py,
                                             double ax, double ay,
                                             double bx, double by,
@@ -495,6 +495,29 @@ static inline double get_max_cosine_tri_xy(double px, double py,
     double cos_p = (pa_sq + pb_sq - ab_sq) / (2.0 * pa * pb);
     double cos_a = (pa_sq + ab_sq - pb_sq) / (2.0 * pa * ab);
     double cos_b = (pb_sq + ab_sq - pa_sq) / (2.0 * pb * ab);
+    return std::max(std::max(cos_p, cos_a), cos_b);
+}
+
+// Branchless variant for the vectorized inner candidate loop.
+// Called only after ab is validated non-degenerate and with candidates that cannot
+// collapse onto triangle vertices (movement is toward centroid, not toward edges).
+// std::max-clamped denominators avoid division by zero without any branch, keeping
+// the entire function as straight-line code so the compiler emits a SIMD loop body.
+[[gnu::always_inline]] static inline
+double get_max_cosine_tri_xy_inner(double px, double py,
+                                    double ax, double ay,
+                                    double bx, double by,
+                                    double ab_sq, double ab) {
+    double pa_sq = (px-ax)*(px-ax) + (py-ay)*(py-ay);
+    double pb_sq = (px-bx)*(px-bx) + (py-by)*(py-by);
+    double pa = std::sqrt(pa_sq);
+    double pb = std::sqrt(pb_sq);
+    double denom_p = std::max(2.0 * pa * pb, TOL_LEN);
+    double denom_a = std::max(2.0 * pa * ab, TOL_LEN);
+    double denom_b = std::max(2.0 * pb * ab, TOL_LEN);
+    double cos_p = (pa_sq + pb_sq - ab_sq) / denom_p;
+    double cos_a = (pa_sq + ab_sq - pb_sq) / denom_a;
+    double cos_b = (pb_sq + ab_sq - pa_sq) / denom_b;
     return std::max(std::max(cos_p, cos_a), cos_b);
 }
 
@@ -643,10 +666,11 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
                 double mc_curr = get_max_cosine_tri_xy(points[i].x, points[i].y, ax, ay, bx, by, ab_sq, ab);
                 if (mc_curr > current_max_cos) current_max_cos = mc_curr;
 
-                // Vectorizable inner loop: all 9 candidates share the same (ax,ay,bx,by,ab,ab_sq)
+                // Vectorizable inner loop: all 9 candidates share the same (ax,ay,bx,by,ab,ab_sq).
+                // Uses the branchless variant so the compiler can emit SIMD (vsqrtpd/vmaxpd).
                 #pragma GCC ivdep
                 for (int k = 0; k < NUM_CANDS; ++k) {
-                    double mc = get_max_cosine_tri_xy(cand_x[k], cand_y[k], ax, ay, bx, by, ab_sq, ab);
+                    double mc = get_max_cosine_tri_xy_inner(cand_x[k], cand_y[k], ax, ay, bx, by, ab_sq, ab);
                     cand_max_cos[k] = std::max(cand_max_cos[k], mc);
                 }
             }
