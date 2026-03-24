@@ -478,25 +478,47 @@ static std::vector<Triangle> triangulation(const std::vector<Point>& points) {
 // Helper: Calculate minimum angle (degrees) of a triangle
 static double clamp_val(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
 
-// Helper: Calculate max cosine of a triangle (proxy for min angle)
-// Returns 1.0 for degenerate triangles (worst case, angle 0)
-static double get_max_cosine_tri(const Point& a, const Point& b, const Point& c) {
-    double ab_sq = (a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y);
-    double bc_sq = (b.x-c.x)*(b.x-c.x) + (b.y-c.y)*(b.y-c.y);
-    double ca_sq = (c.x-a.x)*(c.x-a.x) + (c.y-a.y)*(c.y-a.y);
-    
-    double ab = std::sqrt(ab_sq);
-    double bc = std::sqrt(bc_sq);
-    double ca = std::sqrt(ca_sq);
+// Helper: Calculate max cosine of a triangle given coordinates of the three vertices.
+// p=(px,py) is the "moving" vertex; (ax,ay) and (bx,by) are the fixed opposite vertices.
+// ab_sq and ab (the side opposite p) are precomputed by the caller and already validated
+// to be non-degenerate (ab >= TOL_LEN).
+// Returns 1.0 for degenerate pa or pb.
+static inline double get_max_cosine_tri_xy(double px, double py,
+                                            double ax, double ay,
+                                            double bx, double by,
+                                            double ab_sq, double ab) {
+    double pa_sq = (px-ax)*(px-ax) + (py-ay)*(py-ay);
+    double pb_sq = (px-bx)*(px-bx) + (py-by)*(py-by);
+    double pa = std::sqrt(pa_sq);
+    double pb = std::sqrt(pb_sq);
+    if (pa < TOL_LEN || pb < TOL_LEN) return 1.0; // Degenerate
+    double cos_p = (pa_sq + pb_sq - ab_sq) / (2.0 * pa * pb);
+    double cos_a = (pa_sq + ab_sq - pb_sq) / (2.0 * pa * ab);
+    double cos_b = (pb_sq + ab_sq - pa_sq) / (2.0 * pb * ab);
+    return std::max(std::max(cos_p, cos_a), cos_b);
+}
 
-    if (ab < TOL_LEN || bc < TOL_LEN || ca < TOL_LEN) return 1.0; // Degenerate
-
-    // Law of Cosines: cos A = (b^2 + c^2 - a^2) / 2bc
-    double cos_a = (ab_sq + ca_sq - bc_sq) / (2.0 * ab * ca);
-    double cos_b = (ab_sq + bc_sq - ca_sq) / (2.0 * ab * bc);
-    double cos_c = (ca_sq + bc_sq - ab_sq) / (2.0 * ca * bc);
-
-    return std::max({cos_a, cos_b, cos_c});
+// Branchless variant for the vectorized inner candidate loop.
+// Called only after ab is validated non-degenerate and with candidates that cannot
+// collapse onto triangle vertices (movement is toward centroid, not toward edges).
+// std::max-clamped denominators avoid division by zero without any branch, keeping
+// the entire function as straight-line code so the compiler emits a SIMD loop body.
+[[gnu::always_inline]] static inline
+double get_max_cosine_tri_xy_inner(double px, double py,
+                                    double ax, double ay,
+                                    double bx, double by,
+                                    double ab_sq, double ab) {
+    double pa_sq = (px-ax)*(px-ax) + (py-ay)*(py-ay);
+    double pb_sq = (px-bx)*(px-bx) + (py-by)*(py-by);
+    double pa = std::sqrt(pa_sq);
+    double pb = std::sqrt(pb_sq);
+    double denom_p = std::max(2.0 * pa * pb, TOL_LEN);
+    double denom_a = std::max(2.0 * pa * ab, TOL_LEN);
+    double denom_b = std::max(2.0 * pb * ab, TOL_LEN);
+    double cos_p = (pa_sq + pb_sq - ab_sq) / denom_p;
+    double cos_a = (pa_sq + ab_sq - pb_sq) / denom_a;
+    double cos_b = (pb_sq + ab_sq - pa_sq) / denom_b;
+    return std::max(std::max(cos_p, cos_a), cos_b);
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -553,86 +575,118 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
     tri_count.clear();
     std::vector<int>().swap(tri_count);
 
-    // Define candidate relaxation factors to test per point
-    std::vector<double> candidate_factors = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9};
+    // Candidate relaxation factors — constexpr so the compiler knows the loop count
+    static constexpr int NUM_CANDS = 9;
+    static constexpr double candidate_factors[NUM_CANDS] = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9};
 
     for (int i=0; i<n; ++i) {
         if (w_sum[i] < TOL_VOLUME) continue;
-        
+
         // Update if in valid safe zone (ignoring deep ghost layers)
         if (points[i].x > min_safe_x && points[i].x < max_safe_x && points[i].y > min_safe_y && points[i].y < max_safe_y) {
-            
+
             // Target is the volume-weighted average of surrounding triangle centroids
-            double tx = wx[i] / w_sum[i]; 
+            double tx = wx[i] / w_sum[i];
             double ty = wy[i] / w_sum[i];
-            
-            // Calculate the full vector to the centroid
+
+            // Full movement vector toward centroid
             double full_dx = tx - points[i].x;
             double full_dy = ty - points[i].y;
+
+            // Determine boundary mask for this point — identical for all 9 candidates.
+            // Replicate apply_boundary_constraint: if on x/y boundary, zero that displacement
+            // component and snap the base coordinate.
+            double base_px = points[i].x, base_py = points[i].y;
+            double move_dx = full_dx, move_dy = full_dy;
+            bool was_boundary = false;
+            if (std::abs(base_px) < EPSILON)              { base_px = 0.0;          move_dx = 0.0; was_boundary = true; }
+            else if (std::abs(base_px - DOMAIN_WIDTH) < EPSILON) { base_px = DOMAIN_WIDTH; move_dx = 0.0; was_boundary = true; }
+            if (std::abs(base_py) < EPSILON)              { base_py = 0.0;           move_dy = 0.0; was_boundary = true; }
+            else if (std::abs(base_py - DOMAIN_HEIGHT) < EPSILON) { base_py = DOMAIN_HEIGHT; move_dy = 0.0; was_boundary = true; }
+
+            // Precompute all 9 candidate (x,y) positions with constraints applied.
+            // Since the boundary mask is the same for all factors, each candidate is just
+            // base + factor * move, clamped to the domain.
+            double cand_x[NUM_CANDS], cand_y[NUM_CANDS];
+            for (int k = 0; k < NUM_CANDS; ++k) {
+                double cx = base_px + candidate_factors[k] * move_dx;
+                double cy = base_py + candidate_factors[k] * move_dy;
+                if (!was_boundary) {
+                    // Reflect back into domain, then enforce strict interiority
+                    if (cx < 0.0) cx = -cx;
+                    else if (cx > DOMAIN_WIDTH) cx = DOMAIN_WIDTH - (cx - DOMAIN_WIDTH);
+                    if (cy < 0.0) cy = -cy;
+                    else if (cy > DOMAIN_HEIGHT) cy = DOMAIN_HEIGHT - (cy - DOMAIN_HEIGHT);
+                    if (cx <= EPSILON) cx = EPSILON * 2.0;
+                    if (cx >= DOMAIN_WIDTH - EPSILON) cx = DOMAIN_WIDTH - EPSILON * 2.0;
+                    if (cy <= EPSILON) cy = EPSILON * 2.0;
+                    if (cy >= DOMAIN_HEIGHT - EPSILON) cy = DOMAIN_HEIGHT - EPSILON * 2.0;
+                } else {
+                    if (cx < 0.0) cx = 0.0;
+                    if (cx > DOMAIN_WIDTH) cx = DOMAIN_WIDTH;
+                    if (cy < 0.0) cy = 0.0;
+                    if (cy > DOMAIN_HEIGHT) cy = DOMAIN_HEIGHT;
+                }
+                cand_x[k] = cx;
+                cand_y[k] = cy;
+            }
 
             // Use CSR data for triangle lookup
             int start = tri_offset[i];
             int end = tri_offset[i + 1];
-            
-            // Minimize the maximum cosine is the same as maximizing the minimum angle, but without
-            // needing an acos which is expensive            
+
+            // Evaluate current and all candidate max cosines in one pass over adjacent triangles.
+            // Loop order: triangles (outer) → candidates (inner fixed-size).
+            // The inner loop over NUM_CANDS is auto-vectorizable: no cross-k dependencies,
+            // fixed size known at compile time, ab/ab_sq are loop-invariant per triangle.
             double current_max_cos = -2.0;
+            double cand_max_cos[NUM_CANDS];
+            for (int k = 0; k < NUM_CANDS; ++k) cand_max_cos[k] = -2.0;
+
             for (int j = start; j < end; ++j) {
                 int t_idx = tri_data[j];
                 const auto& tri = triangles[t_idx];
-                Point p1, p2;
-                if (tri.v0 == i) { p1 = points[tri.v1]; p2 = points[tri.v2]; }
-                else if (tri.v1 == i) { p1 = points[tri.v0]; p2 = points[tri.v2]; }
-                else { p1 = points[tri.v0]; p2 = points[tri.v1]; }
-                double mc = get_max_cosine_tri(points[i], p1, p2);
-                if (mc > current_max_cos) current_max_cos = mc;
-            }
-            
-            Point best_candidate = points[i];
-            double best_max_cos = current_max_cos;
+                // Extract the two vertices opposite to point i
+                double ax, ay, bx, by;
+                if      (tri.v0 == i) { ax = points[tri.v1].x; ay = points[tri.v1].y; bx = points[tri.v2].x; by = points[tri.v2].y; }
+                else if (tri.v1 == i) { ax = points[tri.v0].x; ay = points[tri.v0].y; bx = points[tri.v2].x; by = points[tri.v2].y; }
+                else                  { ax = points[tri.v0].x; ay = points[tri.v0].y; bx = points[tri.v1].x; by = points[tri.v1].y; }
 
-            // Test each relaxation factor
-            for (double factor : candidate_factors) {
-                double dx = full_dx * factor;
-                double dy = full_dy * factor;
-
-                // Boundary Projection
-                // We need to be careful not to modify points[i] permanently yet.
-                // Let's create a temp point for the constraint check.                
-                Point temp_p = points[i];
-                bool was_boundary = apply_boundary_constraint(temp_p, dx, dy); 
-                Point candidate = temp_p;
-                candidate.x += dx;
-                candidate.y += dy;
-
-                if (!was_boundary) {
-                    keep_interior_point_inside(candidate);
-                } else {
-                    if (candidate.x < 0) candidate.x = 0;
-                    if (candidate.x > DOMAIN_WIDTH) candidate.x = DOMAIN_WIDTH;
-                    if (candidate.y < 0) candidate.y = 0;
-                    if (candidate.y > DOMAIN_HEIGHT) candidate.y = DOMAIN_HEIGHT;
+                // ab side is fixed for all candidates — precompute once per triangle
+                double ab_sq = (ax-bx)*(ax-bx) + (ay-by)*(ay-by);
+                double ab = std::sqrt(ab_sq);
+                if (ab < TOL_LEN) {
+                    // Degenerate triangle: flag all candidates as worst-case
+                    for (int k = 0; k < NUM_CANDS; ++k) cand_max_cos[k] = 1.0;
+                    current_max_cos = 1.0;
+                    continue;
                 }
 
-                // Inline max cosine calculation using CSR
-                double candidate_max_cos = -2.0;
-                for (int j = start; j < end; ++j) {
-                    int t_idx = tri_data[j];
-                    const auto& tri = triangles[t_idx];
-                    Point p1, p2;
-                    if (tri.v0 == i) { p1 = points[tri.v1]; p2 = points[tri.v2]; }
-                    else if (tri.v1 == i) { p1 = points[tri.v0]; p2 = points[tri.v2]; }
-                    else { p1 = points[tri.v0]; p2 = points[tri.v1]; }
-                    double mc = get_max_cosine_tri(candidate, p1, p2);
-                    if (mc > candidate_max_cos) candidate_max_cos = mc;
-                }
+                // Current position max cosine (scalar, outside vectorized loop)
+                double mc_curr = get_max_cosine_tri_xy(points[i].x, points[i].y, ax, ay, bx, by, ab_sq, ab);
+                if (mc_curr > current_max_cos) current_max_cos = mc_curr;
 
-                if (candidate_max_cos < best_max_cos) {
-                    best_max_cos = candidate_max_cos;
-                    best_candidate = candidate;
+                // Vectorizable inner loop: all 9 candidates share the same (ax,ay,bx,by,ab,ab_sq).
+                // Uses the branchless variant so the compiler can emit SIMD (vsqrtpd/vmaxpd).
+                #pragma GCC ivdep
+                for (int k = 0; k < NUM_CANDS; ++k) {
+                    double mc = get_max_cosine_tri_xy_inner(cand_x[k], cand_y[k], ax, ay, bx, by, ab_sq, ab);
+                    cand_max_cos[k] = std::max(cand_max_cos[k], mc);
                 }
             }
-            points[i] = best_candidate;
+
+            // Pick the best candidate (lowest max cosine = best min angle)
+            double best_x = points[i].x, best_y = points[i].y;
+            double best_cos = current_max_cos;
+            for (int k = 0; k < NUM_CANDS; ++k) {
+                if (cand_max_cos[k] < best_cos) {
+                    best_cos = cand_max_cos[k];
+                    best_x = cand_x[k];
+                    best_y = cand_y[k];
+                }
+            }
+            points[i].x = best_x;
+            points[i].y = best_y;
         }
     }
     tri_data.clear();
