@@ -1,6 +1,6 @@
-box_2D_gen_unstruc_mesh is distributed under LICENSE.txt:
+BoxMeshDM is distributed under LICENSE.txt:
 
-Copyright (c) 2025-2026 box_2D_gen_unstruc_mesh Developers
+Copyright (c) 2025-2026 BoxMeshDM Developers
 License: MIT, http://opensource.org/licenses/MIT
 
 Guidelines
@@ -24,7 +24,7 @@ Contributing
 
 Contributing code to this project assumes that
 
-- you implicitly transfer the copyright of your contribution to the box_2D_gen_unstruc_mesh
+- you implicitly transfer the copyright of your contribution to the BoxMeshDM
   Developers or that your contributions are not significant enough to claim
   copyright
 

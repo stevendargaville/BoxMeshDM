@@ -7,7 +7,7 @@ ARG BRANCH=main
 ARG ARCH=arch-linux-c-opt
 
 LABEL maintainer="Steven Dargaville"
-LABEL description="box_2D_gen_unstruc_mesh_64_bit"
+LABEL description="BoxMeshDM_64_bit"
 
 ENV CHECKOUT_BRANCH=$BRANCH
 ENV PETSC_ARCH=$ARCH
@@ -17,12 +17,12 @@ ENV PETSC_OPTIONS="-on_error_abort"
 WORKDIR /build
 
 # Copy the source code and build it
-COPY . /build/box_2D_gen_unstruc_mesh
+COPY . /build/BoxMeshDM
 
 RUN set -e; \
-    cd box_2D_gen_unstruc_mesh && \
+    cd BoxMeshDM && \
     make clean && make lib && \
     make clean && make && \
     make clean && make tests
 
-WORKDIR /build/box_2D_gen_unstruc_mesh
+WORKDIR /build/BoxMeshDM

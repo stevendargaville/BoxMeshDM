@@ -1,5 +1,5 @@
 #include <petscsys.h>
-#include "box_2D_gen_unstruc_mesh.h"
+#include "BoxMeshDM.h"
 
 int main(int argc, char** argv) {
     PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));

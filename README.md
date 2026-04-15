@@ -40,11 +40,11 @@ There are five input variables that can be changed from the command line:
  
  For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
 
-     mpiexec -n 2 ./box_2D_gen_unstruc_mesh
+     mpiexec -n 2 ./BoxMeshDM
 
 which will generate a mesh with the default parameters. To decrease the edge length for example, 
 
-     mpiexec -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.001
+     mpiexec -n 2 ./BoxMeshDM -target_edge_length 0.001
 
 If you wish to write out the meshes generated this way, ensure PETSc has been configured with HDF5 (``--download-hdf5``) and run the code with ``-write_mesh true``. The resulting ``.h5`` file can be read into a PETSc DMPlex with ``-dm_plex_filename box_mesh.h5``.
 
@@ -54,11 +54,11 @@ To visualise the mesh, from the command line run ``${PETSC_DIR}/lib/petsc/bin/pe
 
 For large scale use, the code can be compiled as a library. Hence instead of writing out the mesh, the routine ``GenerateBoxMeshDM`` can be called directly from existing code. This returns a parallel, load balanced PETSc DMPlex object that can be used without I/O. 
 
-Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make lib``. You then need to include the ``.h`` file in your code and link to the output library ``libbox_2D_gen_unstruc_mesh``. 
+Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make lib``. You then need to include the ``.h`` file in your code and link to the output library ``libboxmeshdm``. 
 
 In your code, to generate a PETSc DM that can then be used as normal, you can call in C/C++ (see ``test_lib.c``):
 
-     #include "box_2D_gen_unstruc_mesh.h"
+     #include "BoxMeshDM.h"
 
      // ...
      
