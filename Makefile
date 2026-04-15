@@ -1,6 +1,6 @@
 # ~~~~~~~~~~~~~~~~~
-# box_2D_gen_unstruc_mesh - Steven Dargaville
-# Makefile for box_2D_gen_unstruc_mesh
+# BoxMeshDM - Steven Dargaville
+# Makefile for BoxMeshDM
 #
 # Must have defined PETSC_DIR and PETSC_ARCH before calling
 # Copied from $PETSC_DIR/share/petsc/Makefile.basic.user
@@ -43,22 +43,22 @@ PETSC_LINK_LIBS_NORPATH := $(LDLIBS)
 endif
 
 # Output executable name
-OUT := box_2D_gen_unstruc_mesh
+OUT := BoxMeshDM
 
 # Output the library - either static or dynamic
 ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)
-LIB_OUT = libbox_2D_gen_unstruc_mesh.a
+LIB_OUT = libboxmeshdm.a
 else
 # mac osx name is different
 ifeq ($(shell uname -s 2>/dev/null),Darwin)
-LIB_OUT = libbox_2D_gen_unstruc_mesh.dylib
+LIB_OUT = libboxmeshdm.dylib
 else
-LIB_OUT = libbox_2D_gen_unstruc_mesh.so
+LIB_OUT = libboxmeshdm.so
 endif
 endif
 
-# All the files required by box_2D_gen_unstruc_mesh
-OBJS := box_2D_gen_unstruc_mesh.o
+# All the files required by BoxMeshDM
+OBJS := BoxMeshDM.o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Rules
@@ -103,10 +103,10 @@ else
 # Shared library
 ifeq ($(shell uname -s 2>/dev/null),Darwin)
 # macOS: Link with rpath to find the dylib in current directory
-	$(LINK.cc) -o test_lib test_lib.o -L. -lbox_2D_gen_unstruc_mesh $(PETSC_LIB) -Wl,-rpath,@loader_path
+	$(LINK.cc) -o test_lib test_lib.o -L. -lboxmeshdm $(PETSC_LIB) -Wl,-rpath,@loader_path
 else
 # Linux: Link with rpath to find the .so in current directory
-	$(LINK.cc) -o test_lib test_lib.o -L. -lbox_2D_gen_unstruc_mesh $(PETSC_LIB) -Wl,-rpath,'$$ORIGIN'
+	$(LINK.cc) -o test_lib test_lib.o -L. -lboxmeshdm $(PETSC_LIB) -Wl,-rpath,'$$ORIGIN'
 endif
 endif
 
@@ -118,17 +118,17 @@ tests_lib: test_lib
 # Tests - check executable exists and run it
 # and also builds the library and tests it can be linked
 # against and run
-tests: box_2D_gen_unstruc_mesh
+tests: BoxMeshDM
 	@echo "Running tests on executable..."
-	./box_2D_gen_unstruc_mesh
-	./box_2D_gen_unstruc_mesh -target_edge_length 0.002
-	./box_2D_gen_unstruc_mesh -target_edge_length 0.003 -final_smooth_its 5
-	./box_2D_gen_unstruc_mesh -target_edge_length 0.004 -integrity_check 0
-	./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -print_stats 0
-	./box_2D_gen_unstruc_mesh -target_edge_length 0.006 -integrity_check 0 -print_stats 0	
-	./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
-	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0
-	$(MPIEXEC) -n 2 ./box_2D_gen_unstruc_mesh -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
+	./BoxMeshDM
+	./BoxMeshDM -target_edge_length 0.002
+	./BoxMeshDM -target_edge_length 0.003 -final_smooth_its 5
+	./BoxMeshDM -target_edge_length 0.004 -integrity_check 0
+	./BoxMeshDM -target_edge_length 0.005 -print_stats 0
+	./BoxMeshDM -target_edge_length 0.006 -integrity_check 0 -print_stats 0	
+	./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
+	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0
+	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
 	$(MAKE) lib
 	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"

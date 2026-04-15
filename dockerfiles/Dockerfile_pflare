@@ -7,7 +7,7 @@ ARG BRANCH=main
 ARG ARCH=arch-linux-c-opt
 
 LABEL maintainer="Steven Dargaville"
-LABEL description="box_2D_gen_unstruc_mesh_pflare"
+LABEL description="BoxMeshDM_pflare"
 
 ENV CHECKOUT_BRANCH=$BRANCH
 ENV PETSC_ARCH=$ARCH
@@ -20,23 +20,23 @@ WORKDIR /build
 # Ensure pipelines fail if any stage fails
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ENV BOX_PREFIX=/build/box_2D_gen_unstruc_mesh
+ENV BOX_PREFIX=/build/BoxMeshDM
 
 # Copy the source code and build it
-COPY . /build/box_2D_gen_unstruc_mesh
+COPY . /build/BoxMeshDM
 
 # Build the library version only
 RUN set -e; \
-    cd box_2D_gen_unstruc_mesh && \
+    cd BoxMeshDM && \
     make clean && make lib
 
 ENV CFLAGS="${CFLAGS} -I${BOX_PREFIX}" \
     LDFLAGS="-Wl,-rpath,${BOX_PREFIX} ${LDFLAGS}" \
-    LDLIBS="${LDLIBS} -L${BOX_PREFIX} -lbox_2D_gen_unstruc_mesh" \
+    LDLIBS="${LDLIBS} -L${BOX_PREFIX} -lboxmeshdm" \
     LD_LIBRARY_PATH="${BOX_PREFIX}:${LD_LIBRARY_PATH}"
 
 # Use the branch supg_box_mesh in PFLARE which modifies the supg and DG
-# tests to use the box_2D_gen_unstruc_mesh library to generate a mesh
+# tests to use the BoxMeshDM library to generate a mesh
 # Verify the solution is 1 everywhere in serial and parallel
 RUN set -e; \
     cd /build && \
@@ -52,4 +52,4 @@ RUN set -e; \
     mpiexec -n 2 ./adv_dg_upwind -target_edge_length 0.01 -pc_type air -verify_solution && \
     mpiexec -n 2 ./adv_dg_upwind -target_edge_length 0.01 -domain_height 2.0 -pc_type air -verify_solution
 
-WORKDIR /build/box_2D_gen_unstruc_mesh
+WORKDIR /build/BoxMeshDM

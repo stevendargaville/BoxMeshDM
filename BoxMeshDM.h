@@ -1,5 +1,5 @@
-#ifndef BOX_2D_GEN_UNSTRUC_MESH_H
-#define BOX_2D_GEN_UNSTRUC_MESH_H
+#ifndef BOXMESHDM_H
+#define BOXMESHDM_H
 
 #include <petscdmplex.h>
 
