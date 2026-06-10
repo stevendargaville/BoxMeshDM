@@ -17,7 +17,7 @@ std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz,
   return points;
 }
 
-// Tetrahedralises a point cloud using TetGen
+// Tetrahedralizes a point cloud using TetGen
 void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud,
                               std::vector<Tetrahedron> &out_tetrahedra) {
   tetgenio in, out;
