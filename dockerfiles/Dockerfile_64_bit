@@ -3,7 +3,7 @@ ARG BASE_IMAGE=stevendargaville/petsc_64_bit
 FROM ${BASE_IMAGE}
 # Checkout the main branch by default
 ARG BRANCH=main
-# Use the optimised petsc build by default
+# Uses the optimised petsc build by default
 ARG ARCH=arch-linux-c-opt
 
 LABEL maintainer="Steven Dargaville"
@@ -14,9 +14,46 @@ ENV PETSC_ARCH=$ARCH
 # Ensure any test failures are caught and the build fails
 ENV PETSC_OPTIONS="-on_error_abort"
 
+# Changes the default build to include packages needed for 3D
+USER root
+
+# Install flex and bison required by PTScotch compilation
+RUN apt-get update && apt-get install -y flex bison && rm -rf /var/lib/apt/lists/*
+
+RUN cd /build/petsc && \
+    OPT='-O3' && \
+    python3 configure \
+      --with-debugging=0 \
+      COPTFLAGS="$OPT" CXXOPTFLAGS="$OPT" FOPTFLAGS="$OPT" \
+      --with-shared-libraries=1 \
+      --with-mpi-dir=/usr/local \
+      --with-64-bit-indices \
+      --download-metis \
+      --download-parmetis \
+      --download-fblaslapack \
+      --download-triangle \
+      --download-ctetgen \
+      --download-tetgen \
+      --download-ptscotch \
+      --download-hdf5 \
+      --download-zlib \
+      --with-petsc4py \
+      --force \
+      --with-clean && \
+    make
+
+# Builds the full TetGen library (libtetgen.a)
+RUN cd /build/petsc/arch-linux-c-opt/externalpackages/tetgen1.6.0 && \
+    # Uncomment the TETLIBRARY macro in tetgen.h to compile as a library
+    sed -i 's|//#define TETLIBRARY|#define TETLIBRARY|g' tetgen.h && \
+    # build the static library (libtetgen.a)
+    make tetlib && \
+    # Copies the library to a location the linker will find
+    cp libtet.a /build/petsc/arch-linux-c-opt/lib/libtetgen.a
+
 WORKDIR /build
 
-# Copy the source code and build it
+# Copies the source code and builds it
 COPY . /build/BoxMeshDM
 
 RUN set -e; \
