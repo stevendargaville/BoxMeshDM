@@ -1,0 +1,75 @@
+Bootstrap: docker
+From: stevendargaville/petsc_64_bit
+
+%arguments
+    # Checkout the main branch by default
+    BRANCH=main
+    # Uses the optimized PETSc build by default
+    ARCH=arch-linux-c-opt
+
+%environment
+    export CHECKOUT_BRANCH={{ BRANCH }}
+    export PETSC_DIR=/build/petsc
+    export PETSC_ARCH={{ ARCH }}
+    # Ensure any test failures are caught and the build fails
+    export PETSC_OPTIONS="-on_error_abort"
+    export PATH=/build/BoxMeshDM:$PATH
+
+%post
+    # Install flex and bison required by PTScotch compilation
+    apt-get update && apt-get install -y flex bison && rm -rf /var/lib/apt/lists/*
+
+    # PETSc configuration and build
+    cd /build/petsc
+    OPT='-O3'
+    python3 configure \
+      --with-debugging=0 \
+      COPTFLAGS="$OPT" CXXOPTFLAGS="$OPT" FOPTFLAGS="$OPT" \
+      --with-shared-libraries=1 \
+      --with-mpi-dir=/usr/local \
+      --with-64-bit-indices \
+      --download-metis \
+      --download-parmetis \
+      --download-fblaslapack \
+      --download-triangle \
+      --download-ctetgen \
+      --download-tetgen \
+      --download-ptscotch \
+      --download-hdf5 \
+      --download-zlib \
+      --with-petsc4py \
+      --force \
+      --with-clean
+    make
+
+    # Builds the full TetGen library (libtetgen.a)
+    cd /build/petsc/arch-linux-c-opt/externalpackages/tetgen1.6.0
+    # Uncomments the TELILIBRARY macro in tetgen.h to compile as a library
+    sed -i 's|//#define TETLIBRARY|#define TETLIBRARY|g' tetgen.h
+    # Builds the static library (libtetgen.a)
+    make tetlib
+    # Copies the library to a location the linker will find
+    cp libtet.a /build/petsc/arch-linux-c-opt/lib/libtetgen.a
+
+    # Create the build directory for your source code
+    mkdir -p /build/BoxMeshDM
+
+%files
+    # Copies everything from the host build context root into the image
+    . /build/BoxMeshDM
+
+%post
+    # Explicitly sets the environment variables for the build process
+    export PETSC_DIR=/build/petsc
+    export PETSC_ARCH=arch-linux-c-opt
+    
+    # Copies the source code and builds it
+    cd /build/BoxMeshDM
+    make clean; make lib
+    make clean; make
+    make clean; make tests
+
+%runscript
+    cd /build/BoxMeshDM
+    exec "$@"
+

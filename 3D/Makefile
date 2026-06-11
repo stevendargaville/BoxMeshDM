@@ -1,21 +1,26 @@
 # Compiler settings
 CXX := mpicxx
 
-# PETSc paths (inside Docker)
-PETSC_DIR  ?= /build/petsc
-PETSC_ARCH ?= arch-linux-c-opt
+# Standardized paths across Docker and Apptainer containers
+PETSC_DIR  := /build/petsc
+PETSC_ARCH := arch-linux-c-opt
+TETGEN_INC := $(PETSC_DIR)/$(PETSC_ARCH)/externalpackages/tetgen1.6.0
 
-# Include directories
-INCLUDES := -I. -I$(PETSC_DIR)/include -I$(PETSC_DIR)/$(PETSC_ARCH)/include
+# Compiler and Linker flags
+INCLUDES := -I. -I$(PETSC_DIR)/include -I$(PETSC_DIR)/$(PETSC_ARCH)/include -I$(TETGEN_INC)
 
-# Link libraries
 LIBS := -L$(PETSC_DIR)/$(PETSC_ARCH)/lib -lpetsc -ltetgen -lmpi -lstdc++ -lm -ldl
 LIBS += -Wl,-rpath=$(PETSC_DIR)/$(PETSC_ARCH)/lib
 
-# Sources
-TARGET := test_runner
-SRCS   := BoxMeshDM_3D.cpp test_BoxMeshDM_3D.cpp
-OBJS   := $(SRCS:.cpp=.o)
+# Container detection for leak santitizer
+ifneq ($(APPTAINER_CONTAINER),)
+    # On a HPC cluster: Turn off leak checking to avoid ptrace crash
+    export ASAN_OPTIONS := detect_leaks=0
+    export LSAN_OPTIONS := exitcode=0
+else
+    # On your laptop: Keep leak tracking fully functional
+    export ASAN_OPTIONS := detect_leaks=1
+endif
 
 # Build modes
 DEBUG_FLAGS   := -O0 -g -Wall -Wextra -std=c++11 -fsanitize=address,undefined
@@ -30,7 +35,11 @@ else
     CXXFLAGS := $(RELEASE_FLAGS)
 endif
 
-# Targets
+# Targets and rules
+TARGET := test_runner
+SRCS   := BoxMeshDM_3D.cpp test_BoxMeshDM_3D.cpp
+OBJS   := $(SRCS:.cpp=.o)
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
@@ -39,7 +48,7 @@ $(TARGET): $(OBJS)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-# Run
+# Run test file
 test: $(TARGET)
 	./$(TARGET)
 
@@ -55,4 +64,5 @@ release:
 clean:
 	rm -f $(OBJS) $(TARGET)
 
-.PHONY: all clean test
+.PHONY: all clean test debug release
+
