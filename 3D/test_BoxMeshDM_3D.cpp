@@ -62,6 +62,34 @@ void TestLargeStructuredGrid() {
             << " elements.\n\n";
 }
 
+// Test 3: New 3D Jittered Unstructured Mesh via Serial Tile Halos
+void TestSerialHaloMesh3D() {
+  std::cout << "Running TestSerialHaloMesh3D...\n";
+
+  // Split the domain into a 2x2x2 tile layout layout
+  int dim_x = 2;
+  int dim_y = 2;
+  int dim_z = 2;
+
+  std::vector<Point3D> points = GenerateMesh3D_Serial(dim_x, dim_y, dim_z);
+
+  std::cout << "-> Generated " << points.size()
+            << " unique points across all tiles (halos removed).\n";
+  TEST_ASSERT(!points.empty(), "Point cloud should not be empty.");
+
+  std::vector<Tetrahedron> tets;
+  TetrahedralizePointCloud(points, tets);
+
+  std::cout << "-> Tetrahedralized into " << tets.size() << " elements.\n";
+  TEST_ASSERT(!tets.empty(), "TetGen failed to produce any tetrahedra.");
+
+  // Save to VTU so you can inspect the quality and boundaries in ParaView
+  WriteTetrahedralMeshVTU(points, tets, "unstructured_halo_3d.vtu",
+                          MPI_COMM_SELF);
+
+  std::cout << "TestSerialHaloMesh3D Passed!\n\n";
+}
+
 int main(int argc, char **argv) {
   // Initialize PETSc (and MPI)
   PetscInitialize(&argc, &argv, NULL, NULL);
@@ -72,6 +100,7 @@ int main(int argc, char **argv) {
 
   TestMinimalCube();
   TestLargeStructuredGrid();
+  TestSerialHaloMesh3D(); // Run the new pipeline test
 
   std::cout << "All tests passed successfully!\n";
 

@@ -1,8 +1,276 @@
 #include "BoxMeshDM_3D.h"
 #include "tetgen.h"
+#include <cmath>
 #include <petscdmplex.h>
+#include <unordered_map>
+#include <vector>
 
-// Generates a stuctured 3D grid of points
+const double EPSILON = 1e-13;
+const double START_JITTER = 0.30;
+double DOMAIN_WIDTH = 1.0;
+double DOMAIN_HEIGHT = 1.0;
+double DOMAIN_DEPTH = 1.0;
+double TARGET_EDGE_LENGTH = 0.1;
+
+// Pack: [Type: 2 bits] [ix: 20 bits] [iy: 20 bits] [iz: 20 bits]
+uint64_t create_point_with_unique_hash_id_3D(int ix, int iy, int iz, int type) {
+  uint64_t id = ((uint64_t)(type & 0x3) << 60) |
+                ((uint64_t)(ix & 0xFFFFF) << 40) |
+                ((uint64_t)(iy & 0xFFFFF) << 20) | ((uint64_t)(iz & 0xFFFFF));
+  return id;
+}
+
+// Simple splitmix64 for deterministic RNG
+uint64_t splitmix64_3D(uint64_t &x) {
+  uint64_t z = (x += 0x9e3779b97f4a7c15);
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+  return z ^ (z >> 31);
+}
+
+double next_double_3D(uint64_t &state) {
+  return (splitmix64_3D(state) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+bool apply_boundary_constraint_3D(Point3D &p, double &dx, double &dy,
+                                  double &dz) {
+  bool on_boundary = false;
+
+  // X Planes (Left/Right)
+  if (std::abs(p.x) < EPSILON) {
+    p.x = 0.0;
+    dx = 0.0;
+    on_boundary = true;
+  } else if (std::abs(p.x - DOMAIN_WIDTH) < EPSILON) {
+    p.x = DOMAIN_WIDTH;
+    dx = 0.0;
+    on_boundary = true;
+  }
+
+  // Y Planes (Bottom/Top)
+  if (std::abs(p.y) < EPSILON) {
+    p.y = 0.0;
+    dy = 0.0;
+    on_boundary = true;
+  } else if (std::abs(p.y - DOMAIN_HEIGHT) < EPSILON) {
+    p.y = DOMAIN_HEIGHT;
+    dy = 0.0;
+    on_boundary = true;
+  }
+
+  // Z Planes (Front/Back)
+  if (std::abs(p.z) < EPSILON) {
+    p.z = 0.0;
+    dz = 0.0;
+    on_boundary = true;
+  } else if (std::abs(p.z - DOMAIN_DEPTH) < EPSILON) {
+    p.z = DOMAIN_DEPTH;
+    dz = 0.0;
+    on_boundary = true;
+  }
+
+  return on_boundary;
+}
+
+void keep_interior_point_inside_3D(Point3D &p) {
+  if (p.x < 0.0)
+    p.x = -p.x;
+  else if (p.x > DOMAIN_WIDTH)
+    p.x = DOMAIN_WIDTH - (p.x - DOMAIN_WIDTH);
+
+  if (p.y < 0.0)
+    p.y = -p.y;
+  else if (p.y > DOMAIN_HEIGHT)
+    p.y = DOMAIN_HEIGHT - (p.y - DOMAIN_HEIGHT);
+
+  if (p.z < 0.0)
+    p.z = -p.z;
+  else if (p.z > DOMAIN_DEPTH)
+    p.z = DOMAIN_DEPTH - (p.z - DOMAIN_DEPTH);
+
+  // Enforce strict interiority
+  if (p.x <= EPSILON)
+    p.x = EPSILON * 2.0;
+  if (p.x >= DOMAIN_WIDTH - EPSILON)
+    p.x = DOMAIN_WIDTH - EPSILON * 2.0;
+  if (p.y <= EPSILON)
+    p.y = EPSILON * 2.0;
+  if (p.y >= DOMAIN_HEIGHT - EPSILON)
+    p.y = DOMAIN_HEIGHT - EPSILON * 2.0;
+  if (p.z <= EPSILON)
+    p.z = EPSILON * 2.0;
+  if (p.z >= DOMAIN_DEPTH - EPSILON)
+    p.z = DOMAIN_DEPTH - EPSILON * 2.0;
+}
+
+void apply_jitter_3D(std::vector<Point3D> &points, double amount, int iter) {
+  for (auto &p : points) {
+    uint64_t h = p.unique_hash_id;
+    h ^= iter + 0x9e3779b9 + (h << 6) + (h >> 2); // Seed modifier
+
+    double jx = (next_double_3D(h) - 0.5) * 2.0 * amount * TARGET_EDGE_LENGTH;
+    double jy = (next_double_3D(h) - 0.5) * 2.0 * amount * TARGET_EDGE_LENGTH;
+    double jz = (next_double_3D(h) - 0.5) * 2.0 * amount * TARGET_EDGE_LENGTH;
+
+    bool was_boundary = apply_boundary_constraint_3D(p, jx, jy, jz);
+
+    p.x += jx;
+    p.y += jy;
+    p.z += jz;
+
+    if (!was_boundary) {
+      keep_interior_point_inside_3D(p);
+    } else {
+      // Strict float drift clamping
+      if (p.x < 0)
+        p.x = 0;
+      if (p.x > DOMAIN_WIDTH)
+        p.x = DOMAIN_WIDTH;
+      if (p.y < 0)
+        p.y = 0;
+      if (p.y > DOMAIN_HEIGHT)
+        p.y = DOMAIN_HEIGHT;
+      if (p.z < 0)
+        p.z = 0;
+      if (p.z > DOMAIN_DEPTH)
+        p.z = DOMAIN_DEPTH;
+    }
+  }
+}
+
+std::vector<Point3D> process_tile_3D_serial(int tile_x, int tile_y, int tile_z,
+                                            int dim_x, int dim_y, int dim_z,
+                                            double pad) {
+  double tile_s_x = DOMAIN_WIDTH / dim_x;
+  double tile_s_y = DOMAIN_HEIGHT / dim_y;
+  double tile_s_z = DOMAIN_DEPTH / dim_z;
+
+  double search_min_x = tile_x * tile_s_x - pad;
+  double search_max_x = (tile_x + 1) * tile_s_x + pad;
+  double search_min_y = tile_y * tile_s_y - pad;
+  double search_max_y = (tile_y + 1) * tile_s_y + pad;
+  double search_min_z = tile_z * tile_s_z - pad;
+  double search_max_z = (tile_z + 1) * tile_s_z + pad;
+
+  // Global limits to determine domain termination
+  int global_max_ix = std::round(DOMAIN_WIDTH / TARGET_EDGE_LENGTH);
+  int global_max_iy = std::round(DOMAIN_HEIGHT / TARGET_EDGE_LENGTH);
+  int global_max_iz = std::round(DOMAIN_DEPTH / TARGET_EDGE_LENGTH);
+
+  // Clamp search indices to valid global ranges to eliminate out-of-bounds
+  // ghost points
+  int min_ix = std::max(0, (int)std::floor(search_min_x / TARGET_EDGE_LENGTH));
+  int max_ix = std::min(global_max_ix,
+                        (int)std::ceil(search_max_x / TARGET_EDGE_LENGTH));
+  int min_iy = std::max(0, (int)std::floor(search_min_y / TARGET_EDGE_LENGTH));
+  int max_iy = std::min(global_max_iy,
+                        (int)std::ceil(search_max_y / TARGET_EDGE_LENGTH));
+  int min_iz = std::max(0, (int)std::floor(search_min_z / TARGET_EDGE_LENGTH));
+  int max_iz = std::min(global_max_iz,
+                        (int)std::ceil(search_max_z / TARGET_EDGE_LENGTH));
+
+  double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.25);
+  std::vector<Point3D> tile_points;
+
+  // Loop through the clamped grid nodes
+  for (int iz = min_iz; iz <= max_iz; ++iz) {
+    for (int iy = min_iy; iy <= max_iy; ++iy) {
+      for (int ix = min_ix; ix <= max_ix; ++ix) {
+
+        // --- BOUNDARY VERTICES ---
+        // Check if this specific grid vertex lies on any of the 6 outer domain
+        // faces
+        bool is_boundary_vertex =
+            (ix == 0 || ix == global_max_ix || iy == 0 || iy == global_max_iy ||
+             iz == 0 || iz == global_max_iz);
+
+        if (is_boundary_vertex) {
+          double cx = ix * TARGET_EDGE_LENGTH;
+          double cy = iy * TARGET_EDGE_LENGTH;
+          double cz = iz * TARGET_EDGE_LENGTH;
+
+          // If it falls within this tile's padded search window, grab it
+          if (cx >= search_min_x && cx <= search_max_x && cy >= search_min_y &&
+              cy <= search_max_y && cz >= search_min_z && cz <= search_max_z) {
+
+            uint64_t id = create_point_with_unique_hash_id_3D(
+                ix, iy, iz, 1); // type 1 = boundary
+            tile_points.emplace_back(cx, cy, cz, id);
+          }
+        }
+
+        // --- INTERIOR CELL CANDIDATES ---
+        // Decouple from boundary check
+        // (Every valid cell volume can host an interior point which is then
+        // safely filtered by the exclusion distance)
+        if (ix < global_max_ix && iy < global_max_iy && iz < global_max_iz) {
+          uint64_t h = ((uint64_t)ix << 40) | ((uint64_t)iy << 20) | iz;
+          h = splitmix64_3D(h);
+
+          double r1 = 0.1 + next_double_3D(h) * 0.8;
+          double r2 = 0.1 + next_double_3D(h) * 0.8;
+          double r3 = 0.1 + next_double_3D(h) * 0.8;
+
+          double cx = (ix + r1) * TARGET_EDGE_LENGTH;
+          double cy = (iy + r2) * TARGET_EDGE_LENGTH;
+          double cz = (iz + r3) * TARGET_EDGE_LENGTH;
+
+          // Only keep the interior candidate if it's far enough from ALL
+          // boundary faces
+          if (cx >= exclusion && cx <= DOMAIN_WIDTH - exclusion &&
+              cy >= exclusion && cy <= DOMAIN_HEIGHT - exclusion &&
+              cz >= exclusion && cz <= DOMAIN_DEPTH - exclusion) {
+
+            if (cx >= search_min_x && cx <= search_max_x &&
+                cy >= search_min_y && cy <= search_max_y &&
+                cz >= search_min_z && cz <= search_max_z) {
+
+              uint64_t id = create_point_with_unique_hash_id_3D(
+                  ix, iy, iz, 0); // type 0 = interior
+              tile_points.emplace_back(cx, cy, cz, id);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Apply deterministic jitter to this tile's point subset
+  apply_jitter_3D(tile_points, START_JITTER, 0);
+
+  return tile_points;
+}
+
+std::vector<Point3D> GenerateMesh3D_Serial(int dim_x, int dim_y, int dim_z) {
+  double pad = TARGET_EDGE_LENGTH * 4.0; // arbitrary halo padding for testing
+  std::unordered_map<uint64_t, Point3D> global_point_map;
+
+  for (int tz = 0; tz < dim_z; ++tz) {
+    for (int ty = 0; ty < dim_y; ++ty) {
+      for (int tx = 0; tx < dim_x; ++tx) {
+
+        std::vector<Point3D> tile_points =
+            process_tile_3D_serial(tx, ty, tz, dim_x, dim_y, dim_z, pad);
+
+        // Merge tile points into global map to filter out halo duplicates
+        for (const auto &p : tile_points) {
+          global_point_map[p.unique_hash_id] = p;
+        }
+      }
+    }
+  }
+
+  // Flatten to a standard vector for TetGen
+  std::vector<Point3D> final_cloud;
+  final_cloud.reserve(global_point_map.size());
+  for (const auto &pair : global_point_map) {
+    final_cloud.push_back(pair.second);
+  }
+
+  return final_cloud;
+}
+
+// Generates a structured 3D grid of points
 std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz,
                                             double spacing) {
   std::vector<Point3D> points;
