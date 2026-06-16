@@ -7,6 +7,8 @@
 
 const double EPSILON = 1e-13;
 const double START_JITTER = 0.30;
+const int ANNEAL_ITERS = 3;
+const int FINAL_SMOOTH_ITS = 4;
 double DOMAIN_WIDTH = 1.0;
 double DOMAIN_HEIGHT = 1.0;
 double DOMAIN_DEPTH = 1.0;
@@ -241,48 +243,179 @@ std::vector<Point3D> process_tile_3D_serial(int tile_x, int tile_y, int tile_z,
   return tile_points;
 }
 
-std::vector<Point3D> GenerateMesh3D_Serial(int dim_x, int dim_y, int dim_z) {
-  double pad = TARGET_EDGE_LENGTH * 4.0; // arbitrary halo padding for testing
-  std::unordered_map<uint64_t, Point3D> global_point_map;
-
-  for (int tz = 0; tz < dim_z; ++tz) {
-    for (int ty = 0; ty < dim_y; ++ty) {
-      for (int tx = 0; tx < dim_x; ++tx) {
-
-        std::vector<Point3D> tile_points =
-            process_tile_3D_serial(tx, ty, tz, dim_x, dim_y, dim_z, pad);
-
-        // Merge tile points into global map to filter out halo duplicates
-        for (const auto &p : tile_points) {
-          global_point_map[p.unique_hash_id] = p;
-        }
-      }
-    }
-  }
-
-  // Flatten to a standard vector for TetGen
-  std::vector<Point3D> final_cloud;
-  final_cloud.reserve(global_point_map.size());
-  for (const auto &pair : global_point_map) {
-    final_cloud.push_back(pair.second);
-  }
-
-  return final_cloud;
+// Calculates the volume of a tetrahedron
+double tet_volume(const Point3D &p0, const Point3D &p1, const Point3D &p2,
+                  const Point3D &p3) {
+  double v0x = p1.x - p0.x, v0y = p1.y - p0.y, v0z = p1.z - p0.z;
+  double v1x = p2.x - p0.x, v1y = p2.y - p0.y, v1z = p2.z - p0.z;
+  double v2x = p3.x - p0.x, v2y = p3.y - p0.y, v2z = p3.z - p0.z;
+  return std::abs(v0x * (v1y * v2z - v1z * v2y) -
+                  v0y * (v1x * v2z - v1z * v2x) +
+                  v0z * (v1x * v2y - v1y * v2x)) /
+         6.0;
 }
 
-// Generates a structured 3D grid of points
-std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz,
-                                            double spacing) {
-  std::vector<Point3D> points;
-  points.reserve(nx * ny * nz);
-  for (int i = 0; i < nx; ++i) {
-    for (int j = 0; j < ny; ++j) {
-      for (int k = 0; k < nz; ++k) {
-        points.emplace_back(i * spacing, j * spacing, k * spacing);
-      }
+// 3D Lloyd-smoothing
+// Moves vertices towards the volume-weighted centroid of surrounding tets
+// Optimising element shape and aspect ratios
+void relax_points_lloyd_3D(std::vector<Point3D> &points,
+                           const std::vector<Tetrahedron> &tets,
+                           double factor) {
+  int n = points.size();
+  // wx, wy, wz:  Volume-Weighted Centroid Accumalators
+  // w_sum: Sum of Weights / Total Area
+  std::vector<double> wx(n, 0.0), wy(n, 0.0), wz(n, 0.0), w_sum(n, 0.0);
+
+  for (const auto &tet : tets) {
+    const Point3D &p0 = points[tet.v0];
+    const Point3D &p1 = points[tet.v1];
+    const Point3D &p2 = points[tet.v2];
+    const Point3D &p3 = points[tet.v3];
+
+    // Tetrahedron centroid
+    double cx = (p0.x + p1.x + p2.x + p3.x) * 0.25;
+    double cy = (p0.y + p1.y + p2.y + p3.y) * 0.25;
+    double cz = (p0.z + p1.z + p2.z + p3.z) * 0.25;
+
+    double vol = tet_volume(p0, p1, p2, p3);
+
+    int v[4] = {tet.v0, tet.v1, tet.v2, tet.v3};
+    for (int i = 0; i < 4; ++i) {
+      wx[v[i]] += vol * cx;
+      wy[v[i]] += vol * cy;
+      wz[v[i]] += vol * cz;
+      w_sum[v[i]] += vol;
     }
   }
-  return points;
+
+  for (int i = 0; i < n; ++i) {
+    if (w_sum[i] < 1e-12)
+      continue; // Skip zero-volume anomalies
+
+    // Target Centroid Coordinates
+    // I.e. the volume-weighted average centroid
+    // of the Vornoi cells surrounding vertex i
+    double tx = wx[i] / w_sum[i];
+    double ty = wy[i] / w_sum[i];
+    double tz = wz[i] / w_sum[i];
+
+    // Final displacements vectors (prior to applying boundary constraints)
+    double dx = (tx - points[i].x) * factor;
+    double dy = (ty - points[i].y) * factor;
+    double dz = (tz - points[i].z) * factor;
+
+    Point3D temp_p = points[i];
+    bool was_boundary = apply_boundary_constraint_3D(temp_p, dx, dy, dz);
+
+    temp_p.x += dx;
+    temp_p.y += dy;
+    temp_p.z += dz;
+
+    if (!was_boundary) {
+      keep_interior_point_inside_3D(temp_p);
+    } else {
+      // Strict clamp to prevent float drift on boundaries
+      if (temp_p.x < 0)
+        temp_p.x = 0;
+      if (temp_p.x > DOMAIN_WIDTH)
+        temp_p.x = DOMAIN_WIDTH;
+      if (temp_p.y < 0)
+        temp_p.y = 0;
+      if (temp_p.y > DOMAIN_HEIGHT)
+        temp_p.y = DOMAIN_HEIGHT;
+      if (temp_p.z < 0)
+        temp_p.z = 0;
+      if (temp_p.z > DOMAIN_DEPTH)
+        temp_p.z = DOMAIN_DEPTH;
+    }
+    points[i] = temp_p;
+  }
+}
+
+// 3D Spring-Force Relaxation
+// Attempts to equalize all edges to TARGET_EDGE_LENGTH
+void relax_points_spring_3D(std::vector<Point3D> &points,
+                            const std::vector<Tetrahedron> &tets, double dt) {
+  int n = points.size();
+  std::vector<double> force_x(n, 0.0), force_y(n, 0.0), force_z(n, 0.0);
+  std::vector<int> valence(n, 0);
+
+  // 6 edges per tetrahedron
+  int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
+
+  for (const auto &tet : tets) {
+    int v[4] = {tet.v0, tet.v1, tet.v2, tet.v3};
+    for (int e = 0; e < 6; ++e) {
+      int idx1 = v[edge_pairs[e][0]];
+      int idx2 = v[edge_pairs[e][1]];
+
+      double dx = points[idx2].x - points[idx1].x;
+      double dy = points[idx2].y - points[idx1].y;
+      double dz = points[idx2].z - points[idx1].z;
+      double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+      if (dist < 1e-14)
+        continue;
+
+      double force_mag = (dist - TARGET_EDGE_LENGTH);
+
+      double nx = dx / dist;
+      double ny = dy / dist;
+      double nz = dz / dist;
+
+      double fx = force_mag * nx;
+      double fy = force_mag * ny;
+      double fz = force_mag * nz;
+
+      force_x[idx1] += fx;
+      force_y[idx1] += fy;
+      force_z[idx1] += fz;
+      force_x[idx2] -= fx;
+      force_y[idx2] -= fy;
+      force_z[idx2] -= fz;
+      valence[idx1]++;
+      valence[idx2]++;
+    }
+  }
+
+  for (int i = 0; i < n; ++i) {
+    if (valence[i] == 0)
+      continue;
+
+    // Normalised Force
+    double fx = force_x[i] / valence[i];
+    double fy = force_y[i] / valence[i];
+    double fz = force_z[i] / valence[i];
+
+    double dx = fx * dt;
+    double dy = fy * dt;
+    double dz = fz * dt;
+
+    Point3D temp_p = points[i];
+    bool was_boundary = apply_boundary_constraint_3D(temp_p, dx, dy, dz);
+
+    temp_p.x += dx;
+    temp_p.y += dy;
+    temp_p.z += dz;
+
+    if (!was_boundary) {
+      keep_interior_point_inside_3D(temp_p);
+    } else {
+      if (temp_p.x < 0)
+        temp_p.x = 0;
+      if (temp_p.x > DOMAIN_WIDTH)
+        temp_p.x = DOMAIN_WIDTH;
+      if (temp_p.y < 0)
+        temp_p.y = 0;
+      if (temp_p.y > DOMAIN_HEIGHT)
+        temp_p.y = DOMAIN_HEIGHT;
+      if (temp_p.z < 0)
+        temp_p.z = 0;
+      if (temp_p.z > DOMAIN_DEPTH)
+        temp_p.z = DOMAIN_DEPTH;
+    }
+    points[i] = temp_p;
+  }
 }
 
 // Tetrahedralizes a point cloud using TetGen
@@ -316,6 +449,71 @@ void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud,
     tet.v3 = out.tetrahedronlist[i * 4 + 3];
     out_tetrahedra.push_back(tet);
   }
+
+  // delete[] in.pointlist;
+}
+
+std::vector<Point3D> GenerateMesh3D_Serial(int dim_x, int dim_y, int dim_z,
+                                           double factor, double dt) {
+  double pad = TARGET_EDGE_LENGTH * 4.0; // arbitrary halo padding for testing
+  std::unordered_map<uint64_t, Point3D> global_point_map;
+
+  // Initial Cloud Generation
+  for (int tz = 0; tz < dim_z; ++tz) {
+    for (int ty = 0; ty < dim_y; ++ty) {
+      for (int tx = 0; tx < dim_x; ++tx) {
+        std::vector<Point3D> tile_points =
+            process_tile_3D_serial(tx, ty, tz, dim_x, dim_y, dim_z, pad);
+
+        // Merge tile points into global map to filter out halo duplicates
+        for (const auto &p : tile_points) {
+          global_point_map[p.unique_hash_id] = p;
+        }
+      }
+    }
+  }
+
+  // Flatten to a standard vector for TetGen
+  std::vector<Point3D> final_cloud;
+  final_cloud.reserve(global_point_map.size());
+  for (const auto &pair : global_point_map) {
+    final_cloud.push_back(pair.second);
+  }
+
+  // Iterative Smoothing Process
+  std::vector<Tetrahedron> tets;
+
+  // Anneal: Jitter -> Triangulate -> Smooth
+  for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
+    apply_jitter_3D(final_cloud, START_JITTER, iter);
+    TetrahedralizePointCloud(final_cloud, tets);
+    relax_points_lloyd_3D(final_cloud, tets, factor);
+    relax_points_spring_3D(final_cloud, tets, dt);
+  }
+
+  // Final Smooth Loop (No Jitter)
+  for (int iter = 0; iter < FINAL_SMOOTH_ITS; ++iter) {
+    TetrahedralizePointCloud(final_cloud, tets);
+    relax_points_lloyd_3D(final_cloud, tets, factor);
+    relax_points_spring_3D(final_cloud, tets, dt);
+  }
+
+  return final_cloud;
+}
+
+// Generates a structured 3D grid of points
+std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz,
+                                            double spacing) {
+  std::vector<Point3D> points;
+  points.reserve(nx * ny * nz);
+  for (int i = 0; i < nx; ++i) {
+    for (int j = 0; j < ny; ++j) {
+      for (int k = 0; k < nz; ++k) {
+        points.emplace_back(i * spacing, j * spacing, k * spacing);
+      }
+    }
+  }
+  return points;
 }
 
 // Writes mesh to VTU file

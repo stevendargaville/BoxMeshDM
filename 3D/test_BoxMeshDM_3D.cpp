@@ -1,6 +1,7 @@
 #include "BoxMeshDM_3D.h"
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <petsc.h>
 #include <vector>
@@ -83,11 +84,80 @@ void TestSerialHaloMesh3D() {
   std::cout << "-> Tetrahedralized into " << tets.size() << " elements.\n";
   TEST_ASSERT(!tets.empty(), "TetGen failed to produce any tetrahedra.");
 
-  // Save to VTU so you can inspect the quality and boundaries in ParaView
   WriteTetrahedralMeshVTU(points, tets, "unstructured_halo_3d.vtu",
                           MPI_COMM_SELF);
 
   std::cout << "TestSerialHaloMesh3D Passed!\n\n";
+}
+
+// Test 4: Verify the automated pipeline keeps points inside the domain
+void TestSmoothingQuality3D() {
+  std::cout << "Running TestSmoothingQuality3D...\n";
+
+  // Use a coarse grid for quick testing
+  std::vector<Point3D> points = GenerateMesh3D_Serial(2, 2, 2);
+  std::vector<Tetrahedron> tets;
+
+  // Tetrahedralize after the automatic internal smoothing
+  TetrahedralizePointCloud(points, tets);
+
+  TEST_ASSERT(tets.size() > 0, "Smoothing produced no tetrahedra.");
+
+  // Ensure points haven't drifted outside the domain on ANY axis
+  for (const auto &p : points) {
+    TEST_ASSERT(p.x >= -1e-9 && p.x <= DOMAIN_WIDTH + 1e-9,
+                "Point drifted outside X bounds");
+    TEST_ASSERT(p.y >= -1e-9 && p.y <= DOMAIN_HEIGHT + 1e-9,
+                "Point drifted outside Y bounds");
+    TEST_ASSERT(p.z >= -1e-9 && p.z <= DOMAIN_DEPTH + 1e-9,
+                "Point drifted outside Z bounds");
+  }
+
+  WriteTetrahedralMeshVTU(points, tets, "smoothed_mesh_3d.vtu", MPI_COMM_SELF);
+  std::cout << "TestSmoothingQuality3D Passed!\n\n";
+}
+
+// Test 5: Explicitly isolate and visually dump the smoothing progression
+void TestExplicitSmoothingVisuals() {
+  std::cout << "Running TestExplicitSmoothingVisuals...\n";
+
+  // Create a structured grid (4x4x4)
+  std::vector<Point3D> points = GenerateStructuredGrid(4, 4, 4, 0.3333);
+  std::vector<Tetrahedron> tets;
+
+  // Manually distort interior nodes to simulate a highly irregular starting
+  // mesh
+  std::srand(42); // Deterministic seed for repeatable test
+  for (auto &p : points) {
+    bool is_interior =
+        (p.x > 0.05 && p.x < DOMAIN_WIDTH - 0.05 && p.y > 0.05 &&
+         p.y < DOMAIN_HEIGHT - 0.05 && p.z > 0.05 && p.z < DOMAIN_DEPTH - 0.05);
+    if (is_interior) {
+      p.x += ((std::rand() % 100) / 100.0 - 0.5) * 0.15;
+      p.y += ((std::rand() % 100) / 100.0 - 0.5) * 0.15;
+      p.z += ((std::rand() % 100) / 100.0 - 0.5) * 0.15;
+    }
+  }
+
+  // Output the distorted baseline
+  TetrahedralizePointCloud(points, tets);
+  WriteTetrahedralMeshVTU(points, tets, "visual_01_noisy.vtu", MPI_COMM_SELF);
+  std::cout << "-> Dumped visual_01_noisy.vtu\n";
+
+  // Apply Lloyd Smoothing and output
+  relax_points_lloyd_3D(points, tets, 0.5);
+  TetrahedralizePointCloud(points, tets);
+  WriteTetrahedralMeshVTU(points, tets, "visual_02_lloyd.vtu", MPI_COMM_SELF);
+  std::cout << "-> Dumped visual_02_lloyd.vtu\n";
+
+  // Apply Spring Smoothing and output
+  relax_points_spring_3D(points, tets, 0.2);
+  TetrahedralizePointCloud(points, tets);
+  WriteTetrahedralMeshVTU(points, tets, "visual_03_spring.vtu", MPI_COMM_SELF);
+  std::cout << "-> Dumped visual_03_spring.vtu\n";
+
+  std::cout << "TestExplicitSmoothingVisuals Passed! Load the 'visual_0*.vtu' "
+               "files into ParaView to see the smoothing happen.\n\n";
 }
 
 int main(int argc, char **argv) {
@@ -100,7 +170,9 @@ int main(int argc, char **argv) {
 
   TestMinimalCube();
   TestLargeStructuredGrid();
-  TestSerialHaloMesh3D(); // Run the new pipeline test
+  TestSerialHaloMesh3D();
+  TestSmoothingQuality3D();       // Wired this up!
+  TestExplicitSmoothingVisuals(); // Added direct coverage for the algorithms
 
   std::cout << "All tests passed successfully!\n";
 
