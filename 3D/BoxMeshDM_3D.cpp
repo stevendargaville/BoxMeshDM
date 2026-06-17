@@ -2,8 +2,12 @@
 #include "tetgen.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iomanip>
+#include <ios>
 #include <iostream>
+#include <map>
+#include <mpi.h>
 #include <petscdmplex.h>
 #include <set>
 #include <unordered_map>
@@ -12,7 +16,7 @@
 const double EPSILON = 1e-13;
 const double START_JITTER = 0.30;
 const int ANNEAL_ITERS = 3;
-const int FINAL_SMOOTH_ITS = 4;
+const int FINAL_SMOOTH_ITS = 20;
 double DOMAIN_WIDTH = 1.0;
 double DOMAIN_HEIGHT = 1.0;
 double DOMAIN_DEPTH = 1.0;
@@ -159,21 +163,24 @@ std::vector<Point3D> process_tile_3D(int tile_x, int tile_y, int tile_z,
   double search_max_z = (tile_z + 1) * tile_s_z + pad;
 
   // Global limits to determine domain termination
-  int global_max_ix = std::round(DOMAIN_WIDTH / TARGET_EDGE_LENGTH);
-  int global_max_iy = std::round(DOMAIN_HEIGHT / TARGET_EDGE_LENGTH);
-  int global_max_iz = std::round(DOMAIN_DEPTH / TARGET_EDGE_LENGTH);
+  int global_max_ix =
+      static_cast<int>(std::floor(DOMAIN_WIDTH / TARGET_EDGE_LENGTH));
+  int global_max_iy =
+      static_cast<int>(std::floor(DOMAIN_HEIGHT / TARGET_EDGE_LENGTH));
+  int global_max_iz =
+      static_cast<int>(std::floor(DOMAIN_DEPTH / TARGET_EDGE_LENGTH));
 
   // Clamp search indices to valid global ranges to eliminate out-of-bounds
   // ghost points
   int min_ix = std::max(0, (int)std::floor(search_min_x / TARGET_EDGE_LENGTH));
   int max_ix = std::min(global_max_ix,
-                        (int)std::ceil(search_max_x / TARGET_EDGE_LENGTH));
+                        (int)std::floor(search_max_x / TARGET_EDGE_LENGTH));
   int min_iy = std::max(0, (int)std::floor(search_min_y / TARGET_EDGE_LENGTH));
   int max_iy = std::min(global_max_iy,
-                        (int)std::ceil(search_max_y / TARGET_EDGE_LENGTH));
+                        (int)std::floor(search_max_y / TARGET_EDGE_LENGTH));
   int min_iz = std::max(0, (int)std::floor(search_min_z / TARGET_EDGE_LENGTH));
   int max_iz = std::min(global_max_iz,
-                        (int)std::ceil(search_max_z / TARGET_EDGE_LENGTH));
+                        (int)std::floor(search_max_z / TARGET_EDGE_LENGTH));
 
   double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.25);
   std::vector<Point3D> tile_points;
@@ -191,10 +198,12 @@ std::vector<Point3D> process_tile_3D(int tile_x, int tile_y, int tile_z,
              iz == 0 || iz == global_max_iz);
 
         if (is_boundary_vertex) {
-          double cx = ix * TARGET_EDGE_LENGTH;
-          double cy = iy * TARGET_EDGE_LENGTH;
-          double cz = iz * TARGET_EDGE_LENGTH;
-
+          double cx =
+              (ix == global_max_ix) ? DOMAIN_WIDTH : ix * TARGET_EDGE_LENGTH;
+          double cy =
+              (iy == global_max_iy) ? DOMAIN_HEIGHT : iy * TARGET_EDGE_LENGTH;
+          double cz =
+              (iz == global_max_iz) ? DOMAIN_DEPTH : iz * TARGET_EDGE_LENGTH;
           // If it falls within this tile's padded search window, grab it
           if (cx >= search_min_x && cx <= search_max_x && cy >= search_min_y &&
               cy <= search_max_y && cz >= search_min_z && cz <= search_max_z) {
@@ -241,9 +250,6 @@ std::vector<Point3D> process_tile_3D(int tile_x, int tile_y, int tile_z,
     }
   }
 
-  // Apply deterministic jitter to this tile's point subset
-  apply_jitter_3D(tile_points, START_JITTER, 0);
-
   return tile_points;
 }
 
@@ -262,6 +268,24 @@ double calculate_tet_volume(const Point3D &p0, const Point3D &p1,
 
   // Dot product with (p1-p0)
   double det = std::abs(v1x * cx + v1y * cy + v1z * cz);
+  return det / 6.0;
+}
+
+// Returns SIGNED volume (negative means the tetrahedron is inverted)
+double calculate_signed_tet_volume(const Point3D &p0, const Point3D &p1,
+                                   const Point3D &p2, const Point3D &p3) {
+  // Volume = 1/6 * |(p1-p0) . ((p2-p0) x (p3-p0))|
+  double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
+  double v2x = p2.x - p0.x, v2y = p2.y - p0.y, v2z = p2.z - p0.z;
+  double v3x = p3.x - p0.x, v3y = p3.y - p0.y, v3z = p3.z - p0.z;
+
+  // Cross product (p2-p0) x (p3-p0)
+  double cx = v2y * v3z - v2z * v3y;
+  double cy = v2z * v3x - v2x * v3z;
+  double cz = v2x * v3y - v2y * v3x;
+
+  // Dot product with (p1-p0)
+  double det = v1x * cx + v1y * cy + v1z * cz;
   return det / 6.0;
 }
 
@@ -309,20 +333,38 @@ void ComputeAndPrintStats_3D(int final_smooth_its,
                              const std::vector<Point3D> &points,
                              const std::vector<Tetrahedron> &tets) {
 
+  // Save the caller's stream configuration
+  std::ios oldState(nullptr);
+  oldState.copyfmt(std::cout);
+
+  // Explicitly force standard decimal representation with 6 digits of precision
+  std::cout << std::defaultfloat << std::setprecision(6);
+
   // Connectivity and Unique Edges
-  std::vector<int> valence(points.size(), 0);
   std::set<std::pair<int, int>> unique_edges;
+  std::vector<int> vertex_valence(points.size(), 0);
   int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
 
   for (const auto &t : tets) {
+    // Track vertex valence (number of tets sharing this vertex)
+    vertex_valence[t.v0]++;
+    vertex_valence[t.v1]++;
+    vertex_valence[t.v2]++;
+    vertex_valence[t.v3]++;
+
+    // Track unique edges
     int v[4] = {t.v0, t.v1, t.v2, t.v3};
     for (auto &pair : edge_pairs) {
       int i1 = v[pair[0]];
       int i2 = v[pair[1]];
-      valence[i1]++;
-      valence[i2]++;
       unique_edges.insert({std::min(i1, i2), std::max(i1, i2)});
     }
+  }
+
+  // Aggregate valence counts
+  std::map<int, int> valence_dist;
+  for (int v : vertex_valence) {
+    valence_dist[v]++;
   }
 
   // Statistics Calculation
@@ -331,7 +373,6 @@ void ComputeAndPrintStats_3D(int final_smooth_its,
   double total_edge_len = 0.0;
   std::vector<long> bins(18, 0);
 
-  // Tetrahedron loop
   for (const auto &t : tets) {
     double vol = calculate_tet_volume(points[t.v0], points[t.v1], points[t.v2],
                                       points[t.v3]);
@@ -347,15 +388,13 @@ void ComputeAndPrintStats_3D(int final_smooth_its,
     }
   }
 
-  // Edge statistics loop
+  // Edge orientation loop
   for (const auto &edge : unique_edges) {
     const Point3D &p1 = points[edge.first];
     const Point3D &p2 = points[edge.second];
     double dx = p2.x - p1.x, dy = p2.y - p1.y, dz = p2.z - p1.z;
     double len = std::sqrt(dx * dx + dy * dy + dz * dz);
     total_edge_len += len;
-
-    // Polar angle [0, 180) from Z-axis
     double angle =
         std::acos(clamp_val_3D(dz / len)) * 180.0 / 3.14159265358979323846;
     int bin = std::min(17, std::max(0, static_cast<int>(angle / 10.0)));
@@ -367,19 +406,37 @@ void ComputeAndPrintStats_3D(int final_smooth_its,
   std::cout << "Iterations: " << final_smooth_its << "\n";
   std::cout << "Points: " << points.size() << " | Tets: " << tets.size()
             << "\n";
-  std::cout << "Volume: Min " << min_vol << " / Max " << max_vol << "\n";
+  std::cout << "Volume: Min " << std::scientific << min_vol << " / Max "
+            << max_vol << "\n";
+  std::cout << std::fixed << std::setprecision(3);
   std::cout << "Dihedral Range: [" << min_angle << ", " << max_angle
             << "] deg\n";
   std::cout << "Avg Edge Length: "
             << (unique_edges.empty() ? 0 : total_edge_len / unique_edges.size())
             << "\n";
 
-  std::cout << "Edge Polar Orientations (10 deg bins):\n";
-  for (int i = 0; i < 18; ++i) {
-    std::cout << "  " << (i * 10) << "-" << ((i + 1) * 10) << ": " << bins[i]
-              << "\n";
+  std::cout << "Connectivity (Vertex Valence - Tets per Vertex):\n";
+  for (auto const &[valence, count] : valence_dist) {
+    double pct = ((double)count / points.size()) * 100.0;
+    std::cout << "  Degree " << std::setw(2) << valence << ": " << std::setw(8)
+              << count << " (" << std::fixed << std::setprecision(2) << pct
+              << "%)\n";
   }
+
+  std::cout << "Edge Polar Orientations (10 deg bins):\n";
+  double total_edges = (double)unique_edges.size();
+  for (int i = 0; i < 18; ++i) {
+    double percentage =
+        (total_edges > 0) ? (bins[i] / total_edges * 100.0) : 0.0;
+    std::cout << "  " << (i * 10) << "-" << ((i + 1) * 10) << ": " << bins[i]
+              << " (" << std::fixed << std::setprecision(1) << percentage
+              << "%)\n";
+  }
+
   std::cout << "=================================\n";
+
+  // Restore old stream state so to not affect downstream test framework prints
+  std::cout.copyfmt(oldState);
 }
 
 // 3D Lloyd-smoothing
@@ -389,73 +446,129 @@ void relax_points_lloyd_3D(std::vector<Point3D> &points,
                            const std::vector<Tetrahedron> &tets,
                            double factor) {
   int n = points.size();
-  // wx, wy, wz:  Volume-Weighted Centroid Accumalators
-  // w_sum: Sum of Weights / Total Area
   std::vector<double> wx(n, 0.0), wy(n, 0.0), wz(n, 0.0), w_sum(n, 0.0);
 
-  for (const auto &tet : tets) {
-    const Point3D &p0 = points[tet.v0];
-    const Point3D &p1 = points[tet.v1];
-    const Point3D &p2 = points[tet.v2];
-    const Point3D &p3 = points[tet.v3];
+  // CSR Setup for fast adjacency lookups
+  std::vector<int> tet_count(n, 0);
+  for (const auto &t : tets) {
+    tet_count[t.v0]++;
+    tet_count[t.v1]++;
+    tet_count[t.v2]++;
+    tet_count[t.v3]++;
+  }
 
-    // Tetrahedron centroid
+  std::vector<int> tet_offset(n + 1, 0);
+  for (int i = 0; i < n; ++i) {
+    tet_offset[i + 1] = tet_offset[i] + tet_count[i];
+  }
+
+  std::vector<int> tet_data(tet_offset[n]);
+  std::fill(tet_count.begin(), tet_count.end(), 0);
+
+  // Accumulate centroids and build CSR data
+  for (size_t k = 0; k < tets.size(); ++k) {
+    const auto &t = tets[k];
+    const Point3D &p0 = points[t.v0];
+    const Point3D &p1 = points[t.v1];
+    const Point3D &p2 = points[t.v2];
+    const Point3D &p3 = points[t.v3];
+
     double cx = (p0.x + p1.x + p2.x + p3.x) * 0.25;
     double cy = (p0.y + p1.y + p2.y + p3.y) * 0.25;
     double cz = (p0.z + p1.z + p2.z + p3.z) * 0.25;
-
     double vol = calculate_tet_volume(p0, p1, p2, p3);
 
-    int v[4] = {tet.v0, tet.v1, tet.v2, tet.v3};
+    int v[4] = {t.v0, t.v1, t.v2, t.v3};
     for (int i = 0; i < 4; ++i) {
       wx[v[i]] += vol * cx;
       wy[v[i]] += vol * cy;
       wz[v[i]] += vol * cz;
       w_sum[v[i]] += vol;
+      tet_data[tet_offset[v[i]] + tet_count[v[i]]++] = k;
     }
   }
 
+  std::vector<double> candidate_factors = {0.1, 0.3, 0.5, 0.7, 0.9};
+
+  // Relax with inversion safety
   for (int i = 0; i < n; ++i) {
     if (w_sum[i] < 1e-12)
-      continue; // Skip zero-volume anomalies
+      continue;
 
-    // Target Centroid Coordinates
-    // I.e. the volume-weighted average centroid
-    // of the Vornoi cells surrounding vertex i
     double tx = wx[i] / w_sum[i];
     double ty = wy[i] / w_sum[i];
     double tz = wz[i] / w_sum[i];
 
-    // Final displacements vectors (prior to applying boundary constraints)
-    double dx = (tx - points[i].x) * factor;
-    double dy = (ty - points[i].y) * factor;
-    double dz = (tz - points[i].z) * factor;
+    // Scale the full displacement by the provided factor
+    double full_dx = (tx - points[i].x) * factor;
+    double full_dy = (ty - points[i].y) * factor;
+    double full_dz = (tz - points[i].z) * factor;
 
-    Point3D temp_p = points[i];
-    bool was_boundary = apply_boundary_constraint_3D(temp_p, dx, dy, dz);
+    int start = tet_offset[i];
+    int end = tet_offset[i + 1];
 
-    temp_p.x += dx;
-    temp_p.y += dy;
-    temp_p.z += dz;
+    Point3D best_candidate = points[i];
+    double best_min_vol = -1.0;
 
-    if (!was_boundary) {
-      keep_interior_point_inside_3D(temp_p);
-    } else {
-      // Strict clamp to prevent float drift on boundaries
-      if (temp_p.x < 0)
-        temp_p.x = 0;
-      if (temp_p.x > DOMAIN_WIDTH)
-        temp_p.x = DOMAIN_WIDTH;
-      if (temp_p.y < 0)
-        temp_p.y = 0;
-      if (temp_p.y > DOMAIN_HEIGHT)
-        temp_p.y = DOMAIN_HEIGHT;
-      if (temp_p.z < 0)
-        temp_p.z = 0;
-      if (temp_p.z > DOMAIN_DEPTH)
-        temp_p.z = DOMAIN_DEPTH;
+    // Find the baseline minimum volume before moving
+    for (int j = start; j < end; ++j) {
+      const auto &t = tets[tet_data[j]];
+      double v = calculate_signed_tet_volume(points[t.v0], points[t.v1],
+                                             points[t.v2], points[t.v3]);
+      if (best_min_vol < 0 || v < best_min_vol)
+        best_min_vol = v;
     }
-    points[i] = temp_p;
+
+    for (double cf : candidate_factors) {
+      Point3D candidate = points[i];
+      double dx = full_dx * cf;
+      double dy = full_dy * cf;
+      double dz = full_dz * cf;
+
+      bool was_boundary = apply_boundary_constraint_3D(candidate, dx, dy, dz);
+      candidate.x += dx;
+      candidate.y += dy;
+      candidate.z += dz;
+
+      if (!was_boundary)
+        keep_interior_point_inside_3D(candidate);
+      else {
+        if (candidate.x < 0)
+          candidate.x = 0;
+        if (candidate.x > DOMAIN_WIDTH)
+          candidate.x = DOMAIN_WIDTH;
+        if (candidate.y < 0)
+          candidate.y = 0;
+        if (candidate.y > DOMAIN_HEIGHT)
+          candidate.y = DOMAIN_HEIGHT;
+        if (candidate.z < 0)
+          candidate.z = 0;
+        if (candidate.z > DOMAIN_DEPTH)
+          candidate.z = DOMAIN_DEPTH;
+      }
+
+      // Test candidate against all connected tets
+      double candidate_min_vol = 1e30;
+      for (int j = start; j < end; ++j) {
+        const auto &t = tets[tet_data[j]];
+        Point3D p0 = (t.v0 == i) ? candidate : points[t.v0];
+        Point3D p1 = (t.v1 == i) ? candidate : points[t.v1];
+        Point3D p2 = (t.v2 == i) ? candidate : points[t.v2];
+        Point3D p3 = (t.v3 == i) ? candidate : points[t.v3];
+
+        double v = calculate_signed_tet_volume(p0, p1, p2, p3);
+        if (v < candidate_min_vol)
+          candidate_min_vol = v;
+      }
+
+      // Only accept the move if it doesn't invert elements (or dramatically
+      // worsen them)
+      if (candidate_min_vol > 0.0 && candidate_min_vol >= best_min_vol * 0.5) {
+        best_min_vol = candidate_min_vol;
+        best_candidate = candidate;
+      }
+    }
+    points[i] = best_candidate;
   }
 }
 
@@ -467,6 +580,8 @@ void relax_points_spring_3D(std::vector<Point3D> &points,
   std::vector<double> force_x(n, 0.0), force_y(n, 0.0), force_z(n, 0.0);
   std::vector<int> valence(n, 0);
 
+  // Gather all unique edges across the entire mesh connectivity
+  std::set<std::pair<int, int>> unique_edges;
   // 6 edges per tetrahedron
   int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
 
@@ -475,36 +590,46 @@ void relax_points_spring_3D(std::vector<Point3D> &points,
     for (int e = 0; e < 6; ++e) {
       int idx1 = v[edge_pairs[e][0]];
       int idx2 = v[edge_pairs[e][1]];
-
-      double dx = points[idx2].x - points[idx1].x;
-      double dy = points[idx2].y - points[idx1].y;
-      double dz = points[idx2].z - points[idx1].z;
-      double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-
-      if (dist < 1e-14)
-        continue;
-
-      double force_mag = (dist - TARGET_EDGE_LENGTH);
-
-      double nx = dx / dist;
-      double ny = dy / dist;
-      double nz = dz / dist;
-
-      double fx = force_mag * nx;
-      double fy = force_mag * ny;
-      double fz = force_mag * nz;
-
-      force_x[idx1] += fx;
-      force_y[idx1] += fy;
-      force_z[idx1] += fz;
-      force_x[idx2] -= fx;
-      force_y[idx2] -= fy;
-      force_z[idx2] -= fz;
-      valence[idx1]++;
-      valence[idx2]++;
+      unique_edges.insert({std::min(idx1, idx2), std::max(idx1, idx2)});
     }
   }
 
+  // Compute physics uniquely per edge
+  for (const auto &edge : unique_edges) {
+    int idx1 = edge.first;
+    int idx2 = edge.second;
+
+    double dx = points[idx2].x - points[idx1].x;
+    double dy = points[idx2].y - points[idx1].y;
+    double dz = points[idx2].z - points[idx1].z;
+    double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+    if (dist < 1e-14)
+      continue;
+
+    double force_mag = (dist - TARGET_EDGE_LENGTH);
+
+    double nx = dx / dist;
+    double ny = dy / dist;
+    double nz = dz / dist;
+
+    double fx = force_mag * nx;
+    double fy = force_mag * ny;
+    double fz = force_mag * nz;
+
+    force_x[idx1] += fx;
+    force_y[idx1] += fy;
+    force_z[idx1] += fz;
+
+    force_x[idx2] -= fx;
+    force_y[idx2] -= fy;
+    force_z[idx2] -= fz;
+
+    valence[idx1]++;
+    valence[idx2]++;
+  }
+
+  // Integrate forces and update coordinates
   for (int i = 0; i < n; ++i) {
     if (valence[i] == 0)
       continue;
@@ -561,7 +686,7 @@ void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud,
 
   // C++ interface
   tetgenbehavior behavior;
-  char switches[] = "Q";
+  char switches[] = "Qz";
   behavior.parse_commandline(switches);
   tetrahedralize(&behavior, &in, &out, nullptr, nullptr);
 
@@ -577,12 +702,19 @@ void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud,
     out_tetrahedra.push_back(tet);
   }
 
-  // delete[] in.pointlist;
+  if (out.numberofpoints != in.numberofpoints) {
+    std::cerr
+        << "Fatal: TetGen dropped/merged points! Output indices desynced.\n";
+    std::exit(EXIT_FAILURE);
+  }
+
+  delete[] in.pointlist;
+  in.pointlist = nullptr;
 }
 
 std::vector<Point3D> GenerateMesh3D(int dim_x, int dim_y, int dim_z,
                                     double factor, double dt) {
-  double pad = TARGET_EDGE_LENGTH * 4.0; // arbitrary halo padding for testing
+  double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITS + 8);
   std::unordered_map<uint64_t, Point3D> global_point_map;
 
   // Initial Cloud Generation

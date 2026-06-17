@@ -23,8 +23,8 @@ else
 endif
 
 # Build modes
-DEBUG_FLAGS   := -O0 -g -Wall -Wextra -std=c++11 -fsanitize=address,undefined
-RELEASE_FLAGS := -O3 -Wall -Wextra -std=c++11
+DEBUG_FLAGS   := -O0 -g -Wall -Wextra -std=c++17 -fsanitize=address,undefined
+RELEASE_FLAGS := -O3 -Wall -Wextra -std=c++17
 
 # Default mode (release)
 MODE ?= release

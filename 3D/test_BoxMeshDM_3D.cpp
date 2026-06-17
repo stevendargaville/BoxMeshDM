@@ -209,7 +209,7 @@ void TestSmoothingConvergence() {
   ComputeAndPrintStats_3D(0, points, tets);
 
   // Run iterations of smoothing
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < 20; ++i) {
     relax_points_lloyd_3D(points, tets, 0.5);
     relax_points_spring_3D(points, tets, 0.2);
     TetrahedralizePointCloud(points, tets);
@@ -241,9 +241,9 @@ void TestNonUnitDomain() {
   std::cout << "Running TestNonUnitDomain...\n";
 
   // Set non-unit globals
-  DOMAIN_WIDTH = 2.0;
-  DOMAIN_HEIGHT = 1.0;
-  DOMAIN_DEPTH = 0.5;
+  DOMAIN_WIDTH = 4.0;
+  DOMAIN_HEIGHT = 3.0;
+  DOMAIN_DEPTH = 2.0;
 
   std::vector<Point3D> points = GenerateMesh3D(4, 2, 1);
   std::vector<Tetrahedron> tets;
@@ -257,8 +257,11 @@ void TestNonUnitDomain() {
 
   ValidateMeshQuality(points, tets);
 
-  // Write out VTU as requested
-  WriteTetrahedralMeshVTU(points, tets, "non_unit_domain.vtu", MPI_COMM_SELF);
+  // Write out VTU
+  std::string filename = "domain_" + std::to_string((int)DOMAIN_WIDTH) + "x" +
+                         std::to_string((int)DOMAIN_HEIGHT) + "x" +
+                         std::to_string((int)DOMAIN_DEPTH) + ".vtu";
+  WriteTetrahedralMeshVTU(points, tets, filename, MPI_COMM_SELF);
 
   // Reset globals for any tests that might theoretically follow
   DOMAIN_WIDTH = 1.0;
