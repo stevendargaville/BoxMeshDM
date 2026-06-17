@@ -25,9 +25,8 @@ struct Tetrahedron {
 };
 
 // Generates the new serial halo-decomposed point cloud
-std::vector<Point3D> GenerateMesh3D_Serial(int dim_x, int dim_y, int dim_z,
-                                           double factor = 0.5,
-                                           double dt = 0.2);
+std::vector<Point3D> GenerateMesh3D(int dim_x, int dim_y, int dim_z,
+                                    double factor = 0.5, double dt = 0.2);
 
 // Computes pure 3D Delaunay tetrahedralization of a point cloud
 void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud,
@@ -52,5 +51,12 @@ void relax_points_lloyd_3D(std::vector<Point3D> &points,
 void relax_points_spring_3D(std::vector<Point3D> &points,
                             const std::vector<Tetrahedron> &tets,
                             double dt = 0.2);
+
+void ComputeAndPrintStats_3D(int final_smooth_its,
+                             const std::vector<Point3D> &points,
+                             const std::vector<Tetrahedron> &tets);
+
+double calculate_tet_volume(const Point3D &p0, const Point3D &p1,
+                            const Point3D &p2, const Point3D &p3);
 
 #endif // TET_MESH_GEN_H

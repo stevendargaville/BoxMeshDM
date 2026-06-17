@@ -1,7 +1,11 @@
 #include "BoxMeshDM_3D.h"
 #include "tetgen.h"
+#include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <iostream>
 #include <petscdmplex.h>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -140,9 +144,9 @@ void apply_jitter_3D(std::vector<Point3D> &points, double amount, int iter) {
   }
 }
 
-std::vector<Point3D> process_tile_3D_serial(int tile_x, int tile_y, int tile_z,
-                                            int dim_x, int dim_y, int dim_z,
-                                            double pad) {
+std::vector<Point3D> process_tile_3D(int tile_x, int tile_y, int tile_z,
+                                     int dim_x, int dim_y, int dim_z,
+                                     double pad) {
   double tile_s_x = DOMAIN_WIDTH / dim_x;
   double tile_s_y = DOMAIN_HEIGHT / dim_y;
   double tile_s_z = DOMAIN_DEPTH / dim_z;
@@ -244,15 +248,138 @@ std::vector<Point3D> process_tile_3D_serial(int tile_x, int tile_y, int tile_z,
 }
 
 // Calculates the volume of a tetrahedron
-double tet_volume(const Point3D &p0, const Point3D &p1, const Point3D &p2,
-                  const Point3D &p3) {
-  double v0x = p1.x - p0.x, v0y = p1.y - p0.y, v0z = p1.z - p0.z;
-  double v1x = p2.x - p0.x, v1y = p2.y - p0.y, v1z = p2.z - p0.z;
-  double v2x = p3.x - p0.x, v2y = p3.y - p0.y, v2z = p3.z - p0.z;
-  return std::abs(v0x * (v1y * v2z - v1z * v2y) -
-                  v0y * (v1x * v2z - v1z * v2x) +
-                  v0z * (v1x * v2y - v1y * v2x)) /
-         6.0;
+double calculate_tet_volume(const Point3D &p0, const Point3D &p1,
+                            const Point3D &p2, const Point3D &p3) {
+  // Volume = 1/6 * |(p1-p0) . ((p2-p0) x (p3-p0))|
+  double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
+  double v2x = p2.x - p0.x, v2y = p2.y - p0.y, v2z = p2.z - p0.z;
+  double v3x = p3.x - p0.x, v3y = p3.y - p0.y, v3z = p3.z - p0.z;
+
+  // Cross product (p2-p0) x (p3-p0)
+  double cx = v2y * v3z - v2z * v3y;
+  double cy = v2z * v3x - v2x * v3z;
+  double cz = v2x * v3y - v2y * v3x;
+
+  // Dot product with (p1-p0)
+  double det = std::abs(v1x * cx + v1y * cy + v1z * cz);
+  return det / 6.0;
+}
+
+// Clamps to prevent acos domain errors
+static double clamp_val_3D(double v) {
+  return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v);
+}
+
+// Calculate the dihedral angles of a given tetrahedron
+static void get_tet_dihedral_angles(const Point3D &p0, const Point3D &p1,
+                                    const Point3D &p2, const Point3D &p3,
+                                    double angles[6]) {
+  auto normal = [](const Point3D &a, const Point3D &b, const Point3D &c) {
+    double ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+    double vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+    return Point3D(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
+  };
+
+  Point3D n[4] = {normal(p1, p2, p3), normal(p0, p3, p2), normal(p0, p1, p3),
+                  normal(p0, p2, p1)};
+
+  auto mag = [](const Point3D &vec) {
+    return std::sqrt(vec.x * vec.x + vec.y * vec.y + vec.z * vec.z);
+  };
+  auto dot = [](const Point3D &a, const Point3D &b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+  };
+
+  int idx = 0;
+  for (int i = 0; i < 3; ++i) {
+    for (int j = i + 1; j < 4; ++j) {
+      double m1 = mag(n[i]), m2 = mag(n[j]);
+      if (m1 < 1e-14 || m2 < 1e-14) {
+        angles[idx++] = 0.0;
+        continue;
+      }
+      double cos_theta = dot(n[i], n[j]) / (m1 * m2);
+      angles[idx++] =
+          std::acos(clamp_val_3D(-cos_theta)) * 180.0 / 3.14159265358979323846;
+    }
+  }
+}
+
+void ComputeAndPrintStats_3D(int final_smooth_its,
+                             const std::vector<Point3D> &points,
+                             const std::vector<Tetrahedron> &tets) {
+
+  // Connectivity and Unique Edges
+  std::vector<int> valence(points.size(), 0);
+  std::set<std::pair<int, int>> unique_edges;
+  int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
+
+  for (const auto &t : tets) {
+    int v[4] = {t.v0, t.v1, t.v2, t.v3};
+    for (auto &pair : edge_pairs) {
+      int i1 = v[pair[0]];
+      int i2 = v[pair[1]];
+      valence[i1]++;
+      valence[i2]++;
+      unique_edges.insert({std::min(i1, i2), std::max(i1, i2)});
+    }
+  }
+
+  // Statistics Calculation
+  double min_vol = 1e30, max_vol = -1.0;
+  double min_angle = 360.0, max_angle = -1.0;
+  double total_edge_len = 0.0;
+  std::vector<long> bins(18, 0);
+
+  // Tetrahedron loop
+  for (const auto &t : tets) {
+    double vol = calculate_tet_volume(points[t.v0], points[t.v1], points[t.v2],
+                                      points[t.v3]);
+    min_vol = std::min(min_vol, vol);
+    max_vol = std::max(max_vol, vol);
+
+    double dihedrals[6];
+    get_tet_dihedral_angles(points[t.v0], points[t.v1], points[t.v2],
+                            points[t.v3], dihedrals);
+    for (double a : dihedrals) {
+      min_angle = std::min(min_angle, a);
+      max_angle = std::max(max_angle, a);
+    }
+  }
+
+  // Edge statistics loop
+  for (const auto &edge : unique_edges) {
+    const Point3D &p1 = points[edge.first];
+    const Point3D &p2 = points[edge.second];
+    double dx = p2.x - p1.x, dy = p2.y - p1.y, dz = p2.z - p1.z;
+    double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    total_edge_len += len;
+
+    // Polar angle [0, 180) from Z-axis
+    double angle =
+        std::acos(clamp_val_3D(dz / len)) * 180.0 / 3.14159265358979323846;
+    int bin = std::min(17, std::max(0, static_cast<int>(angle / 10.0)));
+    bins[bin]++;
+  }
+
+  // Final Print
+  std::cout << "\n=== Serial 3D Mesh Statistics ===\n";
+  std::cout << "Iterations: " << final_smooth_its << "\n";
+  std::cout << "Points: " << points.size() << " | Tets: " << tets.size()
+            << "\n";
+  std::cout << "Volume: Min " << min_vol << " / Max " << max_vol << "\n";
+  std::cout << "Dihedral Range: [" << min_angle << ", " << max_angle
+            << "] deg\n";
+  std::cout << "Avg Edge Length: "
+            << (unique_edges.empty() ? 0 : total_edge_len / unique_edges.size())
+            << "\n";
+
+  std::cout << "Edge Polar Orientations (10 deg bins):\n";
+  for (int i = 0; i < 18; ++i) {
+    std::cout << "  " << (i * 10) << "-" << ((i + 1) * 10) << ": " << bins[i]
+              << "\n";
+  }
+  std::cout << "=================================\n";
 }
 
 // 3D Lloyd-smoothing
@@ -277,7 +404,7 @@ void relax_points_lloyd_3D(std::vector<Point3D> &points,
     double cy = (p0.y + p1.y + p2.y + p3.y) * 0.25;
     double cz = (p0.z + p1.z + p2.z + p3.z) * 0.25;
 
-    double vol = tet_volume(p0, p1, p2, p3);
+    double vol = calculate_tet_volume(p0, p1, p2, p3);
 
     int v[4] = {tet.v0, tet.v1, tet.v2, tet.v3};
     for (int i = 0; i < 4; ++i) {
@@ -453,8 +580,8 @@ void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud,
   // delete[] in.pointlist;
 }
 
-std::vector<Point3D> GenerateMesh3D_Serial(int dim_x, int dim_y, int dim_z,
-                                           double factor, double dt) {
+std::vector<Point3D> GenerateMesh3D(int dim_x, int dim_y, int dim_z,
+                                    double factor, double dt) {
   double pad = TARGET_EDGE_LENGTH * 4.0; // arbitrary halo padding for testing
   std::unordered_map<uint64_t, Point3D> global_point_map;
 
@@ -463,7 +590,7 @@ std::vector<Point3D> GenerateMesh3D_Serial(int dim_x, int dim_y, int dim_z,
     for (int ty = 0; ty < dim_y; ++ty) {
       for (int tx = 0; tx < dim_x; ++tx) {
         std::vector<Point3D> tile_points =
-            process_tile_3D_serial(tx, ty, tz, dim_x, dim_y, dim_z, pad);
+            process_tile_3D(tx, ty, tz, dim_x, dim_y, dim_z, pad);
 
         // Merge tile points into global map to filter out halo duplicates
         for (const auto &p : tile_points) {
