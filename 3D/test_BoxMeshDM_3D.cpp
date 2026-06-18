@@ -141,7 +141,8 @@ void TestParallelMeshGeneration(int rank, int size) {
     ValidateMeshQualityAndPrint(PETSC_COMM_WORLD, 20, cloud, tets);
 
     // Save final output
-    WriteTestVTU(PETSC_COMM_WORLD, cloud, tets, "parallel_mesh_output.vtu");
+    EnsureOutputDirectory("test_outputs");
+    WriteTestVTU(PETSC_COMM_WORLD, cloud, tets, "test_outputs/parallel_mesh_output_" + std::to_string(size) + "_ranks.vtu");
 
     if (rank == 0)
         std::cout << "TestParallelMeshGeneration Passed! Dumped 'parallel_mesh_output.vtu'\n\n";
@@ -307,20 +308,22 @@ void TestExplicitSmoothingVisuals(int rank, int size) {
         }
     }
 
+    EnsureOutputDirectory("test_outputs");
+
     TetrahedralizePointCloud(points, tets);
-    WriteTestVTU(PETSC_COMM_WORLD, points, tets, "visual_01_noisy_" + std::to_string(size) + "_ranks.vtu");
+    WriteTestVTU(PETSC_COMM_WORLD, points, tets, "test_outputs/visual_01_noisy_" + std::to_string(size) + "_ranks.vtu");
     if (rank == 0)
         std::cout << "-> Dumped visual_01_noisy.vtu\n";
 
     relax_points_lloyd_3D(points, tets, 0.5);
     TetrahedralizePointCloud(points, tets);
-    WriteTestVTU(PETSC_COMM_WORLD, points, tets, "visual_02_lloyd_" + std::to_string(size) + "_ranks.vtu");
+    WriteTestVTU(PETSC_COMM_WORLD, points, tets, "test_outputs/visual_02_lloyd_" + std::to_string(size) + "_ranks.vtu");
     if (rank == 0)
         std::cout << "-> Dumped visual_02_lloyd.vtu\n";
 
     relax_points_spring_3D(points, tets, 0.2);
     TetrahedralizePointCloud(points, tets);
-    WriteTestVTU(PETSC_COMM_WORLD, points, tets, "visual_03_spring_" + std::to_string(size) + "_ranks.vtu");
+    WriteTestVTU(PETSC_COMM_WORLD, points, tets, "test_outputs/visual_03_spring_" + std::to_string(size) + "_ranks.vtu");
     if (rank == 0)
         std::cout << "-> Dumped visual_03_spring.vtu\n";
 
@@ -340,7 +343,8 @@ void TestHighResolutionMesh(int rank, int size) {
     TetrahedralizePointCloud(points, tets);
 
     // Export the high-res mesh
-    WriteTestVTU(PETSC_COMM_WORLD, points, tets, "high_res_mesh_output_" + std::to_string(size) + "_ranks.vtu");
+    EnsureOutputDirectory("test_outputs");
+    WriteTestVTU(PETSC_COMM_WORLD, points, tets, "test_outputs/high_res_mesh_output_" + std::to_string(size) + "_ranks.vtu");
 
     if (rank == 0) {
         std::cout << "-> High-Res Mesh Stats:\n";
