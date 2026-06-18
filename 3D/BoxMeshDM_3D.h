@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <mpi.h>
+#include <petscdm.h>
 #include <string>
 #include <vector>
 
@@ -12,51 +13,44 @@ extern double DOMAIN_DEPTH;
 extern double TARGET_EDGE_LENGTH;
 
 struct Point3D {
-  double x, y, z;
-  uint64_t unique_hash_id = 0;
+    double x, y, z;
+    uint64_t unique_hash_id = 0;
 
-  Point3D() : x(0), y(0), z(0), unique_hash_id(0) {}
-  Point3D(double x_, double y_, double z_, uint64_t id = 0)
-      : x(x_), y(y_), z(z_), unique_hash_id(id) {}
+    Point3D() : x(0), y(0), z(0), unique_hash_id(0) {}
+    Point3D(double x_, double y_, double z_, uint64_t id = 0) : x(x_), y(y_), z(z_), unique_hash_id(id) {}
 };
 
 struct Tetrahedron {
-  int v0, v1, v2, v3;
+    int v0, v1, v2, v3;
 };
 
-// Generates the new serial halo-decomposed point cloud
-std::vector<Point3D> GenerateMesh3D(int dim_x, int dim_y, int dim_z,
-                                    double factor = 0.5, double dt = 0.2);
+// Generates the distributed point cloud
+std::vector<Point3D> GenerateMesh3D(int dim_x, int dim_y, int dim_z, double factor = 0.5, double dt = 0.2);
 
 // Computes pure 3D Delaunay tetrahedralization of a point cloud
-void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud,
-                              std::vector<Tetrahedron> &out_tetrahedra);
+void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud, std::vector<Tetrahedron> &out_tetrahedra);
 
 // Generates a structured 3D grid of points
-std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz,
-                                            double spacing);
+std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz, double spacing);
+
+// Decoupled PETSc DMPlex generator for unit testing topology
+DM CreateDMPlex3D(const std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, MPI_Comm comm);
 
 // Writes tetrahedral mesh to VTU file (unstructured grid)
-void WriteTetrahedralMeshVTU(const std::vector<Point3D> &points,
-                             const std::vector<Tetrahedron> &tets,
-                             const std::string &filename,
-                             MPI_Comm comm = MPI_COMM_SELF);
+void WriteTetrahedralMeshVTU(DM dm, const std::string &filename, MPI_Comm comm);
 
 // Lloyd-smoothing: Moves vertices towards the volume-weighted centroid
-void relax_points_lloyd_3D(std::vector<Point3D> &points,
-                           const std::vector<Tetrahedron> &tets,
-                           double factor = 0.5);
+void relax_points_lloyd_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double factor = 0.5);
 
 // Spring-Force Relaxation: Attempts to equalize all edges to TARGET_EDGE_LENGTH
-void relax_points_spring_3D(std::vector<Point3D> &points,
-                            const std::vector<Tetrahedron> &tets,
-                            double dt = 0.2);
+void relax_points_spring_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double dt = 0.2);
 
-void ComputeAndPrintStats_3D(int final_smooth_its,
-                             const std::vector<Point3D> &points,
+void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vector<Point3D> &points,
                              const std::vector<Tetrahedron> &tets);
 
-double calculate_tet_volume(const Point3D &p0, const Point3D &p1,
-                            const Point3D &p2, const Point3D &p3);
+double calculate_tet_volume(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3);
+
+// Exposed for direct boundary condition coverage tracking
+bool apply_boundary_constraint_3D(Point3D &p, double &dx, double &dy, double &dz);
 
 #endif // TET_MESH_GEN_H
