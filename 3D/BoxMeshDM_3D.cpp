@@ -8,14 +8,20 @@
 #include <iostream>
 #include <mpi.h>
 #include <petscdmplex.h>
+#include <petscsf.h>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 const double EPSILON = 1e-13;
 const double START_JITTER = 0.30;
 const int ANNEAL_ITERS = 3;
-const int FINAL_SMOOTH_ITS = 20;
+
+static int TILE_DIM_X = 1;
+static int TILE_DIM_Y = 1;
+static int TILE_DIM_Z = 1;
+
 double DOMAIN_WIDTH = 1.0;
 double DOMAIN_HEIGHT = 1.0;
 double DOMAIN_DEPTH = 1.0;
@@ -37,6 +43,220 @@ uint64_t splitmix64_3D(uint64_t &x) {
 }
 
 double next_double_3D(uint64_t &state) { return (splitmix64_3D(state) >> 11) * (1.0 / 9007199254740992.0); }
+
+// Determines which rank owns a point based on spatial location in 3D
+int get_owner_rank_3D(const Point3D &p) {
+    double tile_s_x = DOMAIN_WIDTH / TILE_DIM_X;
+    double tile_s_y = DOMAIN_HEIGHT / TILE_DIM_Y;
+    double tile_s_z = DOMAIN_DEPTH / TILE_DIM_Z;
+
+    int tx = std::floor(p.x / tile_s_x);
+    int ty = std::floor(p.y / tile_s_y);
+    int tz = std::floor(p.z / tile_s_z);
+
+    if (tx < 0)
+        tx = 0;
+    if (tx >= TILE_DIM_X)
+        tx = TILE_DIM_X - 1;
+    if (ty < 0)
+        ty = 0;
+    if (ty >= TILE_DIM_Y)
+        ty = TILE_DIM_Y - 1;
+    if (tz < 0)
+        tz = 0;
+    if (tz >= TILE_DIM_Z)
+        tz = TILE_DIM_Z - 1;
+
+    return (tz * TILE_DIM_Y * TILE_DIM_X) + (ty * TILE_DIM_X) + tx;
+}
+
+// Clamps to prevent acos domain errors
+static double clamp_val_3D(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
+
+// Calculates the dihedral angles of a given tetrahedron
+static void get_tet_dihedral_angles(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3,
+                                    double angles[6]) {
+    auto normal = [](const Point3D &a, const Point3D &b, const Point3D &c) {
+        double ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+        double vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+        return Point3D(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
+    };
+
+    Point3D n[4] = {normal(p1, p2, p3), normal(p0, p3, p2), normal(p0, p1, p3), normal(p0, p2, p1)};
+
+    auto mag = [](const Point3D &vec) { return std::sqrt(vec.x * vec.x + vec.y * vec.y + vec.z * vec.z); };
+    auto dot = [](const Point3D &a, const Point3D &b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+
+    int idx = 0;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+            double m1 = mag(n[i]), m2 = mag(n[j]);
+            if (m1 < 1e-14 || m2 < 1e-14) {
+                angles[idx++] = 0.0;
+                continue;
+            }
+            double cos_theta = dot(n[i], n[j]) / (m1 * m2);
+            angles[idx++] = std::acos(clamp_val_3D(-cos_theta)) * 180.0 / 3.14159265358979323846;
+        }
+    }
+}
+
+static double get_min_dihedral(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3) {
+    double angles[6];
+    get_tet_dihedral_angles(p0, p1, p2, p3, angles);
+    double min_a = 360.0;
+    for (int i = 0; i < 6; ++i) {
+        if (angles[i] < min_a)
+            min_a = angles[i];
+    }
+    return min_a;
+}
+
+// Deterministically resolve ownership of boundary nodes via MPI
+static void ResolveBoundaryOwnership_3D(MPI_Comm comm, std::vector<Point3D> &points, double min_x, double min_y, double min_z,
+                                        double max_x, double max_y, double max_z, double interior_min_x, double interior_min_y,
+                                        double interior_min_z, double interior_max_x, double interior_max_y,
+                                        double interior_max_z, double pad) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    struct Claim3D {
+        uint64_t id;
+        int geo_rank;
+        double x, y, z;
+    };
+
+    MPI_Datatype MPI_CLAIM_3D;
+    {
+        int blocklengths[4] = {1, 1, 3};
+        MPI_Aint displacements[3];
+        MPI_Datatype types[3] = {MPI_UINT64_T, MPI_INT, MPI_DOUBLE};
+
+        Claim3D dummy;
+        MPI_Aint base_addr;
+        MPI_Get_address(&dummy, &base_addr);
+        MPI_Get_address(&dummy.id, &displacements[0]);
+        MPI_Get_address(&dummy.geo_rank, &displacements[1]);
+        MPI_Get_address(&dummy.x, &displacements[2]);
+
+        for (int i = 0; i < 3; i++)
+            displacements[i] -= base_addr;
+
+        MPI_Type_create_struct(3, blocklengths, displacements, types, &MPI_CLAIM_3D);
+        MPI_Type_commit(&MPI_CLAIM_3D);
+    }
+
+    std::vector<std::vector<Claim3D>> send_buffers(size);
+    std::unordered_set<uint64_t> involved_ids;
+
+    int tx = rank % TILE_DIM_X;
+    int ty = (rank / TILE_DIM_X) % TILE_DIM_Y;
+    int tz = rank / (TILE_DIM_X * TILE_DIM_Y);
+
+    for (auto &p : points) {
+        if (p.x > min_x && p.x < max_x && p.y > min_y && p.y < max_y && p.z > min_z && p.z < max_z &&
+            (p.x <= interior_min_x || p.x >= interior_max_x || p.y <= interior_min_y || p.y >= interior_max_y ||
+             p.z <= interior_min_z || p.z >= interior_max_z)) {
+
+            involved_ids.insert(p.unique_hash_id);
+            int my_geo_rank = get_owner_rank_3D(p);
+
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0 && dz == 0)
+                            continue;
+                        int nx = tx + dx;
+                        int ny = ty + dy;
+                        int nz = tz + dz;
+                        if (nx >= 0 && nx < TILE_DIM_X && ny >= 0 && ny < TILE_DIM_Y && nz >= 0 && nz < TILE_DIM_Z) {
+                            double tile_s_x = DOMAIN_WIDTH / TILE_DIM_X;
+                            double tile_s_y = DOMAIN_HEIGHT / TILE_DIM_Y;
+                            double tile_s_z = DOMAIN_DEPTH / TILE_DIM_Z;
+
+                            double n_min_x = nx * tile_s_x;
+                            double n_max_x = (nx + 1) * tile_s_x;
+                            double n_min_y = ny * tile_s_y;
+                            double n_max_y = (ny + 1) * tile_s_y;
+                            double n_min_z = nz * tile_s_z;
+                            double n_max_z = (nz + 1) * tile_s_z;
+                            double safe_pad = pad * 1.2;
+
+                            if (p.x >= n_min_x - safe_pad && p.x <= n_max_x + safe_pad && p.y >= n_min_y - safe_pad &&
+                                p.y <= n_max_y + safe_pad && p.z >= n_min_z - safe_pad && p.z <= n_max_z + safe_pad) {
+                                int n_rank = (nz * TILE_DIM_Y * TILE_DIM_X) + (ny * TILE_DIM_X) + nx;
+                                send_buffers[n_rank].push_back({p.unique_hash_id, my_geo_rank, p.x, p.y, p.z});
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<int> send_counts(size), recv_counts(size);
+    for (int r = 0; r < size; ++r)
+        send_counts[r] = send_buffers[r].size();
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+
+    std::vector<std::vector<Claim3D>> recv_buffers(size);
+    std::vector<MPI_Request> requests;
+
+    for (int r = 0; r < size; ++r) {
+        if (recv_counts[r] > 0) {
+            recv_buffers[r].resize(recv_counts[r]);
+            MPI_Irecv(recv_buffers[r].data(), recv_counts[r], MPI_CLAIM_3D, r, 999, comm, &requests.emplace_back());
+        }
+    }
+    for (int r = 0; r < size; ++r) {
+        if (send_counts[r] > 0) {
+            MPI_Isend(send_buffers[r].data(), send_counts[r], MPI_CLAIM_3D, r, 999, comm, &requests.emplace_back());
+        }
+    }
+    if (!requests.empty())
+        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+
+    MPI_Type_free(&MPI_CLAIM_3D);
+
+    struct ResolutionData {
+        int best_rank = 999999;
+        double best_x = 0, best_y = 0, best_z = 0;
+    };
+    std::unordered_map<uint64_t, ResolutionData> resolution_map;
+
+    for (const auto &p : points) {
+        if (involved_ids.count(p.unique_hash_id)) {
+            auto &data = resolution_map[p.unique_hash_id];
+            data.best_rank = rank;
+            data.best_x = p.x;
+            data.best_y = p.y;
+            data.best_z = p.z;
+        }
+    }
+
+    for (int r = 0; r < size; ++r) {
+        for (const auto &claim : recv_buffers[r]) {
+            involved_ids.insert(claim.id);
+            auto &data = resolution_map[claim.id];
+            if (r < data.best_rank) {
+                data.best_rank = r;
+                data.best_x = claim.x;
+                data.best_y = claim.y;
+                data.best_z = claim.z;
+            }
+        }
+    }
+
+    for (auto &p : points) {
+        if (involved_ids.count(p.unique_hash_id)) {
+            const auto &data = resolution_map[p.unique_hash_id];
+            p.x = data.best_x;
+            p.y = data.best_y;
+            p.z = data.best_z;
+        }
+    }
+}
 
 bool apply_boundary_constraint_3D(Point3D &p, double &dx, double &dy, double &dz) {
     bool on_boundary = false;
@@ -143,97 +363,37 @@ void apply_jitter_3D(std::vector<Point3D> &points, double amount, int iter) {
     }
 }
 
-std::vector<Point3D> process_tile_3D(int tile_x, int tile_y, int tile_z, int dim_x, int dim_y, int dim_z, double pad) {
-    double tile_s_x = DOMAIN_WIDTH / dim_x;
-    double tile_s_y = DOMAIN_HEIGHT / dim_y;
-    double tile_s_z = DOMAIN_DEPTH / dim_z;
+// Tetrahedralizes a point cloud using TetGen
+void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud, std::vector<Tetrahedron> &out_tetrahedra) {
+    tetgenio in, out;
 
-    double search_min_x = tile_x * tile_s_x - pad;
-    double search_max_x = (tile_x + 1) * tile_s_x + pad;
-    double search_min_y = tile_y * tile_s_y - pad;
-    double search_max_y = (tile_y + 1) * tile_s_y + pad;
-    double search_min_z = tile_z * tile_s_z - pad;
-    double search_max_z = (tile_z + 1) * tile_s_z + pad;
+    in.numberofpoints = static_cast<int>(point_cloud.size());
+    in.pointlist = new double[in.numberofpoints * 3];
 
-    // Global limits to determine domain termination
-    int global_max_ix = static_cast<int>(std::floor(DOMAIN_WIDTH / TARGET_EDGE_LENGTH));
-    int global_max_iy = static_cast<int>(std::floor(DOMAIN_HEIGHT / TARGET_EDGE_LENGTH));
-    int global_max_iz = static_cast<int>(std::floor(DOMAIN_DEPTH / TARGET_EDGE_LENGTH));
-
-    // Clamp search indices to valid global ranges to eliminate out-of-bounds
-    // ghost points
-    int min_ix = std::max(0, (int)std::floor(search_min_x / TARGET_EDGE_LENGTH));
-    int max_ix = std::min(global_max_ix, (int)std::floor(search_max_x / TARGET_EDGE_LENGTH));
-    int min_iy = std::max(0, (int)std::floor(search_min_y / TARGET_EDGE_LENGTH));
-    int max_iy = std::min(global_max_iy, (int)std::floor(search_max_y / TARGET_EDGE_LENGTH));
-    int min_iz = std::max(0, (int)std::floor(search_min_z / TARGET_EDGE_LENGTH));
-    int max_iz = std::min(global_max_iz, (int)std::floor(search_max_z / TARGET_EDGE_LENGTH));
-
-    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.25);
-    std::vector<Point3D> tile_points;
-
-    // Loop through the clamped grid nodes
-    for (int iz = min_iz; iz <= max_iz; ++iz) {
-        for (int iy = min_iy; iy <= max_iy; ++iy) {
-            for (int ix = min_ix; ix <= max_ix; ++ix) {
-
-                // --- BOUNDARY VERTICES ---
-                // Check if this specific grid vertex lies on any of the 6 outer
-                // domain faces
-                bool is_boundary_vertex =
-                    (ix == 0 || ix == global_max_ix || iy == 0 || iy == global_max_iy || iz == 0 || iz == global_max_iz);
-
-                if (is_boundary_vertex) {
-                    double cx = (ix == global_max_ix) ? DOMAIN_WIDTH : ix * TARGET_EDGE_LENGTH;
-                    double cy = (iy == global_max_iy) ? DOMAIN_HEIGHT : iy * TARGET_EDGE_LENGTH;
-                    double cz = (iz == global_max_iz) ? DOMAIN_DEPTH : iz * TARGET_EDGE_LENGTH;
-                    // If it falls within this tile's padded search window, grab
-                    // it
-                    if (cx >= search_min_x && cx <= search_max_x && cy >= search_min_y && cy <= search_max_y &&
-                        cz >= search_min_z && cz <= search_max_z) {
-
-                        uint64_t id = create_point_with_unique_hash_id_3D(ix, iy, iz, 1); // type 1 = boundary
-                        tile_points.emplace_back(cx, cy, cz, id);
-                    }
-                }
-
-                // --- INTERIOR CELL CANDIDATES ---
-                // Decouple from boundary check
-                // (Every valid cell volume can host an interior point which is
-                // then safely filtered by the exclusion distance)
-                if (ix < global_max_ix && iy < global_max_iy && iz < global_max_iz) {
-                    uint64_t h = ((uint64_t)ix << 40) | ((uint64_t)iy << 20) | iz;
-                    h = splitmix64_3D(h);
-
-                    double r1 = 0.1 + next_double_3D(h) * 0.8;
-                    double r2 = 0.1 + next_double_3D(h) * 0.8;
-                    double r3 = 0.1 + next_double_3D(h) * 0.8;
-
-                    double cx = (ix + r1) * TARGET_EDGE_LENGTH;
-                    double cy = (iy + r2) * TARGET_EDGE_LENGTH;
-                    double cz = (iz + r3) * TARGET_EDGE_LENGTH;
-
-                    // Only keep the interior candidate if it's far enough from
-                    // ALL boundary faces
-                    if (cx >= exclusion && cx <= DOMAIN_WIDTH - exclusion && cy >= exclusion &&
-                        cy <= DOMAIN_HEIGHT - exclusion && cz >= exclusion && cz <= DOMAIN_DEPTH - exclusion) {
-
-                        if (cx >= search_min_x && cx <= search_max_x && cy >= search_min_y && cy <= search_max_y &&
-                            cz >= search_min_z && cz <= search_max_z) {
-
-                            uint64_t id = create_point_with_unique_hash_id_3D(ix, iy, iz, 0); // type 0 = interior
-                            tile_points.emplace_back(cx, cy, cz, id);
-                        }
-                    }
-                }
-            }
-        }
+    for (size_t i = 0; i < point_cloud.size(); ++i) {
+        in.pointlist[i * 3 + 0] = point_cloud[i].x;
+        in.pointlist[i * 3 + 1] = point_cloud[i].y;
+        in.pointlist[i * 3 + 2] = point_cloud[i].z;
     }
 
-    return tile_points;
+    tetgenbehavior behavior;
+    char switches[] = "Qz";
+    behavior.parse_commandline(switches);
+    tetrahedralize(&behavior, &in, &out, nullptr, nullptr);
+
+    out_tetrahedra.clear();
+    out_tetrahedra.reserve(out.numberoftetrahedra);
+
+    for (int i = 0; i < out.numberoftetrahedra; ++i) {
+        Tetrahedron tet;
+        tet.v0 = out.tetrahedronlist[i * 4 + 0];
+        tet.v1 = out.tetrahedronlist[i * 4 + 1];
+        tet.v2 = out.tetrahedronlist[i * 4 + 2];
+        tet.v3 = out.tetrahedronlist[i * 4 + 3];
+        out_tetrahedra.push_back(tet);
+    }
 }
 
-// Calculates the volume of a tetrahedron
 double calculate_tet_volume(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3) {
     // Volume = 1/6 * |(p1-p0) . ((p2-p0) x (p3-p0))|
     double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
@@ -246,11 +406,9 @@ double calculate_tet_volume(const Point3D &p0, const Point3D &p1, const Point3D 
     double cz = v2x * v3y - v2y * v3x;
 
     // Dot product with (p1-p0)
-    double det = std::abs(v1x * cx + v1y * cy + v1z * cz);
-    return det / 6.0;
+    return std::abs(v1x * cx + v1y * cy + v1z * cz) / 6.0;
 }
 
-// Returns SIGNED volume (negative means the tetrahedron is inverted)
 double calculate_signed_tet_volume(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3) {
     // Volume = 1/6 * |(p1-p0) . ((p2-p0) x (p3-p0))|
     double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
@@ -263,43 +421,419 @@ double calculate_signed_tet_volume(const Point3D &p0, const Point3D &p1, const P
     double cz = v2x * v3y - v2y * v3x;
 
     // Dot product with (p1-p0)
-    double det = v1x * cx + v1y * cy + v1z * cz;
-    return det / 6.0;
+    return (v1x * cx + v1y * cy + v1z * cz) / 6.0;
 }
 
-// Clamps to prevent acos domain errors
-static double clamp_val_3D(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
+// 3D Lloyd-smoothing
+// Moves vertices towards the volume-weighted centroid of surrounding tets
+// Optimising element shape and aspect ratios
+void relax_points_lloyd_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double factor, double min_x,
+                           double min_y, double min_z, double max_x, double max_y, double max_z) {
+    int n = points.size();
+    std::vector<double> wx(n, 0.0), wy(n, 0.0), wz(n, 0.0), w_sum(n, 0.0);
 
-// Calculate the dihedral angles of a given tetrahedron
-static void get_tet_dihedral_angles(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3,
-                                    double angles[6]) {
-    auto normal = [](const Point3D &a, const Point3D &b, const Point3D &c) {
-        double ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
-        double vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
-        return Point3D(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
-    };
+    // Compressed Sparse Row (CSR) Setup for fast adjacency lookups
+    std::vector<int> tet_count(n, 0);
+    for (const auto &t : tets) {
+        tet_count[t.v0]++;
+        tet_count[t.v1]++;
+        tet_count[t.v2]++;
+        tet_count[t.v3]++;
+    }
 
-    Point3D n[4] = {normal(p1, p2, p3), normal(p0, p3, p2), normal(p0, p1, p3), normal(p0, p2, p1)};
+    std::vector<int> tet_offset(n + 1, 0);
+    for (int i = 0; i < n; ++i)
+        tet_offset[i + 1] = tet_offset[i] + tet_count[i];
+    std::vector<int> tet_data(tet_offset[n]);
+    std::fill(tet_count.begin(), tet_count.end(), 0);
 
-    auto mag = [](const Point3D &vec) { return std::sqrt(vec.x * vec.x + vec.y * vec.y + vec.z * vec.z); };
-    auto dot = [](const Point3D &a, const Point3D &b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+    // Loops through all tets and calculates the volume-weighted centroid
+    for (size_t k = 0; k < tets.size(); ++k) {
+        const auto &t = tets[k];
+        const Point3D &p0 = points[t.v0], &p1 = points[t.v1], &p2 = points[t.v2], &p3 = points[t.v3];
+        double cx = (p0.x + p1.x + p2.x + p3.x) * 0.25;
+        double cy = (p0.y + p1.y + p2.y + p3.y) * 0.25;
+        double cz = (p0.z + p1.z + p2.z + p3.z) * 0.25;
+        double vol = calculate_tet_volume(p0, p1, p2, p3);
 
-    int idx = 0;
-    for (int i = 0; i < 3; ++i) {
-        for (int j = i + 1; j < 4; ++j) {
-            double m1 = mag(n[i]), m2 = mag(n[j]);
-            if (m1 < 1e-14 || m2 < 1e-14) {
-                angles[idx++] = 0.0;
-                continue;
+        int v[4] = {t.v0, t.v1, t.v2, t.v3};
+        for (int i = 0; i < 4; ++i) {
+            wx[v[i]] += vol * cx;
+            wy[v[i]] += vol * cy;
+            wz[v[i]] += vol * cz;
+            w_sum[v[i]] += vol;
+            tet_data[tet_offset[v[i]] + tet_count[v[i]]++] = k;
+        }
+    }
+
+    std::vector<double> candidate_factors = {0.1, 0.3, 0.5, 0.7, 0.9};
+
+    // Loops through all points and apply the spring forces
+    for (int i = 0; i < n; ++i) {
+        if (w_sum[i] < 1e-12)
+            continue;
+        if (points[i].x > min_x && points[i].x < max_x && points[i].y > min_y && points[i].y < max_y && points[i].z > min_z &&
+            points[i].z < max_z) {
+            double tx = wx[i] / w_sum[i];
+            double ty = wy[i] / w_sum[i];
+            double tz = wz[i] / w_sum[i];
+
+            // Scales the full displacement by the provided factor
+            double full_dx = (tx - points[i].x) * factor;
+            double full_dy = (ty - points[i].y) * factor;
+            double full_dz = (tz - points[i].z) * factor;
+
+            int start = tet_offset[i], end = tet_offset[i + 1];
+            Point3D best_candidate = points[i];
+            double best_min_angle = -1.0;
+
+            // Find the baseline minimum angle before moving
+            for (int j = start; j < end; ++j) {
+                const auto &t = tets[tet_data[j]];
+                double a = get_min_dihedral(points[t.v0], points[t.v1], points[t.v2], points[t.v3]);
+                if (best_min_angle < 0 || a < best_min_angle)
+                    best_min_angle = a;
             }
-            double cos_theta = dot(n[i], n[j]) / (m1 * m2);
-            angles[idx++] = std::acos(clamp_val_3D(-cos_theta)) * 180.0 / 3.14159265358979323846;
+
+            // Loops through all tets and calculates the volume-weighted centroid
+            for (double cf : candidate_factors) {
+                Point3D candidate = points[i];
+                double dx = full_dx * cf, dy = full_dy * cf, dz = full_dz * cf;
+                bool was_boundary = apply_boundary_constraint_3D(candidate, dx, dy, dz);
+                candidate.x += dx;
+                candidate.y += dy;
+                candidate.z += dz;
+
+                if (!was_boundary) {
+                    keep_interior_point_inside_3D(candidate);
+                } else {
+                    if (candidate.x < 0)
+                        candidate.x = 0;
+                    if (candidate.x > DOMAIN_WIDTH)
+                        candidate.x = DOMAIN_WIDTH;
+                    if (candidate.y < 0)
+                        candidate.y = 0;
+                    if (candidate.y > DOMAIN_HEIGHT)
+                        candidate.y = DOMAIN_HEIGHT;
+                    if (candidate.z < 0)
+                        candidate.z = 0;
+                    if (candidate.z > DOMAIN_DEPTH)
+                        candidate.z = DOMAIN_DEPTH;
+                }
+
+                double candidate_min_angle = 360.0;
+                bool inverted = false;
+                for (int j = start; j < end; ++j) {
+                    const auto &t = tets[tet_data[j]];
+                    Point3D p0 = (t.v0 == i) ? candidate : points[t.v0], p1 = (t.v1 == i) ? candidate : points[t.v1];
+                    Point3D p2 = (t.v2 == i) ? candidate : points[t.v2], p3 = (t.v3 == i) ? candidate : points[t.v3];
+
+                    double v = calculate_signed_tet_volume(p0, p1, p2, p3);
+                    if (v <= 1e-14) {
+                        inverted = true;
+                        break;
+                    }
+
+                    double a = get_min_dihedral(p0, p1, p2, p3);
+                    if (a < candidate_min_angle)
+                        candidate_min_angle = a;
+                }
+
+                if (!inverted && candidate_min_angle > best_min_angle) {
+                    best_min_angle = candidate_min_angle;
+                    best_candidate = candidate;
+                }
+            }
+            points[i] = best_candidate;
         }
     }
 }
 
-void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vector<Point3D> &points,
-                             const std::vector<Tetrahedron> &tets) {
+// 3D Spring-Force Relaxation
+// Attempts to equalize all edges to TARGET_EDGE_LENGTH
+void relax_points_spring_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double dt, double min_x,
+                            double min_y, double min_z, double max_x, double max_y, double max_z) {
+    int n = points.size();
+    std::vector<double> force_x(n, 0.0), force_y(n, 0.0), force_z(n, 0.0);
+    std::vector<int> valence(n, 0);
+
+    // Gather all unique edges across the entire mesh connectivity
+    // 6 edges per tet, 4 tets per face
+    int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
+    std::set<std::pair<int, int>> unique_edges;
+
+    for (const auto &tet : tets) {
+        int v[4] = {tet.v0, tet.v1, tet.v2, tet.v3};
+        for (int e = 0; e < 6; ++e) {
+            int idx1 = std::min(v[edge_pairs[e][0]], v[edge_pairs[e][1]]);
+            int idx2 = std::max(v[edge_pairs[e][0]], v[edge_pairs[e][1]]);
+            unique_edges.insert({idx1, idx2});
+        }
+    }
+
+    // Compute physics uniquely per edge
+    for (const auto &edge : unique_edges) {
+        int idx1 = edge.first, idx2 = edge.second;
+        double dx = points[idx2].x - points[idx1].x;
+        double dy = points[idx2].y - points[idx1].y;
+        double dz = points[idx2].z - points[idx1].z;
+        double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < 1e-14)
+            continue;
+
+        double force_mag = (dist - TARGET_EDGE_LENGTH);
+        double fx = force_mag * (dx / dist), fy = force_mag * (dy / dist), fz = force_mag * (dz / dist);
+
+        force_x[idx1] += fx;
+        force_y[idx1] += fy;
+        force_z[idx1] += fz;
+        valence[idx1]++;
+        force_x[idx2] -= fx;
+        force_y[idx2] -= fy;
+        force_z[idx2] -= fz;
+        valence[idx2]++;
+    }
+
+    // Integrate forces and update coordinates
+    for (int i = 0; i < n; ++i) {
+        if (valence[i] == 0)
+            continue;
+        if (points[i].x > min_x && points[i].x < max_x && points[i].y > min_y && points[i].y < max_y && points[i].z > min_z &&
+            points[i].z < max_z) {
+            double dx = (force_x[i] / valence[i]) * dt;
+            double dy = (force_y[i] / valence[i]) * dt;
+            double dz = (force_z[i] / valence[i]) * dt;
+
+            Point3D temp_p = points[i];
+            bool was_boundary = apply_boundary_constraint_3D(temp_p, dx, dy, dz);
+            temp_p.x += dx;
+            temp_p.y += dy;
+            temp_p.z += dz;
+
+            if (!was_boundary) {
+                keep_interior_point_inside_3D(temp_p);
+            } else {
+                if (temp_p.x < 0)
+                    temp_p.x = 0;
+                if (temp_p.x > DOMAIN_WIDTH)
+                    temp_p.x = DOMAIN_WIDTH;
+                if (temp_p.y < 0)
+                    temp_p.y = 0;
+                if (temp_p.y > DOMAIN_HEIGHT)
+                    temp_p.y = DOMAIN_HEIGHT;
+                if (temp_p.z < 0)
+                    temp_p.z = 0;
+                if (temp_p.z > DOMAIN_DEPTH)
+                    temp_p.z = DOMAIN_DEPTH;
+            }
+            points[i] = temp_p;
+        }
+    }
+}
+
+// PETSc DMPlex Boundary Labelling
+static void LabelBoundaries_3D(DM dm) {
+    DMLabel label;
+    DMGetLabel(dm, "Face Sets", &label);
+    if (!label) {
+        DMCreateLabel(dm, "Face Sets");
+        DMGetLabel(dm, "Face Sets", &label);
+    } else {
+        DMLabelClearStratum(label, 1);
+        DMLabelClearStratum(label, 2);
+        DMLabelClearStratum(label, 3);
+        DMLabelClearStratum(label, 4);
+        DMLabelClearStratum(label, 5);
+        DMLabelClearStratum(label, 6);
+    }
+
+    Vec coordsVec;
+    DMGetCoordinatesLocal(dm, &coordsVec);
+    PetscSection coordSection;
+    DMGetCoordinateSection(dm, &coordSection);
+
+    const PetscScalar *coords;
+    VecGetArrayRead(coordsVec, &coords);
+
+    // Label Vertices (Depth 0)
+    PetscInt vStart, vEnd;
+    DMPlexGetDepthStratum(dm, 0, &vStart, &vEnd);
+
+    for (PetscInt v = vStart; v < vEnd; ++v) {
+        PetscInt dof, off;
+        PetscSectionGetDof(coordSection, v, &dof);
+        if (dof > 0) {
+            PetscSectionGetOffset(coordSection, v, &off);
+            double x = coords[off], y = coords[off + 1], z = coords[off + 2];
+
+            PetscInt val = 0;
+            // 1=Bottom(Z=0), 2=Top(Z=D), 3=Left(X=0), 4=Right(X=W), 5=Front(Y=0), 6=Back(Y=H)
+            if (std::abs(z) < EPSILON)
+                val = 1;
+            else if (std::abs(z - DOMAIN_DEPTH) < EPSILON)
+                val = 2;
+            else if (std::abs(x) < EPSILON)
+                val = 3;
+            else if (std::abs(x - DOMAIN_WIDTH) < EPSILON)
+                val = 4;
+            else if (std::abs(y) < EPSILON)
+                val = 5;
+            else if (std::abs(y - DOMAIN_HEIGHT) < EPSILON)
+                val = 6;
+
+            if (val != 0)
+                DMLabelSetValue(label, v, val);
+        }
+    }
+    DMPlexLabelComplete(dm, label);
+
+    // Label Faces (Height 1 in 3D = faces)
+    PetscInt fStart, fEnd;
+    DMPlexGetHeightStratum(dm, 1, &fStart, &fEnd);
+
+    // Get the valid chart limits of the coordinate section to prevent SEGVs
+    PetscInt $cStart$, $cEnd$;
+    PetscSectionGetChart(coordSection, &$cStart$, &$cEnd$);
+
+    for (PetscInt f = fStart; f < fEnd; ++f) {
+        PetscInt closureSize;
+        PetscInt *closure = NULL;
+
+        // Retrieve the full transitive closure of the face (includes edges and vertices)
+        DMPlexGetTransitiveClosure(dm, f, PETSC_TRUE, &closureSize, &closure);
+
+        double cx = 0, cy = 0, cz = 0;
+        int count = 0;
+
+        // The closure array contains pairs: [point, orientation, point, orientation, ...]
+        for (PetscInt i = 0; i < closureSize * 2; i += 2) {
+            PetscInt p = closure[i];
+
+            // Defensively check if the point is within the coordinate section's chart range
+            if (p >= $cStart$ && p < $cEnd$) {
+                PetscInt dof, off;
+                PetscSectionGetDof(coordSection, p, &dof);
+
+                // Only pull coordinates if the point actually holds degrees of freedom (Vertices)
+                if (dof > 0) {
+                    PetscSectionGetOffset(coordSection, p, &off);
+                    cx += coords[off];
+                    cy += coords[off + 1];
+                    cz += coords[off + 2];
+                    count++;
+                }
+            }
+        }
+        // Clean up the closure array memory allocated by PETSc
+        DMPlexRestoreTransitiveClosure(dm, f, PETSC_TRUE, &closureSize, &closure);
+
+        if (count > 0) {
+            cx /= count;
+            cy /= count;
+            cz /= count;
+            PetscInt val = 0;
+
+            if (std::abs(cz) < EPSILON)
+                val = 1;
+            else if (std::abs(cz - DOMAIN_DEPTH) < EPSILON)
+                val = 2;
+            else if (std::abs(cx) < EPSILON)
+                val = 3;
+            else if (std::abs(cx - DOMAIN_WIDTH) < EPSILON)
+                val = 4;
+            else if (std::abs(cy) < EPSILON)
+                val = 5;
+            else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON)
+                val = 6;
+
+            if (val != 0)
+                DMLabelSetValue(label, f, val);
+        }
+    }
+
+    VecRestoreArrayRead(coordsVec, &coords);
+    DMPlexLabelComplete(dm, label);
+}
+
+static PetscErrorCode RefineHook_LabelBoundaries_3D(DM /*dm*/, DM dmf, void * /*ctx*/) {
+    LabelBoundaries_3D(dmf);
+    DMRefineHookAdd(dmf, RefineHook_LabelBoundaries_3D, NULL, NULL);
+    return 0;
+}
+
+static bool CheckMeshIntegrity_3D(MPI_Comm comm, const std::vector<Point3D> &points_local,
+                                  const std::vector<Tetrahedron> &tets_local) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    double local_total_volume = 0.0;
+    long local_bad_edge_count = 0;
+    double local_max_edge_len = 0.0;
+
+    const double MAX_EDGE_RATIO = 3.5;
+    const double THRESHOLD_LEN = TARGET_EDGE_LENGTH * MAX_EDGE_RATIO;
+    int bad_edge_print_count = 0;
+
+    for (const auto &t : tets_local) {
+        const Point3D &p0 = points_local[t.v0], &p1 = points_local[t.v1], &p2 = points_local[t.v2], &p3 = points_local[t.v3];
+
+        local_total_volume += calculate_tet_volume(p0, p1, p2, p3);
+
+        double edges[6] = {std::sqrt(std::pow(p1.x - p0.x, 2) + std::pow(p1.y - p0.y, 2) + std::pow(p1.z - p0.z, 2)),
+                           std::sqrt(std::pow(p2.x - p1.x, 2) + std::pow(p2.y - p1.y, 2) + std::pow(p2.z - p1.z, 2)),
+                           std::sqrt(std::pow(p0.x - p2.x, 2) + std::pow(p0.y - p2.y, 2) + std::pow(p0.z - p2.z, 2)),
+                           std::sqrt(std::pow(p3.x - p0.x, 2) + std::pow(p3.y - p0.y, 2) + std::pow(p3.z - p0.z, 2)),
+                           std::sqrt(std::pow(p3.x - p1.x, 2) + std::pow(p3.y - p1.y, 2) + std::pow(p3.z - p1.z, 2)),
+                           std::sqrt(std::pow(p3.x - p2.x, 2) + std::pow(p3.y - p2.y, 2) + std::pow(p3.z - p2.z, 2))};
+
+        for (int i = 0; i < 6; ++i) {
+            if (edges[i] > local_max_edge_len)
+                local_max_edge_len = edges[i];
+            if (edges[i] > THRESHOLD_LEN) {
+                local_bad_edge_count++;
+                if (bad_edge_print_count < 5) {
+                    std::cout << "[Rank " << rank << "] BAD TET EDGE: Len " << edges[i] << " vs target " << TARGET_EDGE_LENGTH
+                              << "\n";
+                    bad_edge_print_count++;
+                }
+            }
+        }
+    }
+
+    double global_total_volume;
+    long global_bad_edge_count;
+    double global_max_edge_len;
+
+    MPI_Reduce(&local_total_volume, &global_total_volume, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_bad_edge_count, &global_bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_max_edge_len, &global_max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+
+    int success = 1;
+    if (rank == 0) {
+        double expected_volume = DOMAIN_WIDTH * DOMAIN_HEIGHT * DOMAIN_DEPTH;
+        bool vol_pass = std::abs(global_total_volume - expected_volume) < 1e-5;
+        bool edge_pass = (global_bad_edge_count == 0);
+
+        if (!vol_pass || !edge_pass) {
+            success = 0;
+            std::cout << "\n!!! 3D MESH INTEGRITY CHECK FAILED !!!\n";
+            if (!vol_pass)
+                std::cout << "  [FAIL] Total Volume: " << std::fixed << std::setprecision(6) << global_total_volume
+                          << " (Expected " << expected_volume << ")\n";
+            if (!edge_pass) {
+                std::cout << "  [FAIL] Bad Edges: " << global_bad_edge_count << " edges > " << MAX_EDGE_RATIO << "x target.\n";
+                std::cout << "         Max Edge: " << global_max_edge_len << "\n";
+            }
+            std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+        }
+    }
+    MPI_Bcast(&success, 1, MPI_INT, 0, comm);
+    return (success == 1);
+}
+
+void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vector<Point3D> &points_local,
+                             const std::vector<Tetrahedron> &tets_local) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
@@ -308,16 +842,12 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
     std::ios oldState(nullptr);
     oldState.copyfmt(std::cout);
 
-    // Simulate distributed mesh ownership for accurate global reductions
-    // Guarantees each entity is counted exactly once globally.
-    auto get_owner = [size](uint64_t hash_id) { return static_cast<int>(hash_id % size); };
-
     // Connectivity and Unique Edges extraction
     std::set<std::pair<int, int>> unique_edges;
-    std::vector<int> vertex_valence(points.size(), 0);
+    std::vector<int> vertex_valence(points_local.size(), 0);
     int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
 
-    for (const auto &t : tets) {
+    for (const auto &t : tets_local) {
         // Track vertex valence (number of tets sharing this vertex)
         vertex_valence[t.v0]++;
         vertex_valence[t.v1]++;
@@ -335,11 +865,11 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
 
     // --- Compute Load Imbalance & Connectivity ---
     long points_owned = 0;
-    const int MAX_CONN = 60; // Increased for 3D (valences can safely exceed 30)
+    const int MAX_CONN = 60;
     long local_conn_bins[MAX_CONN] = {0};
 
-    for (size_t i = 0; i < points.size(); ++i) {
-        if (get_owner(points[i].unique_hash_id) == rank) {
+    for (size_t i = 0; i < points_local.size(); ++i) {
+        if (get_owner_rank_3D(points_local[i]) == rank) {
             points_owned++;
             int degree = vertex_valence[i];
             if (degree >= MAX_CONN)
@@ -356,30 +886,25 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
     long global_conn_bins[MAX_CONN] = {0};
     MPI_Reduce(local_conn_bins, global_conn_bins, MAX_CONN, MPI_LONG, MPI_SUM, 0, comm);
 
-    // --- Tetrahedron Statistics (Volume & Angles) ---
-    long local_tet_count = 0;
+    // --- Tetrahedron Statistics ---
+    long local_tet_count = tets_local.size(); // In distributed context, tets_local are ALL owned by this rank
     double local_min_volume = 1e30, local_max_volume = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
 
-    for (const auto &t : tets) {
-        // Tie tetrahedron ownership to its first vertex
-        if (get_owner(points[t.v0].unique_hash_id) == rank) {
-            local_tet_count++;
+    for (const auto &t : tets_local) {
+        double vol = calculate_tet_volume(points_local[t.v0], points_local[t.v1], points_local[t.v2], points_local[t.v3]);
+        if (vol < local_min_volume)
+            local_min_volume = vol;
+        if (vol > local_max_volume)
+            local_max_volume = vol;
 
-            double vol = calculate_tet_volume(points[t.v0], points[t.v1], points[t.v2], points[t.v3]);
-            if (vol < local_min_volume)
-                local_min_volume = vol;
-            if (vol > local_max_volume)
-                local_max_volume = vol;
-
-            double dihedrals[6];
-            get_tet_dihedral_angles(points[t.v0], points[t.v1], points[t.v2], points[t.v3], dihedrals);
-            for (double a : dihedrals) {
-                if (a < local_min_angle)
-                    local_min_angle = a;
-                if (a > local_max_angle)
-                    local_max_angle = a;
-            }
+        double dihedrals[6];
+        get_tet_dihedral_angles(points_local[t.v0], points_local[t.v1], points_local[t.v2], points_local[t.v3], dihedrals);
+        for (double a : dihedrals) {
+            if (a < local_min_angle)
+                local_min_angle = a;
+            if (a > local_max_angle)
+                local_max_angle = a;
         }
     }
 
@@ -392,11 +917,15 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
     long local_edge_count = 0;
 
     for (const auto &edge : unique_edges) {
-        const Point3D &p1 = points[edge.first];
-        const Point3D &p2 = points[edge.second];
+        const Point3D &p1 = points_local[edge.first];
+        const Point3D &p2 = points_local[edge.second];
 
-        // Tie edge ownership to a hash combination of its two vertices
-        if (get_owner(p1.unique_hash_id ^ p2.unique_hash_id) == rank) {
+        // Ensure edge is only counted by the rank that owns the vertex with the lowest hash id
+        uint64_t min_hash = std::min(p1.unique_hash_id, p2.unique_hash_id);
+        const Point3D &min_p = (p1.unique_hash_id == min_hash) ? p1 : p2;
+
+        // Ties edge ownership to a hash combination of its two vertices
+        if (get_owner_rank_3D(min_p) == rank) {
             double dx = p2.x - p1.x, dy = p2.y - p1.y, dz = p2.z - p1.z;
             double len = std::sqrt(dx * dx + dy * dy + dz * dz);
 
@@ -461,7 +990,6 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
         std::cout << "  Total: " << num_tets_owned_global << "\n";
         std::cout << "  Volume Min: " << std::scientific << global_min_volume << "\n";
         std::cout << "  Volume Max: " << std::scientific << global_max_volume << "\n";
-
         std::cout << std::defaultfloat << std::setprecision(6);
         std::cout << "  Volume Ratio: " << (global_min_volume > 0 ? global_max_volume / global_min_volume : -1.0) << "\n";
         std::cout << "  Angle Min: " << global_min_angle << " deg\n";
@@ -485,372 +1013,314 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
     }
 }
 
-// 3D Lloyd-smoothing
-// Moves vertices towards the volume-weighted centroid of surrounding tets
-// Optimising element shape and aspect ratios
-void relax_points_lloyd_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double factor) {
-    int n = points.size();
-    std::vector<double> wx(n, 0.0), wy(n, 0.0), wz(n, 0.0), w_sum(n, 0.0);
+// Processes a single tile of the domain
+// search_min          t_min          interior_min        interior_max        t_max         search_max
+//      |----------------|-----------------|------------------|-----------------|----------------|
+static void process_tile_3D(MPI_Comm comm, int final_smooth_its, int tile_x, int tile_y, int tile_z, double factor, double dt,
+                            std::vector<Point3D> &points_on_owned_tets_and_orphans, std::vector<Tetrahedron> &tets_owned) {
+    int comm_rank, comm_size;
+    MPI_Comm_rank(comm, &comm_rank);
+    MPI_Comm_size(comm, &comm_size);
 
-    // CSR Setup for fast adjacency lookups
-    std::vector<int> tet_count(n, 0);
-    for (const auto &t : tets) {
-        tet_count[t.v0]++;
-        tet_count[t.v1]++;
-        tet_count[t.v2]++;
-        tet_count[t.v3]++;
-    }
+    // The size of each tile
+    double tile_s_x = DOMAIN_WIDTH / TILE_DIM_X;
+    double tile_s_y = DOMAIN_HEIGHT / TILE_DIM_Y;
+    double tile_s_z = DOMAIN_DEPTH / TILE_DIM_Z;
 
-    std::vector<int> tet_offset(n + 1, 0);
-    for (int i = 0; i < n; ++i) {
-        tet_offset[i + 1] = tet_offset[i] + tet_count[i];
-    }
+    // The tile's local search space
+    double t_min_x = tile_x * tile_s_x, t_max_x = (tile_x + 1) * tile_s_x;
+    double t_min_y = tile_y * tile_s_y, t_max_y = (tile_y + 1) * tile_s_y;
+    double t_min_z = tile_z * tile_s_z, t_max_z = (tile_z + 1) * tile_s_z;
 
-    std::vector<int> tet_data(tet_offset[n]);
-    std::fill(tet_count.begin(), tet_count.end(), 0);
+    // Padding for the tile's local search space
+    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + final_smooth_its + 8);
 
-    // Accumulate centroids and build CSR data
-    for (size_t k = 0; k < tets.size(); ++k) {
-        const auto &t = tets[k];
-        const Point3D &p0 = points[t.v0];
-        const Point3D &p1 = points[t.v1];
-        const Point3D &p2 = points[t.v2];
-        const Point3D &p3 = points[t.v3];
+    // The tile's local search space with padding
+    double search_min_x = t_min_x - pad, search_max_x = t_max_x + pad;
+    double search_min_y = t_min_y - pad, search_max_y = t_max_y + pad;
+    double search_min_z = t_min_z - pad, search_max_z = t_max_z + pad;
 
-        double cx = (p0.x + p1.x + p2.x + p3.x) * 0.25;
-        double cy = (p0.y + p1.y + p2.y + p3.y) * 0.25;
-        double cz = (p0.z + p1.z + p2.z + p3.z) * 0.25;
-        double vol = calculate_tet_volume(p0, p1, p2, p3);
+    // The tile's interior search space with padding
+    // (Points that don't need to be ghosted as are safely within the tile)
+    double interior_min_x = t_min_x + pad, interior_max_x = t_max_x - pad;
+    double interior_min_y = t_min_y + pad, interior_max_y = t_max_y - pad;
+    double interior_min_z = t_min_z + pad, interior_max_z = t_max_z - pad;
 
-        int v[4] = {t.v0, t.v1, t.v2, t.v3};
-        for (int i = 0; i < 4; ++i) {
-            wx[v[i]] += vol * cx;
-            wy[v[i]] += vol * cy;
-            wz[v[i]] += vol * cz;
-            w_sum[v[i]] += vol;
-            tet_data[tet_offset[v[i]] + tet_count[v[i]]++] = k;
-        }
-    }
+    // Clamp search indices to valid global ranges to eliminate out-of-bounds ghost points
+    int min_ix = std::max(0, (int)std::floor(search_min_x / TARGET_EDGE_LENGTH));
+    int max_ix =
+        std::min((int)std::floor(DOMAIN_WIDTH / TARGET_EDGE_LENGTH), (int)std::ceil(search_max_x / TARGET_EDGE_LENGTH));
+    int min_iy = std::max(0, (int)std::floor(search_min_y / TARGET_EDGE_LENGTH));
+    int max_iy =
+        std::min((int)std::floor(DOMAIN_HEIGHT / TARGET_EDGE_LENGTH), (int)std::ceil(search_max_y / TARGET_EDGE_LENGTH));
+    int min_iz = std::max(0, (int)std::floor(search_min_z / TARGET_EDGE_LENGTH));
+    int max_iz =
+        std::min((int)std::floor(DOMAIN_DEPTH / TARGET_EDGE_LENGTH), (int)std::ceil(search_max_z / TARGET_EDGE_LENGTH));
 
-    std::vector<double> candidate_factors = {0.1, 0.3, 0.5, 0.7, 0.9};
+    // Global limits to determine domain termination
+    int global_max_ix = static_cast<int>(std::floor(DOMAIN_WIDTH / TARGET_EDGE_LENGTH));
+    int global_max_iy = static_cast<int>(std::floor(DOMAIN_HEIGHT / TARGET_EDGE_LENGTH));
+    int global_max_iz = static_cast<int>(std::floor(DOMAIN_DEPTH / TARGET_EDGE_LENGTH));
 
-    // Relax with inversion safety
-    for (int i = 0; i < n; ++i) {
-        if (w_sum[i] < 1e-12)
-            continue;
+    std::vector<Point3D> points_with_halos;
+    double exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.25);
 
-        double tx = wx[i] / w_sum[i];
-        double ty = wy[i] / w_sum[i];
-        double tz = wz[i] / w_sum[i];
+    // Loop through the clamped grid nodes
+    for (int iz = min_iz; iz <= max_iz; ++iz) {
+        for (int iy = min_iy; iy <= max_iy; ++iy) {
+            for (int ix = min_ix; ix <= max_ix; ++ix) {
+                // Check if this specific grid vertex lies on any of the 6 outer domain faces
+                bool is_boundary =
+                    (ix == 0 || ix == global_max_ix || iy == 0 || iy == global_max_iy || iz == 0 || iz == global_max_iz);
+                if (is_boundary) {
+                    double cx = (ix == global_max_ix) ? DOMAIN_WIDTH : ix * TARGET_EDGE_LENGTH;
+                    double cy = (iy == global_max_iy) ? DOMAIN_HEIGHT : iy * TARGET_EDGE_LENGTH;
+                    double cz = (iz == global_max_iz) ? DOMAIN_DEPTH : iz * TARGET_EDGE_LENGTH;
+                    // If it falls within this tile's padded search window, grab it
+                    if (cx >= search_min_x && cx <= search_max_x && cy >= search_min_y && cy <= search_max_y &&
+                        cz >= search_min_z && cz <= search_max_z) {
+                        points_with_halos.emplace_back(cx, cy, cz, create_point_with_unique_hash_id_3D(ix, iy, iz, 1));
+                    }
+                } else {
+                    // Jitter the point slightly to avoid overlapping with other points
+                    uint64_t seed = ((uint64_t)ix << 40) | ((uint64_t)iy << 20) | iz;
+                    uint64_t h = splitmix64_3D(seed);
+                    double cx = (ix + 0.1 + next_double_3D(h) * 0.8) * TARGET_EDGE_LENGTH;
+                    double cy = (iy + 0.1 + next_double_3D(h) * 0.8) * TARGET_EDGE_LENGTH;
+                    double cz = (iz + 0.1 + next_double_3D(h) * 0.8) * TARGET_EDGE_LENGTH;
 
-        // Scale the full displacement by the provided factor
-        double full_dx = (tx - points[i].x) * factor;
-        double full_dy = (ty - points[i].y) * factor;
-        double full_dz = (tz - points[i].z) * factor;
-
-        int start = tet_offset[i];
-        int end = tet_offset[i + 1];
-
-        Point3D best_candidate = points[i];
-        double best_min_vol = -1.0;
-
-        // Find the baseline minimum volume before moving
-        for (int j = start; j < end; ++j) {
-            const auto &t = tets[tet_data[j]];
-            double v = calculate_signed_tet_volume(points[t.v0], points[t.v1], points[t.v2], points[t.v3]);
-            if (best_min_vol < 0 || v < best_min_vol)
-                best_min_vol = v;
-        }
-
-        for (double cf : candidate_factors) {
-            Point3D candidate = points[i];
-            double dx = full_dx * cf;
-            double dy = full_dy * cf;
-            double dz = full_dz * cf;
-
-            bool was_boundary = apply_boundary_constraint_3D(candidate, dx, dy, dz);
-            candidate.x += dx;
-            candidate.y += dy;
-            candidate.z += dz;
-
-            if (!was_boundary)
-                keep_interior_point_inside_3D(candidate);
-            else {
-                if (candidate.x < 0)
-                    candidate.x = 0;
-                if (candidate.x > DOMAIN_WIDTH)
-                    candidate.x = DOMAIN_WIDTH;
-                if (candidate.y < 0)
-                    candidate.y = 0;
-                if (candidate.y > DOMAIN_HEIGHT)
-                    candidate.y = DOMAIN_HEIGHT;
-                if (candidate.z < 0)
-                    candidate.z = 0;
-                if (candidate.z > DOMAIN_DEPTH)
-                    candidate.z = DOMAIN_DEPTH;
-            }
-
-            // Test candidate against all connected tets
-            double candidate_min_vol = 1e30;
-            for (int j = start; j < end; ++j) {
-                const auto &t = tets[tet_data[j]];
-                Point3D p0 = (t.v0 == i) ? candidate : points[t.v0];
-                Point3D p1 = (t.v1 == i) ? candidate : points[t.v1];
-                Point3D p2 = (t.v2 == i) ? candidate : points[t.v2];
-                Point3D p3 = (t.v3 == i) ? candidate : points[t.v3];
-
-                double v = calculate_signed_tet_volume(p0, p1, p2, p3);
-                if (v < candidate_min_vol)
-                    candidate_min_vol = v;
-            }
-
-            // Only accept the move if it doesn't invert elements (or
-            // dramatically worsen them)
-            if (candidate_min_vol > 0.0 && candidate_min_vol >= best_min_vol * 0.5) {
-                best_min_vol = candidate_min_vol;
-                best_candidate = candidate;
-            }
-        }
-        points[i] = best_candidate;
-    }
-}
-
-// 3D Spring-Force Relaxation
-// Attempts to equalize all edges to TARGET_EDGE_LENGTH
-void relax_points_spring_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double dt) {
-    int n = points.size();
-    std::vector<double> force_x(n, 0.0), force_y(n, 0.0), force_z(n, 0.0);
-    std::vector<int> valence(n, 0);
-
-    // Gather all unique edges across the entire mesh connectivity
-    std::set<std::pair<int, int>> unique_edges;
-    // 6 edges per tetrahedron
-    int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
-
-    for (const auto &tet : tets) {
-        int v[4] = {tet.v0, tet.v1, tet.v2, tet.v3};
-        for (int e = 0; e < 6; ++e) {
-            int idx1 = v[edge_pairs[e][0]];
-            int idx2 = v[edge_pairs[e][1]];
-            unique_edges.insert({std::min(idx1, idx2), std::max(idx1, idx2)});
-        }
-    }
-
-    // Compute physics uniquely per edge
-    for (const auto &edge : unique_edges) {
-        int idx1 = edge.first;
-        int idx2 = edge.second;
-
-        double dx = points[idx2].x - points[idx1].x;
-        double dy = points[idx2].y - points[idx1].y;
-        double dz = points[idx2].z - points[idx1].z;
-        double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-
-        if (dist < 1e-14)
-            continue;
-
-        double force_mag = (dist - TARGET_EDGE_LENGTH);
-
-        double nx = dx / dist;
-        double ny = dy / dist;
-        double nz = dz / dist;
-
-        double fx = force_mag * nx;
-        double fy = force_mag * ny;
-        double fz = force_mag * nz;
-
-        force_x[idx1] += fx;
-        force_y[idx1] += fy;
-        force_z[idx1] += fz;
-
-        force_x[idx2] -= fx;
-        force_y[idx2] -= fy;
-        force_z[idx2] -= fz;
-
-        valence[idx1]++;
-        valence[idx2]++;
-    }
-
-    // Integrate forces and update coordinates
-    for (int i = 0; i < n; ++i) {
-        if (valence[i] == 0)
-            continue;
-
-        // Normalised Force
-        double fx = force_x[i] / valence[i];
-        double fy = force_y[i] / valence[i];
-        double fz = force_z[i] / valence[i];
-
-        double dx = fx * dt;
-        double dy = fy * dt;
-        double dz = fz * dt;
-
-        Point3D temp_p = points[i];
-        bool was_boundary = apply_boundary_constraint_3D(temp_p, dx, dy, dz);
-
-        temp_p.x += dx;
-        temp_p.y += dy;
-        temp_p.z += dz;
-
-        if (!was_boundary)
-            keep_interior_point_inside_3D(temp_p);
-        else {
-            if (temp_p.x < 0)
-                temp_p.x = 0;
-            if (temp_p.x > DOMAIN_WIDTH)
-                temp_p.x = DOMAIN_WIDTH;
-            if (temp_p.y < 0)
-                temp_p.y = 0;
-            if (temp_p.y > DOMAIN_HEIGHT)
-                temp_p.y = DOMAIN_HEIGHT;
-            if (temp_p.z < 0)
-                temp_p.z = 0;
-            if (temp_p.z > DOMAIN_DEPTH)
-                temp_p.z = DOMAIN_DEPTH;
-        }
-        points[i] = temp_p;
-    }
-}
-
-// Tetrahedralizes a point cloud using TetGen
-void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud, std::vector<Tetrahedron> &out_tetrahedra) {
-    tetgenio in, out;
-
-    in.numberofpoints = static_cast<int>(point_cloud.size());
-    in.pointlist = new double[in.numberofpoints * 3];
-
-    for (size_t i = 0; i < point_cloud.size(); ++i) {
-        in.pointlist[i * 3 + 0] = point_cloud[i].x;
-        in.pointlist[i * 3 + 1] = point_cloud[i].y;
-        in.pointlist[i * 3 + 2] = point_cloud[i].z;
-    }
-
-    tetgenbehavior behavior;
-    char switches[] = "Qz";
-    behavior.parse_commandline(switches);
-    tetrahedralize(&behavior, &in, &out, nullptr, nullptr);
-
-    out_tetrahedra.clear();
-    out_tetrahedra.reserve(out.numberoftetrahedra);
-
-    for (int i = 0; i < out.numberoftetrahedra; ++i) {
-        Tetrahedron tet;
-        tet.v0 = out.tetrahedronlist[i * 4 + 0];
-        tet.v1 = out.tetrahedronlist[i * 4 + 1];
-        tet.v2 = out.tetrahedronlist[i * 4 + 2];
-        tet.v3 = out.tetrahedronlist[i * 4 + 3];
-        out_tetrahedra.push_back(tet);
-    }
-
-    if (out.numberofpoints != in.numberofpoints) {
-        std::cerr << "Fatal: TetGen dropped/merged points! Output indices "
-                     "desynced.\n";
-        std::exit(EXIT_FAILURE);
-    }
-
-    delete[] in.pointlist;
-    in.pointlist = nullptr;
-}
-
-std::vector<Point3D> GenerateMesh3D(int dim_x, int dim_y, int dim_z, double factor, double dt) {
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    double pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + FINAL_SMOOTH_ITS + 8);
-    std::unordered_map<uint64_t, Point3D> local_point_map;
-
-    // --- Distributed Cloud Generation (Domain Decomposition) ---
-    int tile_idx = 0;
-    for (int tz = 0; tz < dim_z; ++tz) {
-        for (int ty = 0; ty < dim_y; ++ty) {
-            for (int tx = 0; tx < dim_x; ++tx) {
-                if (tile_idx % size == rank) {
-                    std::vector<Point3D> tile_points = process_tile_3D(tx, ty, tz, dim_x, dim_y, dim_z, pad);
-
-                    // Merge tile points into global map to filter out halo
-                    // duplicates
-                    for (const auto &p : tile_points) {
-                        local_point_map[p.unique_hash_id] = p;
+                    // Only keep the interior candidate if it's far enough from all boundary faces
+                    if (cx >= exclusion && cx <= DOMAIN_WIDTH - exclusion && cy >= exclusion &&
+                        cy <= DOMAIN_HEIGHT - exclusion && cz >= exclusion && cz <= DOMAIN_DEPTH - exclusion) {
+                        if (cx >= search_min_x && cx <= search_max_x && cy >= search_min_y && cy <= search_max_y &&
+                            cz >= search_min_z && cz <= search_max_z) {
+                            points_with_halos.emplace_back(cx, cy, cz, create_point_with_unique_hash_id_3D(ix, iy, iz, 0));
+                        }
                     }
                 }
-                tile_idx++;
             }
         }
     }
 
-    // --- Flat Serialization for MPI Gather ---
-    std::vector<double> local_coords;
-    std::vector<uint64_t> local_ids;
-    local_coords.reserve(local_point_map.size() * 3);
-    local_ids.reserve(local_point_map.size());
+    // Synchronize the search window with the tile's interior
+    double sync_margin = pad - (TARGET_EDGE_LENGTH * 1.5);
+    double s_min_x = t_min_x - sync_margin, s_max_x = t_max_x + sync_margin;
+    double s_min_y = t_min_y - sync_margin, s_max_y = t_max_y + sync_margin;
+    double s_min_z = t_min_z - sync_margin, s_max_z = t_max_z + sync_margin;
 
-    for (const auto &pair : local_point_map) {
-        local_coords.push_back(pair.second.x);
-        local_coords.push_back(pair.second.y);
-        local_coords.push_back(pair.second.z);
-        local_ids.push_back(pair.second.unique_hash_id);
+    std::vector<Tetrahedron> tets_with_halos;
+
+    for (int iter = 0; iter < ANNEAL_ITERS + final_smooth_its; ++iter) {
+        if (iter < ANNEAL_ITERS)
+            apply_jitter_3D(points_with_halos, START_JITTER, iter);
+
+        // Sort deterministically before local meshing to prevent rank drift
+        std::sort(points_with_halos.begin(), points_with_halos.end(),
+                  [](const Point3D &a, const Point3D &b) { return a.unique_hash_id < b.unique_hash_id; });
+
+        TetrahedralizePointCloud(points_with_halos, tets_with_halos);
+        relax_points_lloyd_3D(points_with_halos, tets_with_halos, factor, s_min_x, s_min_y, s_min_z, s_max_x, s_max_y,
+                              s_max_z);
+        relax_points_spring_3D(points_with_halos, tets_with_halos, dt, s_min_x, s_min_y, s_min_z, s_max_x, s_max_y, s_max_z);
+
+        ResolveBoundaryOwnership_3D(comm, points_with_halos, s_min_x, s_min_y, s_min_z, s_max_x, s_max_y, s_max_z,
+                                    interior_min_x, interior_min_y, interior_min_z, interior_max_x, interior_max_y,
+                                    interior_max_z, pad);
     }
 
-    int local_num_points = static_cast<int>(local_point_map.size());
-    std::vector<int> recv_counts(size);
-    MPI_Allgather(&local_num_points, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    TetrahedralizePointCloud(points_with_halos, tets_with_halos);
+    ResolveBoundaryOwnership_3D(comm, points_with_halos, s_min_x, s_min_y, s_min_z, s_max_x, s_max_y, s_max_z, interior_min_x,
+                                interior_min_y, interior_min_z, interior_max_x, interior_max_y, interior_max_z, pad);
 
-    std::vector<int> coord_counts(size);
-    std::vector<int> coord_displs(size, 0);
-    std::vector<int> id_displs(size, 0);
-    int total_points = 0;
+    std::vector<int> local_to_owned_idx(points_with_halos.size(), -1);
 
-    for (int i = 0; i < size; ++i) {
-        coord_counts[i] = recv_counts[i] * 3;
-        if (i > 0) {
-            coord_displs[i] = coord_displs[i - 1] + coord_counts[i - 1];
-            id_displs[i] = id_displs[i - 1] + recv_counts[i - 1];
+    // Filter to true ownership
+    for (const auto &tet : tets_with_halos) {
+        const Point3D &p0 = points_with_halos[tet.v0];
+        const Point3D &p1 = points_with_halos[tet.v1];
+        const Point3D &p2 = points_with_halos[tet.v2];
+        const Point3D &p3 = points_with_halos[tet.v3];
+
+        uint64_t min_hash_id = std::min({p0.unique_hash_id, p1.unique_hash_id, p2.unique_hash_id, p3.unique_hash_id});
+        const Point3D *min_p = &p0;
+        if (p1.unique_hash_id == min_hash_id)
+            min_p = &p1;
+        if (p2.unique_hash_id == min_hash_id)
+            min_p = &p2;
+        if (p3.unique_hash_id == min_hash_id)
+            min_p = &p3;
+
+        if (get_owner_rank_3D(*min_p) == comm_rank) {
+            Tetrahedron new_t;
+            int *src_idx[4] = {(int *)&tet.v0, (int *)&tet.v1, (int *)&tet.v2, (int *)&tet.v3};
+            int *dst_idx[4] = {&new_t.v0, &new_t.v1, &new_t.v2, &new_t.v3};
+
+            for (int k = 0; k < 4; ++k) {
+                int local_idx = *src_idx[k];
+                if (local_to_owned_idx[local_idx] == -1) {
+                    local_to_owned_idx[local_idx] = points_on_owned_tets_and_orphans.size();
+                    points_on_owned_tets_and_orphans.push_back(points_with_halos[local_idx]);
+                }
+                *dst_idx[k] = local_to_owned_idx[local_idx];
+            }
+            tets_owned.push_back(new_t);
         }
-        total_points += recv_counts[i];
     }
 
-    std::vector<double> global_coords(total_points * 3);
-    std::vector<uint64_t> global_ids(total_points);
+    for (size_t i = 0; i < points_with_halos.size(); ++i) {
+        if (get_owner_rank_3D(points_with_halos[i]) == comm_rank && local_to_owned_idx[i] == -1) {
+            points_on_owned_tets_and_orphans.push_back(points_with_halos[i]);
+        }
+    }
+}
 
-    MPI_Allgatherv(local_coords.data(), local_num_points * 3, MPI_DOUBLE, global_coords.data(), coord_counts.data(),
-                   coord_displs.data(), MPI_DOUBLE, MPI_COMM_WORLD);
-    MPI_Allgatherv(local_ids.data(), local_num_points, MPI_UINT64_T, global_ids.data(), recv_counts.data(), id_displs.data(),
-                   MPI_UINT64_T, MPI_COMM_WORLD);
+DM CreateDMPlex3D(MPI_Comm comm, const std::vector<Point3D> &points_on_owned_tets_and_orphans,
+                  const std::vector<Tetrahedron> &tets_owned) {
+    int comm_rank, comm_size;
+    MPI_Comm_rank(comm, &comm_rank);
+    MPI_Comm_size(comm, &comm_size);
+    PetscInt neg_one = -1;
 
-    // --- Rebuild Global Deduplicated Map on All Ranks ---
-    std::unordered_map<uint64_t, Point3D> global_point_map;
-    for (int i = 0; i < total_points; ++i) {
-        uint64_t id = global_ids[i];
-        global_point_map[id] = Point3D(global_coords[i * 3], global_coords[i * 3 + 1], global_coords[i * 3 + 2], id);
+    PetscInt num_points = points_on_owned_tets_and_orphans.size();
+    std::vector<PetscInt> global_ids(num_points, neg_one);
+    PetscInt num_points_owned = 0;
+
+    for (int i = 0; i < num_points; ++i) {
+        if (get_owner_rank_3D(points_on_owned_tets_and_orphans[i]) == comm_rank)
+            num_points_owned++;
     }
 
-    // Flatten to a standard vector for TetGen
-    std::vector<Point3D> final_cloud;
-    final_cloud.reserve(global_point_map.size());
-    for (const auto &pair : global_point_map) {
-        final_cloud.push_back(pair.second);
+    PetscInt start_id = 0;
+    MPI_Exscan(&num_points_owned, &start_id, 1, MPIU_INT, MPI_SUM, comm);
+    PetscInt current_id = start_id;
+
+    for (int i = 0; i < num_points; ++i) {
+        if (get_owner_rank_3D(points_on_owned_tets_and_orphans[i]) == comm_rank)
+            global_ids[i] = current_id++;
     }
 
-    // --- Synchronized Smoothing Phase ---
-    std::vector<Tetrahedron> tets;
+    std::vector<std::vector<uint64_t>> send_ids(comm_size);
+    std::vector<std::vector<int>> send_req_indices(comm_size);
 
-    // Anneal: Jitter -> Triangulate -> Smooth
-    for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
-        apply_jitter_3D(final_cloud, START_JITTER, iter);
-        TetrahedralizePointCloud(final_cloud, tets);
-        relax_points_lloyd_3D(final_cloud, tets, factor);
-        relax_points_spring_3D(final_cloud, tets, dt);
+    for (int i = 0; i < num_points; ++i) {
+        if (global_ids[i] == neg_one) {
+            int owner = get_owner_rank_3D(points_on_owned_tets_and_orphans[i]);
+            send_ids[owner].push_back(points_on_owned_tets_and_orphans[i].unique_hash_id);
+            send_req_indices[owner].push_back(i);
+        }
     }
 
-    // Final Smooth Loop (No Jitter)
-    for (int iter = 0; iter < FINAL_SMOOTH_ITS; ++iter) {
-        TetrahedralizePointCloud(final_cloud, tets);
-        relax_points_lloyd_3D(final_cloud, tets, factor);
-        relax_points_spring_3D(final_cloud, tets, dt);
+    std::vector<int> send_counts(comm_size), recv_counts(comm_size);
+    for (int r = 0; r < comm_size; ++r)
+        send_counts[r] = send_ids[r].size();
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+
+    std::vector<std::vector<uint64_t>> recv_ids(comm_size);
+    std::vector<MPI_Request> requests;
+
+    for (int r = 0; r < comm_size; ++r) {
+        if (recv_counts[r] > 0) {
+            recv_ids[r].resize(recv_counts[r]);
+            MPI_Irecv(recv_ids[r].data(), recv_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, comm, &requests.emplace_back());
+        }
+        if (r != comm_rank && send_counts[r] > 0) {
+            MPI_Isend(send_ids[r].data(), send_counts[r] * sizeof(uint64_t), MPI_BYTE, r, 100, comm, &requests.emplace_back());
+        }
+    }
+    if (!requests.empty())
+        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    requests.clear();
+
+    std::unordered_map<uint64_t, PetscInt> points_owned_l2g_map;
+    for (int i = 0; i < num_points; ++i) {
+        if (get_owner_rank_3D(points_on_owned_tets_and_orphans[i]) == comm_rank) {
+            points_owned_l2g_map[points_on_owned_tets_and_orphans[i].unique_hash_id] = global_ids[i];
+        }
     }
 
-    return final_cloud;
+    std::vector<std::vector<PetscInt>> send_answers(comm_size);
+    for (int r = 0; r < comm_size; ++r) {
+        if (recv_counts[r] > 0) {
+            send_answers[r].resize(recv_counts[r]);
+            for (int k = 0; k < recv_counts[r]; ++k)
+                send_answers[r][k] = points_owned_l2g_map[recv_ids[r][k]];
+        }
+    }
+
+    std::vector<std::vector<PetscInt>> recv_answers(comm_size);
+    for (int r = 0; r < comm_size; ++r) {
+        if (r != comm_rank && send_counts[r] > 0) {
+            recv_answers[r].resize(send_counts[r]);
+            MPI_Irecv(recv_answers[r].data(), send_counts[r] * sizeof(PetscInt), MPI_BYTE, r, 101, comm,
+                      &requests.emplace_back());
+        }
+        if (recv_counts[r] > 0) {
+            MPI_Isend(send_answers[r].data(), recv_counts[r] * sizeof(PetscInt), MPI_BYTE, r, 101, comm,
+                      &requests.emplace_back());
+        }
+    }
+    if (!requests.empty())
+        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+
+    for (int r = 0; r < comm_size; ++r) {
+        if (send_counts[r] > 0) {
+            for (int k = 0; k < send_counts[r]; ++k)
+                global_ids[send_req_indices[r][k]] = recv_answers[r][k];
+        }
+    }
+
+    PetscInt num_tets_owned = tets_owned.size();
+    std::vector<PetscInt> cells(num_tets_owned * 4);
+    for (int i = 0; i < num_tets_owned; ++i) {
+        cells[i * 4 + 0] = global_ids[tets_owned[i].v0];
+        cells[i * 4 + 1] = global_ids[tets_owned[i].v1];
+        cells[i * 4 + 2] = global_ids[tets_owned[i].v2];
+        cells[i * 4 + 3] = global_ids[tets_owned[i].v3];
+    }
+
+    std::vector<PetscReal> coords_points_owned;
+    coords_points_owned.reserve(num_points_owned * 3);
+    for (int i = 0; i < num_points; ++i) {
+        if (get_owner_rank_3D(points_on_owned_tets_and_orphans[i]) == comm_rank) {
+            coords_points_owned.push_back(points_on_owned_tets_and_orphans[i].x);
+            coords_points_owned.push_back(points_on_owned_tets_and_orphans[i].y);
+            coords_points_owned.push_back(points_on_owned_tets_and_orphans[i].z);
+        }
+    }
+
+    DM dm = nullptr;
+
+    // Provides valid memory addresses for optional PETSc outputs
+    PetscSF vertexSF = nullptr;
+    PetscInt *verticesAdj = nullptr;
+
+    // Safeguard against empty vectors returning invalid pointers
+    PetscInt *cells_ptr = cells.empty() ? nullptr : cells.data();
+    PetscReal *coords_ptr = coords_points_owned.empty() ? nullptr : coords_points_owned.data();
+
+    // Use PetscCallAbort since the function returns a DM, not a PetscErrorCode
+    PetscCallAbort(comm, DMPlexCreateFromCellListParallelPetsc(comm,
+                                                               3,                // dim: 3D Mesh
+                                                               num_tets_owned,   // numCells
+                                                               num_points_owned, // numVertices
+                                                               PETSC_DECIDE, // NVertices: Let PETSc compute the global total
+                                                               4,            // numCorners
+                                                               PETSC_TRUE,   // interpolate
+                                                               cells_ptr,    // cells
+                                                               3,            // spaceDim
+                                                               coords_ptr,   // vertexCoords
+                                                               &vertexSF,    // vertexSF: Safe pointer reference
+                                                               &verticesAdj, // verticesAdj: Safe pointer reference
+                                                               &dm));
+
+    // Clean up optional outputs if PETSc allocated them
+    if (vertexSF)
+        PetscCallAbort(comm, PetscSFDestroy(&vertexSF));
+    if (verticesAdj)
+        PetscCallAbort(comm, PetscFree(verticesAdj));
+
+    DMPlexDistributeSetDefault(dm, PETSC_FALSE);
+    return dm;
 }
 
 // Generates a structured 3D grid of points
@@ -860,62 +1330,113 @@ std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz, double spaci
     for (int i = 0; i < nx; ++i) {
         for (int j = 0; j < ny; ++j) {
             for (int k = 0; k < nz; ++k) {
-                points.emplace_back(i * spacing, j * spacing, k * spacing);
+                // Generate a deterministic hash
+                uint64_t hash_id = create_point_with_unique_hash_id_3D(i, j, k, 0);
+
+                points.emplace_back(i * spacing, j * spacing, k * spacing, hash_id);
             }
         }
     }
     return points;
 }
 
-// --- Decoupled PETSc DMPlex Generator ---
-DM CreateDMPlex3D(const std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, MPI_Comm comm) {
-    int rank;
-    MPI_Comm_rank(comm, &rank);
-
-    DM dm;
-    PetscInt dim = 3;
-
-    // PETSc Specification: Only Rank 0 feeds topology information
-    PetscInt numCells = (rank == 0) ? static_cast<PetscInt>(tets.size()) : 0;
-    PetscInt numVertices = (rank == 0) ? static_cast<PetscInt>(points.size()) : 0;
-
-    std::vector<PetscInt> cells;
-    std::vector<PetscReal> coords;
-
-    if (rank == 0) {
-        cells.resize(numCells * 4);
-        coords.resize(numVertices * 3);
-        for (size_t i = 0; i < tets.size(); ++i) {
-            cells[i * 4 + 0] = tets[i].v0;
-            cells[i * 4 + 1] = tets[i].v1;
-            cells[i * 4 + 2] = tets[i].v2;
-            cells[i * 4 + 3] = tets[i].v3;
-        }
-        for (size_t i = 0; i < points.size(); ++i) {
-            coords[i * 3 + 0] = points[i].x;
-            coords[i * 3 + 1] = points[i].y;
-            coords[i * 3 + 2] = points[i].z;
-        }
-    }
-
-    DMPlexCreateFromCellListPetsc(comm, dim, numCells, numVertices, 4, PETSC_TRUE, cells.empty() ? nullptr : cells.data(), dim,
-                                  coords.empty() ? nullptr : coords.data(), &dm);
-
-    // Distribute across parallel processes via PETSc Partitioner
-    DM distributedMesh = nullptr;
-    DMPlexDistribute(dm, 0, nullptr, &distributedMesh);
-    if (distributedMesh) {
-        DMDestroy(&dm);
-        dm = distributedMesh;
-    }
-
-    return dm;
-}
-
-// Writes mesh to VTU file
+// Write your DM back to VTU just like the old version
 void WriteTetrahedralMeshVTU(DM dm, const std::string &filename, MPI_Comm comm) {
     PetscViewer viewer;
     PetscViewerVTKOpen(comm, filename.c_str(), FILE_MODE_WRITE, &viewer);
     DMView(dm, viewer);
     PetscViewerDestroy(&viewer);
+}
+
+DM GenerateBoxMeshDM_3D(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height,
+                        double domain_depth, int final_smooth_its, double factor, double dt, PetscBool integrity_check,
+                        PetscBool print_stats) {
+    int comm_rank, comm_size;
+    MPI_Comm_rank(comm, &comm_rank);
+    MPI_Comm_size(comm, &comm_size);
+
+    TARGET_EDGE_LENGTH = target_edge_length;
+    DOMAIN_WIDTH = domain_width;
+    DOMAIN_HEIGHT = domain_height;
+    DOMAIN_DEPTH = domain_depth;
+
+    int best_tx = 1, best_ty = 1, best_tz = 1;
+    double min_cut_area = 1e30;
+
+    // Brute-force find the optimal 3D processor grid that minimizes internal halo communication surfaces
+    for (int x = 1; x <= comm_size; ++x) {
+        if (comm_size % x == 0) {
+            for (int y = 1; y <= comm_size / x; ++y) {
+                if ((comm_size / x) % y == 0) {
+                    int z = comm_size / (x * y);
+
+                    // Internal cut area formula for a 3D bounding box topology
+                    double cut_area = (x - 1) * domain_height * domain_depth + (y - 1) * domain_width * domain_depth +
+                                      (z - 1) * domain_width * domain_height;
+
+                    if (cut_area < min_cut_area) {
+                        min_cut_area = cut_area;
+                        best_tx = x;
+                        best_ty = y;
+                        best_tz = z;
+                    }
+                }
+            }
+        }
+    }
+
+    // Only warns if forced into 1D because the number itself is prime
+    if (comm_rank == 0) {
+        int ones_count = (best_tx == 1) + (best_ty == 1) + (best_tz == 1);
+
+        if (ones_count >= 2 && comm_size > 2) {
+            // Check if comm_size is actually a prime number
+            bool is_prime = true;
+            for (int i = 2; i * i <= comm_size; ++i) {
+                if (comm_size % i == 0) {
+                    is_prime = false;
+                    break;
+                }
+            }
+
+            if (is_prime) {
+                std::cout << "\n[BoxMeshDM_3D] Note: MPI rank count (" << comm_size << ") is a prime number.\n"
+                          << "-> Decomposed into a 1D slice layout: " << best_tx << "x" << best_ty << "x" << best_tz << "\n\n";
+            } else {
+                std::cout << "\n[BoxMeshDM_3D] Note: Domain geometry constraints favor a 1D slice layout.\n"
+                          << "-> Decomposed grid optimized to: " << best_tx << "x" << best_ty << "x" << best_tz << "\n\n";
+            }
+        }
+    }
+
+    TILE_DIM_X = best_tx;
+    TILE_DIM_Y = best_ty;
+    TILE_DIM_Z = best_tz;
+
+    std::vector<Point3D> points_on_owned_tets_and_orphans;
+    std::vector<Tetrahedron> tets_owned;
+
+    // Calculates the 3D tile coordinates for this specific rank
+    int tz = comm_rank / (TILE_DIM_X * TILE_DIM_Y);
+    int ty = (comm_rank / TILE_DIM_X) % TILE_DIM_Y;
+    int tx = comm_rank % TILE_DIM_X;
+
+    process_tile_3D(comm, final_smooth_its, tx, ty, tz, factor, dt, points_on_owned_tets_and_orphans, tets_owned);
+
+    if (integrity_check) {
+        if (!CheckMeshIntegrity_3D(comm, points_on_owned_tets_and_orphans, tets_owned))
+            return NULL;
+    }
+
+    if (print_stats) {
+        ComputeAndPrintStats_3D(comm, final_smooth_its, points_on_owned_tets_and_orphans, tets_owned);
+    }
+
+    DM dm = CreateDMPlex3D(comm, points_on_owned_tets_and_orphans, tets_owned);
+    PetscObjectSetName((PetscObject)dm, "Mesh3D");
+
+    LabelBoundaries_3D(dm);
+    DMRefineHookAdd(dm, RefineHook_LabelBoundaries_3D, NULL, NULL);
+
+    return dm;
 }

@@ -24,9 +24,6 @@ struct Tetrahedron {
     int v0, v1, v2, v3;
 };
 
-// Generates the distributed point cloud
-std::vector<Point3D> GenerateMesh3D(int dim_x, int dim_y, int dim_z, double factor = 0.5, double dt = 0.2);
-
 // Computes pure 3D Delaunay tetrahedralization of a point cloud
 void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud, std::vector<Tetrahedron> &out_tetrahedra);
 
@@ -34,16 +31,18 @@ void TetrahedralizePointCloud(const std::vector<Point3D> &point_cloud, std::vect
 std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz, double spacing);
 
 // Decoupled PETSc DMPlex generator for unit testing topology
-DM CreateDMPlex3D(const std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, MPI_Comm comm);
+DM CreateDMPlex3D(MPI_Comm comm, const std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets);
 
 // Writes tetrahedral mesh to VTU file (unstructured grid)
 void WriteTetrahedralMeshVTU(DM dm, const std::string &filename, MPI_Comm comm);
 
 // Lloyd-smoothing: Moves vertices towards the volume-weighted centroid
-void relax_points_lloyd_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double factor = 0.5);
+void relax_points_lloyd_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double factor, double min_x,
+                           double min_y, double min_z, double max_x, double max_y, double max_z);
 
 // Spring-Force Relaxation: Attempts to equalize all edges to TARGET_EDGE_LENGTH
-void relax_points_spring_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double dt = 0.2);
+void relax_points_spring_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double dt, double min_x,
+                            double min_y, double min_z, double max_x, double max_y, double max_z);
 
 void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vector<Point3D> &points,
                              const std::vector<Tetrahedron> &tets);
@@ -52,5 +51,12 @@ double calculate_tet_volume(const Point3D &p0, const Point3D &p1, const Point3D 
 
 // Exposed for direct boundary condition coverage tracking
 bool apply_boundary_constraint_3D(Point3D &p, double &dx, double &dy, double &dz);
+
+int get_owner_rank_3D(const Point3D &p);
+
+// Main generator
+PETSC_EXTERN DM GenerateBoxMeshDM_3D(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height,
+                                     double domain_depth, int final_smooth_its, double factor, double dt,
+                                     PetscBool integrity_check, PetscBool print_stats);
 
 #endif // TET_MESH_GEN_H
