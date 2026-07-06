@@ -27,6 +27,18 @@ double DOMAIN_HEIGHT = 1.0;
 double DOMAIN_DEPTH = 1.0;
 double TARGET_EDGE_LENGTH = 0.02;
 
+struct Face3D {
+    int v0, v1, v2;
+    bool operator<(const Face3D &o) const {
+        if (v0 != o.v0)
+            return v0 < o.v0;
+        if (v1 != o.v1)
+            return v1 < o.v1;
+        return v2 < o.v2;
+    }
+    bool operator==(const Face3D &o) const { return v0 == o.v0 && v1 == o.v1 && v2 == o.v2; }
+};
+
 // Pack: [Type: 2 bits] [ix: 20 bits] [iy: 20 bits] [iz: 20 bits]
 uint64_t create_point_with_unique_hash_id_3D(int ix, int iy, int iz, int type) {
     uint64_t id = ((uint64_t)(type & 0x3) << 60) | ((uint64_t)(ix & 0xFFFFF) << 40) | ((uint64_t)(iy & 0xFFFFF) << 20) |
@@ -110,6 +122,33 @@ static double get_min_dihedral(const Point3D &p0, const Point3D &p1, const Point
             min_a = angles[i];
     }
     return min_a;
+}
+
+// Fast Edge and Valence Computation
+static void ComputeValenceAndEdges_3D(const std::vector<Tetrahedron> &tets, int num_points,
+                                      std::vector<std::pair<int, int>> &unique_edges, std::vector<int> &valence) {
+    unique_edges.clear();
+    unique_edges.reserve(tets.size() * 6);
+
+    for (const auto &t : tets) {
+        int e[6][2] = {{t.v0, t.v1}, {t.v0, t.v2}, {t.v0, t.v3}, {t.v1, t.v2}, {t.v1, t.v3}, {t.v2, t.v3}};
+        for (int i = 0; i < 6; ++i) {
+            int u = e[i][0];
+            int v = e[i][1];
+            if (u > v)
+                std::swap(u, v);
+            unique_edges.push_back({u, v});
+        }
+    }
+
+    std::sort(unique_edges.begin(), unique_edges.end());
+    unique_edges.erase(std::unique(unique_edges.begin(), unique_edges.end()), unique_edges.end());
+
+    valence.assign(num_points, 0);
+    for (const auto &edge : unique_edges) {
+        valence[edge.first]++;
+        valence[edge.second]++;
+    }
 }
 
 // Deterministically resolve ownership of boundary nodes via MPI
@@ -256,6 +295,14 @@ static void ResolveBoundaryOwnership_3D(MPI_Comm comm, std::vector<Point3D> &poi
             p.z = data.best_z;
         }
     }
+
+    // Memory cleanup
+    send_buffers.clear();
+    recv_buffers.clear();
+    std::vector<std::vector<Claim3D>>().swap(send_buffers);
+    std::vector<std::vector<Claim3D>>().swap(recv_buffers);
+    involved_ids.clear();
+    resolution_map.clear();
 }
 
 bool apply_boundary_constraint_3D(Point3D &p, double &dx, double &dy, double &dz) {
@@ -555,23 +602,11 @@ void relax_points_spring_3D(std::vector<Point3D> &points, const std::vector<Tetr
                             double min_y, double min_z, double max_x, double max_y, double max_z) {
     int n = points.size();
     std::vector<double> force_x(n, 0.0), force_y(n, 0.0), force_z(n, 0.0);
-    std::vector<int> valence(n, 0);
 
-    // Gather all unique edges across the entire mesh connectivity
-    // 6 edges per tet, 4 tets per face
-    int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
-    std::set<std::pair<int, int>> unique_edges;
+    std::vector<std::pair<int, int>> unique_edges;
+    std::vector<int> valence;
+    ComputeValenceAndEdges_3D(tets, n, unique_edges, valence);
 
-    for (const auto &tet : tets) {
-        int v[4] = {tet.v0, tet.v1, tet.v2, tet.v3};
-        for (int e = 0; e < 6; ++e) {
-            int idx1 = std::min(v[edge_pairs[e][0]], v[edge_pairs[e][1]]);
-            int idx2 = std::max(v[edge_pairs[e][0]], v[edge_pairs[e][1]]);
-            unique_edges.insert({idx1, idx2});
-        }
-    }
-
-    // Compute physics uniquely per edge
     for (const auto &edge : unique_edges) {
         int idx1 = edge.first, idx2 = edge.second;
         double dx = points[idx2].x - points[idx1].x;
@@ -587,11 +622,9 @@ void relax_points_spring_3D(std::vector<Point3D> &points, const std::vector<Tetr
         force_x[idx1] += fx;
         force_y[idx1] += fy;
         force_z[idx1] += fz;
-        valence[idx1]++;
         force_x[idx2] -= fx;
         force_y[idx2] -= fy;
         force_z[idx2] -= fz;
-        valence[idx2]++;
     }
 
     // Integrate forces and update coordinates
@@ -692,8 +725,8 @@ static void LabelBoundaries_3D(DM dm) {
     DMPlexGetHeightStratum(dm, 1, &fStart, &fEnd);
 
     // Get the valid chart limits of the coordinate section to prevent SEGVs
-    PetscInt $cStart$, $cEnd$;
-    PetscSectionGetChart(coordSection, &$cStart$, &$cEnd$);
+    PetscInt cStart, cEnd;
+    PetscSectionGetChart(coordSection, &cStart, &cEnd);
 
     for (PetscInt f = fStart; f < fEnd; ++f) {
         PetscInt closureSize;
@@ -710,7 +743,7 @@ static void LabelBoundaries_3D(DM dm) {
             PetscInt p = closure[i];
 
             // Defensively check if the point is within the coordinate section's chart range
-            if (p >= $cStart$ && p < $cEnd$) {
+            if (p >= cStart && p < cEnd) {
                 PetscInt dof, off;
                 PetscSectionGetDof(coordSection, p, &dof);
 
@@ -801,26 +834,168 @@ static bool CheckMeshIntegrity_3D(MPI_Comm comm, const std::vector<Point3D> &poi
         }
     }
 
-    double global_total_volume;
-    long global_bad_edge_count;
-    double global_max_edge_len;
+    // Euler Characteristic Accumulators
+    long local_owned_v = 0, local_owned_c = 0, local_owned_e = 0, local_owned_f = 0;
+
+    // Counts Vertices strictly via geometric ownership
+    for (const auto &p : points_local) {
+        if (get_owner_rank_3D(p) == rank)
+            local_owned_v++;
+    }
+
+    // Counts Cells (Tetrahedra) strictly via geometric ownership of the min-hash point
+    for (const auto &t : tets_local) {
+        uint64_t m = std::min({points_local[t.v0].unique_hash_id, points_local[t.v1].unique_hash_id,
+                               points_local[t.v2].unique_hash_id, points_local[t.v3].unique_hash_id});
+        const Point3D *p_min = &points_local[t.v0];
+        if (m == points_local[t.v1].unique_hash_id)
+            p_min = &points_local[t.v1];
+        else if (m == points_local[t.v2].unique_hash_id)
+            p_min = &points_local[t.v2];
+        else if (m == points_local[t.v3].unique_hash_id)
+            p_min = &points_local[t.v3];
+
+        if (get_owner_rank_3D(*p_min) == rank)
+            local_owned_c++;
+    }
+
+    // Extracts all unique local edges and faces
+    std::vector<std::pair<int, int>> unique_edges;
+    std::vector<int> valence;
+    ComputeValenceAndEdges_3D(tets_local, points_local.size(), unique_edges, valence);
+
+    std::vector<Face3D> unique_faces;
+    unique_faces.reserve(tets_local.size() * 4);
+    for (const auto &t : tets_local) {
+        int f[4][3] = {{t.v0, t.v1, t.v2}, {t.v0, t.v1, t.v3}, {t.v0, t.v2, t.v3}, {t.v1, t.v2, t.v3}};
+        for (int i = 0; i < 4; ++i) {
+            std::sort(f[i], f[i] + 3);
+            unique_faces.push_back({f[i][0], f[i][1], f[i][2]});
+        }
+    }
+    std::sort(unique_faces.begin(), unique_faces.end());
+    unique_faces.erase(std::unique(unique_faces.begin(), unique_faces.end()), unique_faces.end());
+
+    // Distributed Hash Counting via Split MPI Exchanges for Edges and Faces
+    auto mix_hash = [](uint64_t x) -> uint64_t {
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31;
+        return x;
+    };
+
+    std::vector<std::vector<uint64_t>> send_e(size), send_f(size);
+    std::unordered_set<uint64_t> local_e_hashes, local_f_hashes;
+
+    // Distribute Edges uniformly by hash
+    for (const auto &edge : unique_edges) {
+        uint64_t h1 = points_local[edge.first].unique_hash_id;
+        uint64_t h2 = points_local[edge.second].unique_hash_id;
+        if (h1 > h2)
+            std::swap(h1, h2);
+
+        uint64_t eh = mix_hash(h1 ^ mix_hash(h2));
+        if (local_e_hashes.insert(eh).second) {
+            send_e[eh % size].push_back(eh);
+        }
+    }
+
+    // Distribute Faces uniformly by hash
+    for (const auto &face : unique_faces) {
+        uint64_t h[3] = {points_local[face.v0].unique_hash_id, points_local[face.v1].unique_hash_id,
+                         points_local[face.v2].unique_hash_id};
+        std::sort(h, h + 3);
+
+        uint64_t fh = mix_hash(h[0] ^ mix_hash(h[1] ^ mix_hash(h[2])));
+        if (local_f_hashes.insert(fh).second) {
+            send_f[fh % size].push_back(fh);
+        }
+    }
+
+    // Exchange Payload Sizes
+    std::vector<int> send_counts_e(size), recv_counts_e(size);
+    std::vector<int> send_counts_f(size), recv_counts_f(size);
+    for (int r = 0; r < size; ++r) {
+        send_counts_e[r] = send_e[r].size();
+        send_counts_f[r] = send_f[r].size();
+    }
+
+    MPI_Alltoall(send_counts_e.data(), 1, MPI_INT, recv_counts_e.data(), 1, MPI_INT, comm);
+    MPI_Alltoall(send_counts_f.data(), 1, MPI_INT, recv_counts_f.data(), 1, MPI_INT, comm);
+
+    // Exchange Hash Payloads using Non-blocking Isend/Irecv
+    std::vector<std::vector<uint64_t>> recv_e(size), recv_f(size);
+    std::vector<MPI_Request> reqs;
+
+    for (int r = 0; r < size; ++r) {
+        if (recv_counts_e[r] > 0) {
+            recv_e[r].resize(recv_counts_e[r]);
+            MPI_Irecv(recv_e[r].data(), recv_counts_e[r], MPI_UINT64_T, r, 0, comm, &reqs.emplace_back());
+        }
+        if (recv_counts_f[r] > 0) {
+            recv_f[r].resize(recv_counts_f[r]);
+            MPI_Irecv(recv_f[r].data(), recv_counts_f[r], MPI_UINT64_T, r, 1, comm, &reqs.emplace_back());
+        }
+    }
+
+    for (int r = 0; r < size; ++r) {
+        if (send_counts_e[r] > 0) {
+            MPI_Isend(send_e[r].data(), send_counts_e[r], MPI_UINT64_T, r, 0, comm, &reqs.emplace_back());
+        }
+        if (send_counts_f[r] > 0) {
+            MPI_Isend(send_f[r].data(), send_counts_f[r], MPI_UINT64_T, r, 1, comm, &reqs.emplace_back());
+        }
+    }
+
+    if (!reqs.empty()) {
+        MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+    }
+
+    // Deduplicate shared elements on designated hash target ranks
+    std::unordered_set<uint64_t> owned_e, owned_f;
+    for (int r = 0; r < size; ++r) {
+        for (uint64_t eh : recv_e[r])
+            owned_e.insert(eh);
+        for (uint64_t fh : recv_f[r])
+            owned_f.insert(fh);
+    }
+
+    local_owned_e = owned_e.size();
+    local_owned_f = owned_f.size();
+
+    // Gathers metrics to rank 0
+    double global_total_volume, global_max_edge_len, global_bad_edge_count;
+    long global_v, global_e, global_f, global_c;
 
     MPI_Reduce(&local_total_volume, &global_total_volume, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
     MPI_Reduce(&local_bad_edge_count, &global_bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_max_edge_len, &global_max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
 
+    MPI_Reduce(&local_owned_v, &global_v, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_owned_e, &global_e, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_owned_f, &global_f, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_owned_c, &global_c, 1, MPI_LONG, MPI_SUM, 0, comm);
+
     int success = 1;
     if (rank == 0) {
         double expected_volume = DOMAIN_WIDTH * DOMAIN_HEIGHT * DOMAIN_DEPTH;
+        long euler_characteristic = global_v - global_e + global_f - global_c;
+
         bool vol_pass = std::abs(global_total_volume - expected_volume) < 1e-5;
         bool edge_pass = (global_bad_edge_count == 0);
+        bool euler_pass = (euler_characteristic == 1); // 1 for solid 3D domain (ball)
 
-        if (!vol_pass || !edge_pass) {
+        if (!vol_pass || !edge_pass || !euler_pass) {
             success = 0;
             std::cout << "\n!!! 3D MESH INTEGRITY CHECK FAILED !!!\n";
             if (!vol_pass)
                 std::cout << "  [FAIL] Total Volume: " << std::fixed << std::setprecision(6) << global_total_volume
                           << " (Expected " << expected_volume << ")\n";
+            if (!euler_pass)
+                std::cout << "  [FAIL] Topological Validation: V=" << global_v << ", E=" << global_e << ", F=" << global_f
+                          << ", C=" << global_c << " -> Chi = " << euler_characteristic << " (Expected 1)\n";
             if (!edge_pass) {
                 std::cout << "  [FAIL] Bad Edges: " << global_bad_edge_count << " edges > " << MAX_EDGE_RATIO << "x target.\n";
                 std::cout << "         Max Edge: " << global_max_edge_len << "\n";
@@ -843,27 +1018,10 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
     oldState.copyfmt(std::cout);
 
     // Connectivity and Unique Edges extraction
-    std::set<std::pair<int, int>> unique_edges;
-    std::vector<int> vertex_valence(points_local.size(), 0);
-    int edge_pairs[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
+    std::vector<std::pair<int, int>> unique_edges;
+    std::vector<int> vertex_valence;
+    ComputeValenceAndEdges_3D(tets_local, points_local.size(), unique_edges, vertex_valence);
 
-    for (const auto &t : tets_local) {
-        // Track vertex valence (number of tets sharing this vertex)
-        vertex_valence[t.v0]++;
-        vertex_valence[t.v1]++;
-        vertex_valence[t.v2]++;
-        vertex_valence[t.v3]++;
-
-        // Track unique edges
-        int v[4] = {t.v0, t.v1, t.v2, t.v3};
-        for (auto &pair : edge_pairs) {
-            int i1 = v[pair[0]];
-            int i2 = v[pair[1]];
-            unique_edges.insert({std::min(i1, i2), std::max(i1, i2)});
-        }
-    }
-
-    // --- Compute Load Imbalance & Connectivity ---
     long points_owned = 0;
     const int MAX_CONN = 60;
     long local_conn_bins[MAX_CONN] = {0};
@@ -886,7 +1044,7 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
     long global_conn_bins[MAX_CONN] = {0};
     MPI_Reduce(local_conn_bins, global_conn_bins, MAX_CONN, MPI_LONG, MPI_SUM, 0, comm);
 
-    // --- Tetrahedron Statistics ---
+    // Tetrahedron Statistics
     long local_tet_count = tets_local.size(); // In distributed context, tets_local are ALL owned by this rank
     double local_min_volume = 1e30, local_max_volume = -1.0;
     double local_min_angle = 360.0, local_max_angle = -1.0;
@@ -911,7 +1069,7 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
     long num_tets_owned_global;
     MPI_Reduce(&local_tet_count, &num_tets_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
 
-    // --- Edge Orientation Statistics ---
+    // Edge Orientation Statistics
     std::vector<long> local_bins(18, 0);
     double local_total_edge_len = 0.0;
     long local_edge_count = 0;
@@ -948,7 +1106,7 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
         local_max_angle = -1.0;
     }
 
-    // --- Global Reductions ---
+    // Global Reductions
     double global_min_volume, global_max_volume;
     double global_min_angle, global_max_angle;
     double global_total_edge_len;
@@ -964,7 +1122,7 @@ void ComputeAndPrintStats_3D(MPI_Comm comm, int final_smooth_its, const std::vec
     std::vector<long> global_bins(18);
     MPI_Reduce(local_bins.data(), global_bins.data(), 18, MPI_LONG, MPI_SUM, 0, comm);
 
-    // --- Output Aggregated Stats to Rank 0 ---
+    // Output Aggregated Stats to Rank 0
     if (rank == 0) {
         std::cout << "\n=== Parallel 3D Mesh Statistics ===\n";
         std::cout << "Final Smooth Iterations: " << final_smooth_its << "\n";
@@ -1172,6 +1330,14 @@ static void process_tile_3D(MPI_Comm comm, int final_smooth_its, int tile_x, int
             points_on_owned_tets_and_orphans.push_back(points_with_halos[i]);
         }
     }
+
+    // Free vectors
+    points_with_halos.clear();
+    tets_with_halos.clear();
+    local_to_owned_idx.clear();
+    std::vector<Point3D>().swap(points_with_halos);
+    std::vector<Tetrahedron>().swap(tets_with_halos);
+    std::vector<int>().swap(local_to_owned_idx);
 }
 
 DM CreateDMPlex3D(MPI_Comm comm, const std::vector<Point3D> &points_on_owned_tets_and_orphans,
@@ -1298,7 +1464,7 @@ DM CreateDMPlex3D(MPI_Comm comm, const std::vector<Point3D> &points_on_owned_tet
     PetscInt *cells_ptr = cells.empty() ? nullptr : cells.data();
     PetscReal *coords_ptr = coords_points_owned.empty() ? nullptr : coords_points_owned.data();
 
-    // Use PetscCallAbort since the function returns a DM, not a PetscErrorCode
+    // (Using PetscCallAbort since the function returns a DM, not a PetscErrorCode)
     PetscCallAbort(comm, DMPlexCreateFromCellListParallelPetsc(comm,
                                                                3,                // dim: 3D Mesh
                                                                num_tets_owned,   // numCells
@@ -1320,6 +1486,17 @@ DM CreateDMPlex3D(MPI_Comm comm, const std::vector<Point3D> &points_on_owned_tet
         PetscCallAbort(comm, PetscFree(verticesAdj));
 
     DMPlexDistributeSetDefault(dm, PETSC_FALSE);
+
+    // Memory reclamation
+    send_ids.clear();
+    recv_ids.clear();
+    send_answers.clear();
+    recv_answers.clear();
+    std::vector<std::vector<uint64_t>>().swap(send_ids);
+    std::vector<std::vector<uint64_t>>().swap(recv_ids);
+    std::vector<std::vector<PetscInt>>().swap(send_answers);
+    std::vector<std::vector<PetscInt>>().swap(recv_answers);
+
     return dm;
 }
 
@@ -1340,7 +1517,6 @@ std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz, double spaci
     return points;
 }
 
-// Write your DM back to VTU just like the old version
 void WriteTetrahedralMeshVTU(DM dm, const std::string &filename, MPI_Comm comm) {
     PetscViewer viewer;
     PetscViewerVTKOpen(comm, filename.c_str(), FILE_MODE_WRITE, &viewer);
