@@ -9,7 +9,7 @@
 #include <mpi.h>
 #include <petscdmplex.h>
 #include <petscsf.h>
-#include <set>
+// #include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -113,6 +113,7 @@ static void get_tet_dihedral_angles(const Point3D &p0, const Point3D &p1, const 
     }
 }
 
+/*
 static double get_min_dihedral(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3) {
     double angles[6];
     get_tet_dihedral_angles(p0, p1, p2, p3, angles);
@@ -122,6 +123,40 @@ static double get_min_dihedral(const Point3D &p0, const Point3D &p1, const Point
             min_a = angles[i];
     }
     return min_a;
+}
+*/
+
+// Calculates the square mean ratio of a given tetrahedron
+// Maximizing this metric prevents slivers
+static double get_square_mean_ratio(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3) {
+    double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
+    double v2x = p2.x - p0.x, v2y = p2.y - p0.y, v2z = p2.z - p0.z;
+    double v3x = p3.x - p0.x, v3y = p3.y - p0.y, v3z = p3.z - p0.z;
+
+    // Cross product (p2-p0) x (p3-p0)
+    double cx = v2y * v3z - v2z * v3y;
+    double cy = v2z * v3x - v2x * v3z;
+    double cz = v2x * v3y - v2y * v3x;
+
+    // 6x Signed volume
+    double vol6 = v1x * cx + v1y * cy + v1z * cz;
+
+    // If volume is negative or effectively zero, it's inverted/degenerate
+    if (vol6 <= 1e-14)
+        return -1.0;
+
+    // Squared edge lengths
+    double d01 = v1x * v1x + v1y * v1y + v1z * v1z;
+    double d02 = v2x * v2x + v2y * v2y + v2z * v2z;
+    double d03 = v3x * v3x + v3y * v3y + v3z * v3z;
+    double d12 = (p2.x - p1.x) * (p2.x - p1.x) + (p2.y - p1.y) * (p2.y - p1.y) + (p2.z - p1.z) * (p2.z - p1.z);
+    double d23 = (p3.x - p2.x) * (p3.x - p2.x) + (p3.y - p2.y) * (p3.y - p2.y) + (p3.z - p2.z) * (p3.z - p2.z);
+    double d31 = (p1.x - p3.x) * (p1.x - p3.x) + (p1.y - p3.y) * (p1.y - p3.y) + (p1.z - p3.z) * (p1.z - p3.z);
+
+    double sum_sq = d01 + d02 + d03 + d12 + d23 + d31;
+
+    // V^2 / S^3 metric. Higher is better.
+    return (vol6 * vol6) / (sum_sq * sum_sq * sum_sq);
 }
 
 // Fast Edge and Valence Computation
@@ -532,17 +567,17 @@ void relax_points_lloyd_3D(std::vector<Point3D> &points, const std::vector<Tetra
 
             int start = tet_offset[i], end = tet_offset[i + 1];
             Point3D best_candidate = points[i];
-            double best_min_angle = -1.0;
+            double best_min_quality = -1.0;
 
-            // Find the baseline minimum angle before moving
+            // Find the baseline minimum quality before moving
             for (int j = start; j < end; ++j) {
                 const auto &t = tets[tet_data[j]];
-                double a = get_min_dihedral(points[t.v0], points[t.v1], points[t.v2], points[t.v3]);
-                if (best_min_angle < 0 || a < best_min_angle)
-                    best_min_angle = a;
+                double q = get_square_mean_ratio(points[t.v0], points[t.v1], points[t.v2], points[t.v3]);
+                if (best_min_quality < 0 || q < best_min_quality)
+                    best_min_quality = q;
             }
 
-            // Loops through all tets and calculates the volume-weighted centroid
+            // Test displacement factors
             for (double cf : candidate_factors) {
                 Point3D candidate = points[i];
                 double dx = full_dx * cf, dy = full_dy * cf, dz = full_dz * cf;
@@ -568,26 +603,27 @@ void relax_points_lloyd_3D(std::vector<Point3D> &points, const std::vector<Tetra
                         candidate.z = DOMAIN_DEPTH;
                 }
 
-                double candidate_min_angle = 360.0;
+                double candidate_min_quality = 1e30;
                 bool inverted = false;
                 for (int j = start; j < end; ++j) {
                     const auto &t = tets[tet_data[j]];
-                    Point3D p0 = (t.v0 == i) ? candidate : points[t.v0], p1 = (t.v1 == i) ? candidate : points[t.v1];
-                    Point3D p2 = (t.v2 == i) ? candidate : points[t.v2], p3 = (t.v3 == i) ? candidate : points[t.v3];
+                    Point3D p0 = (t.v0 == i) ? candidate : points[t.v0];
+                    Point3D p1 = (t.v1 == i) ? candidate : points[t.v1];
+                    Point3D p2 = (t.v2 == i) ? candidate : points[t.v2];
+                    Point3D p3 = (t.v3 == i) ? candidate : points[t.v3];
 
-                    double v = calculate_signed_tet_volume(p0, p1, p2, p3);
-                    if (v <= 1e-14) {
+                    // Combined inversion/degeneracy and quality check in one call
+                    double q = get_square_mean_ratio(p0, p1, p2, p3);
+                    if (q < 0) {
                         inverted = true;
                         break;
                     }
-
-                    double a = get_min_dihedral(p0, p1, p2, p3);
-                    if (a < candidate_min_angle)
-                        candidate_min_angle = a;
+                    if (q < candidate_min_quality)
+                        candidate_min_quality = q;
                 }
 
-                if (!inverted && candidate_min_angle > best_min_angle) {
-                    best_min_angle = candidate_min_angle;
+                if (!inverted && candidate_min_quality > best_min_quality) {
+                    best_min_quality = candidate_min_quality;
                     best_candidate = candidate;
                 }
             }
@@ -729,37 +765,47 @@ static void LabelBoundaries_3D(DM dm) {
     PetscSectionGetChart(coordSection, &cStart, &cEnd);
 
     for (PetscInt f = fStart; f < fEnd; ++f) {
-        PetscInt closureSize;
-        PetscInt *closure = NULL;
+        PetscInt num_edges;
+        const PetscInt *edges;
 
-        // Retrieve the full transitive closure of the face (includes edges and vertices)
-        DMPlexGetTransitiveClosure(dm, f, PETSC_TRUE, &closureSize, &closure);
+        // Traverse Face -> Edges
+        DMPlexGetConeSize(dm, f, &num_edges);
+        DMPlexGetCone(dm, f, &edges);
 
         double cx = 0, cy = 0, cz = 0;
         int count = 0;
 
-        // The closure array contains pairs: [point, orientation, point, orientation, ...]
-        for (PetscInt i = 0; i < closureSize * 2; i += 2) {
-            PetscInt p = closure[i];
+        for (PetscInt i = 0; i < num_edges; ++i) {
+            PetscInt e = edges[i];
+            PetscInt num_verts;
+            const PetscInt *verts;
 
-            // Defensively check if the point is within the coordinate section's chart range
-            if (p >= cStart && p < cEnd) {
-                PetscInt dof, off;
-                PetscSectionGetDof(coordSection, p, &dof);
+            // Traverse Edge -> Vertices
+            DMPlexGetConeSize(dm, e, &num_verts);
+            DMPlexGetCone(dm, e, &verts);
 
-                // Only pull coordinates if the point actually holds degrees of freedom (Vertices)
-                if (dof > 0) {
-                    PetscSectionGetOffset(coordSection, p, &off);
-                    cx += coords[off];
-                    cy += coords[off + 1];
-                    cz += coords[off + 2];
-                    count++;
+            for (PetscInt j = 0; j < num_verts; ++j) {
+                PetscInt p = verts[j];
+
+                // Defensively check if the point is within the coordinate section's chart range
+                if (p >= cStart && p < cEnd) {
+                    PetscInt dof, off;
+                    PetscSectionGetDof(coordSection, p, &dof);
+
+                    // Only pull coordinates if the point actually holds degrees of freedom
+                    if (dof > 0) {
+                        PetscSectionGetOffset(coordSection, p, &off);
+                        cx += coords[off];
+                        cy += coords[off + 1];
+                        cz += coords[off + 2];
+                        count++;
+                    }
                 }
             }
         }
-        // Clean up the closure array memory allocated by PETSc
-        DMPlexRestoreTransitiveClosure(dm, f, PETSC_TRUE, &closureSize, &closure);
 
+        // "count" will normally be 6 for a triangle (3 edges * 2 vertices).
+        // Dividing the sum by 6 mathematically yields the exact centroid.
         if (count > 0) {
             cx /= count;
             cy /= count;
@@ -1309,6 +1355,11 @@ static void process_tile_3D(MPI_Comm comm, int final_smooth_its, int tile_x, int
             min_p = &p3;
 
         if (get_owner_rank_3D(*min_p) == comm_rank) {
+            double vol = calculate_tet_volume(p0, p1, p2, p3);
+            if (vol < 1e-13) {
+                continue; // Drop degenerate element before it reaches PETSc
+            }
+
             Tetrahedron new_t;
             int *src_idx[4] = {(int *)&tet.v0, (int *)&tet.v1, (int *)&tet.v2, (int *)&tet.v3};
             int *dst_idx[4] = {&new_t.v0, &new_t.v1, &new_t.v2, &new_t.v3};
@@ -1535,6 +1586,14 @@ DM GenerateBoxMeshDM_3D(MPI_Comm comm, double target_edge_length, double domain_
     DOMAIN_WIDTH = domain_width;
     DOMAIN_HEIGHT = domain_height;
     DOMAIN_DEPTH = domain_depth;
+
+    // 2^20 is the maximum index value for the index
+    if (TARGET_EDGE_LENGTH < DOMAIN_WIDTH / 1048575.0) {
+        if (comm_rank == 0) {
+            std::cerr << "WARNING: Target edge length is too small. It exceeds the 20-bit index limit per dimension.\n";
+            MPI_Abort(comm, EXIT_FAILURE);
+        }
+    }
 
     int best_tx = 1, best_ty = 1, best_tz = 1;
     double min_cut_area = 1e30;
