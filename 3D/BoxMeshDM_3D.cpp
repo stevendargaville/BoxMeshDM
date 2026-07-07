@@ -9,9 +9,9 @@
 #include <mpi.h>
 #include <petscdmplex.h>
 #include <petscsf.h>
-// #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 const double EPSILON = 1e-13;
@@ -112,19 +112,6 @@ static void get_tet_dihedral_angles(const Point3D &p0, const Point3D &p1, const 
         }
     }
 }
-
-/*
-static double get_min_dihedral(const Point3D &p0, const Point3D &p1, const Point3D &p2, const Point3D &p3) {
-    double angles[6];
-    get_tet_dihedral_angles(p0, p1, p2, p3, angles);
-    double min_a = 360.0;
-    for (int i = 0; i < 6; ++i) {
-        if (angles[i] < min_a)
-            min_a = angles[i];
-    }
-    return min_a;
-}
-*/
 
 // Calculates the square mean ratio of a given tetrahedron
 // Maximizing this metric prevents slivers
@@ -1391,6 +1378,91 @@ static void process_tile_3D(MPI_Comm comm, int final_smooth_its, int tile_x, int
     std::vector<int>().swap(local_to_owned_idx);
 }
 
+// Merges boundary nodes connected by highly compressed edges
+static void CollapseBoundarySlivers_3D(std::vector<Point3D> &points, std::vector<Tetrahedron> &tets) {
+    double threshold = 0.1 * TARGET_EDGE_LENGTH;
+    double thresh_sq = threshold * threshold;
+    int n = points.size();
+
+    std::vector<int> parent(n);
+    for (int i = 0; i < n; ++i)
+        parent[i] = i;
+
+    // Union-find root lookup
+    auto find_set = [&](int i) {
+        int root = i;
+        while (root != parent[root])
+            root = parent[root];
+        int curr = i;
+        while (curr != root) {
+            int nxt = parent[curr];
+            parent[curr] = root;
+            curr = nxt;
+        }
+        return root;
+    };
+
+    auto is_boundary = [&](const Point3D &p) {
+        return (std::abs(p.x) < EPSILON || std::abs(p.x - DOMAIN_WIDTH) < EPSILON || std::abs(p.y) < EPSILON ||
+                std::abs(p.y - DOMAIN_HEIGHT) < EPSILON || std::abs(p.z) < EPSILON || std::abs(p.z - DOMAIN_DEPTH) < EPSILON);
+    };
+
+    // Extracts all unique edges from the current tets
+    std::vector<std::pair<int, int>> edges;
+    edges.reserve(tets.size() * 6);
+    for (const auto &t : tets) {
+        edges.push_back({t.v0, t.v1});
+        edges.push_back({t.v0, t.v2});
+        edges.push_back({t.v0, t.v3});
+        edges.push_back({t.v1, t.v2});
+        edges.push_back({t.v1, t.v3});
+        edges.push_back({t.v2, t.v3});
+    }
+
+    // Evaluates edges and collapse if both points sit on the boundary and are too close
+    for (const auto &e : edges) {
+        int u = e.first;
+        int v = e.second;
+        int pu = find_set(u);
+        int pv = find_set(v);
+
+        if (pu != pv) {
+            const Point3D &p1 = points[pu];
+            const Point3D &p2 = points[pv];
+
+            if (is_boundary(p1) && is_boundary(p2)) {
+                double dx = p1.x - p2.x, dy = p1.y - p2.y, dz = p1.z - p2.z;
+                if (dx * dx + dy * dy + dz * dz < thresh_sq) {
+                    // Makes the merge deterministic across parallel ranks using the unique hash
+                    if (p1.unique_hash_id < p2.unique_hash_id) {
+                        parent[pv] = pu;
+                    } else {
+                        parent[pu] = pv;
+                    }
+                }
+            }
+        }
+    }
+
+    // Updates the tetrahedra vertices and discards any that have collapsed into lines/points
+    std::vector<Tetrahedron> new_tets;
+    new_tets.reserve(tets.size());
+    for (const auto &t : tets) {
+        int v0 = find_set(t.v0);
+        int v1 = find_set(t.v1);
+        int v2 = find_set(t.v2);
+        int v3 = find_set(t.v3);
+
+        // Only keep if all 4 vertices remain distinct
+        if (v0 != v1 && v0 != v2 && v0 != v3 && v1 != v2 && v1 != v3 && v2 != v3) {
+            Tetrahedron nt = {v0, v1, v2, v3};
+            new_tets.push_back(nt);
+        }
+    }
+
+    tets = std::move(new_tets);
+}
+
 DM CreateDMPlex3D(MPI_Comm comm, const std::vector<Point3D> &points_on_owned_tets_and_orphans,
                   const std::vector<Tetrahedron> &tets_owned) {
     int comm_rank, comm_size;
@@ -1448,19 +1520,36 @@ DM CreateDMPlex3D(MPI_Comm comm, const std::vector<Point3D> &points_on_owned_tet
         MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
     requests.clear();
 
-    std::unordered_map<uint64_t, PetscInt> points_owned_l2g_map;
+    std::vector<std::pair<uint64_t, PetscInt>> points_owned_l2g_map;
+    points_owned_l2g_map.reserve(num_points_owned);
     for (int i = 0; i < num_points; ++i) {
         if (get_owner_rank_3D(points_on_owned_tets_and_orphans[i]) == comm_rank) {
-            points_owned_l2g_map[points_on_owned_tets_and_orphans[i].unique_hash_id] = global_ids[i];
+            points_owned_l2g_map.emplace_back(points_on_owned_tets_and_orphans[i].unique_hash_id, global_ids[i]);
         }
     }
+
+    // Sorts to enable O(log N) cache-friendly lookups
+    std::sort(
+        points_owned_l2g_map.begin(), points_owned_l2g_map.end(),
+        [](const std::pair<uint64_t, PetscInt> &a, const std::pair<uint64_t, PetscInt> &b) { return a.first < b.first; });
 
     std::vector<std::vector<PetscInt>> send_answers(comm_size);
     for (int r = 0; r < comm_size; ++r) {
         if (recv_counts[r] > 0) {
             send_answers[r].resize(recv_counts[r]);
-            for (int k = 0; k < recv_counts[r]; ++k)
-                send_answers[r][k] = points_owned_l2g_map[recv_ids[r][k]];
+            for (int k = 0; k < recv_counts[r]; ++k) {
+                uint64_t target_id = recv_ids[r][k];
+
+                // Binary search
+                auto it = std::lower_bound(points_owned_l2g_map.begin(), points_owned_l2g_map.end(), target_id,
+                                           [](const std::pair<uint64_t, PetscInt> &p, uint64_t val) { return p.first < val; });
+
+                if (it != points_owned_l2g_map.end() && it->first == target_id) {
+                    send_answers[r][k] = it->second;
+                } else {
+                    send_answers[r][k] = neg_one;
+                }
+            }
         }
     }
 
@@ -1657,6 +1746,8 @@ DM GenerateBoxMeshDM_3D(MPI_Comm comm, double target_edge_length, double domain_
     int tx = comm_rank % TILE_DIM_X;
 
     process_tile_3D(comm, final_smooth_its, tx, ty, tz, factor, dt, points_on_owned_tets_and_orphans, tets_owned);
+
+    CollapseBoundarySlivers_3D(points_on_owned_tets_and_orphans, tets_owned);
 
     if (integrity_check) {
         if (!CheckMeshIntegrity_3D(comm, points_on_owned_tets_and_orphans, tets_owned))
