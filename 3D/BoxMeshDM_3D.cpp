@@ -1650,7 +1650,19 @@ std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz, double spaci
                 // Generate a deterministic hash
                 uint64_t hash_id = create_point_with_unique_hash_id_3D(i, j, k, 0);
 
-                points.emplace_back(i * spacing, j * spacing, k * spacing, hash_id);
+                double x = i * spacing;
+                double y = j * spacing;
+                double z = k * spacing;
+
+                // Clamp to the domain boundaries to avoid floating point overshoot
+                if (x > DOMAIN_WIDTH)
+                    x = DOMAIN_WIDTH;
+                if (y > DOMAIN_HEIGHT)
+                    y = DOMAIN_HEIGHT;
+                if (z > DOMAIN_DEPTH)
+                    z = DOMAIN_DEPTH;
+
+                points.emplace_back(x, y, z, hash_id);
             }
         }
     }

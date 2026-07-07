@@ -4,11 +4,26 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <petsc.h>
 #include <petscdmplex.h>
 #include <string>
 #include <vector>
+
+// Macro to wrap test execution with MPI timing
+#define RUN_TEST_TIMED(test_call)                                                                                             \
+    do {                                                                                                                      \
+        MPI_Barrier(PETSC_COMM_WORLD); /* Synchronize all ranks before starting */                                            \
+        double t_start = MPI_Wtime();                                                                                         \
+        test_call;                                                                                                            \
+        MPI_Barrier(PETSC_COMM_WORLD); /* Synchronize all ranks after finishing */                                            \
+        double t_end = MPI_Wtime();                                                                                           \
+        if (rank == 0) {                                                                                                      \
+            std::cout << "[TIMING] `" << #test_call << "` completed in " << std::fixed << std::setprecision(4)                \
+                      << (t_end - t_start) << " seconds.\n=======================================\n\n";                       \
+        }                                                                                                                     \
+    } while (0)
 
 namespace fs = std::filesystem;
 
@@ -503,6 +518,92 @@ void TestMeshResolutionScaling(int rank) {
         std::cout << "TestMeshResolutionScaling Passed!\n\n";
 }
 
+// Test 15: High-load stress test to generate a few million elements
+void TestLargeMeshGeneration(int rank, int size) {
+    // Only runs if it is running in serial or if it runs in MPI with 8 ranks
+    // (avoids the massive mesh generation taking too long)
+    if (size != 1 && size != 8)
+        return;
+
+    if (rank == 0)
+        std::cout << "Running TestLargeMeshGeneration (expecting ~3 Million+ elements)...\n";
+
+    // Target edge length of 0.0125 mathematically maps to roughly 80 points per axis.
+    // 80 * 80 * 80 = 512,000 cubes. At ~6 tetrahedra per cube that leads to > 3,000,000 elements globally.
+    double target_edge = 0.0125;
+
+    DM dm = GenerateBoxMeshDM_3D(PETSC_COMM_WORLD, target_edge, 1.0, 1.0, 1.0, 5, 0.5, 0.2, PETSC_TRUE, PETSC_FALSE);
+    TEST_ASSERT(dm != nullptr, "Large mesh generation returned a null DM.");
+
+    PetscInt c_start, c_end;
+    DMPlexGetHeightStratum(dm, 0, &c_start, &c_end);
+    PetscInt local_cells = c_end - c_start;
+
+    PetscInt global_cells = 0;
+    MPI_Allreduce(&local_cells, &global_cells, 1, MPIU_INT, MPI_SUM, PETSC_COMM_WORLD);
+
+    if (rank == 0) {
+        std::cout << "-> Successfully generated " << global_cells << " global tetrahedra!\n";
+        TEST_ASSERT(global_cells > 2000000, "Large mesh failed to breach the 2 million element mark.");
+    }
+
+    EnsureOutputDirectory("test_outputs");
+    std::string filename = "test_outputs/80x80x80_" + std::to_string(size) + "_ranks.vtu";
+    WriteTestVTU(dm, filename, PETSC_COMM_WORLD);
+    DMDestroy(&dm);
+
+    if (rank == 0)
+        std::cout << "TestLargeMeshGeneration Passed! Dumped '" << filename << "'\n\n";
+}
+
+// Test 16: Ensure mesh generator can handle extremely flat/sheet-like domains
+void TestExtremelyFlatDomain(int rank, int size) {
+    if (rank == 0)
+        std::cout << "Running TestExtremelyFlatDomain...\n";
+
+    // 10x10x0.1 domain generates extremely high geometric aspect ratios for the initial MPI tile chunking
+    DM dm = GenerateBoxMeshDM_3D(PETSC_COMM_WORLD, 0.05, 2.0, 2.0, 0.1, 5, 0.5, 0.2, PETSC_TRUE, PETSC_FALSE);
+    TEST_ASSERT(dm != nullptr, "Extremely flat domain mesh generation failed.");
+
+    EnsureOutputDirectory("test_outputs");
+    std::string filename = "test_outputs/flat_domain_" + std::to_string(size) + "_ranks.vtu";
+    WriteTestVTU(dm, filename, PETSC_COMM_WORLD);
+    DMDestroy(&dm);
+
+    if (rank == 0)
+        std::cout << "TestExtremelyFlatDomain Passed! Dumped '" << filename << "'\n\n";
+}
+
+// Test 17: Validate spatial partitioning assignment function handles boundary float limits safely
+void TestOwnerRankDetermination(int rank) {
+    if (rank == 0)
+        std::cout << "Running TestOwnerRankDetermination...\n";
+
+    // Re-simulate domain dimensions to ensure static boundaries are set
+    DOMAIN_WIDTH = 2.0;
+    DOMAIN_HEIGHT = 2.0;
+    DOMAIN_DEPTH = 2.0;
+
+    // Spatial edge boundaries
+    Point3D origin(0.0, 0.0, 0.0);
+    Point3D far_corner(2.0, 2.0, 2.0);
+    Point3D out_of_bounds(3.0, 3.0, 3.0);
+    Point3D negative(-1.0, -1.0, -1.0);
+
+    int o_origin = get_owner_rank_3D(origin);
+    int o_far = get_owner_rank_3D(far_corner);
+    int o_out = get_owner_rank_3D(out_of_bounds);
+    int o_neg = get_owner_rank_3D(negative);
+
+    TEST_ASSERT(o_origin >= 0, "Origin owner rank must be strictly valid.");
+    TEST_ASSERT(o_far >= 0, "Far corner boundary owner rank must be strictly valid.");
+    TEST_ASSERT(o_out >= 0, "Out of bounds points should clamp to highest partition rank safely.");
+    TEST_ASSERT(o_neg >= 0, "Negative points should clamp to rank 0 securely.");
+
+    if (rank == 0)
+        std::cout << "TestOwnerRankDetermination Passed!\n\n";
+}
+
 int main(int argc, char **argv) {
     PetscInitialize(&argc, &argv, NULL, NULL);
 
@@ -517,18 +618,23 @@ int main(int argc, char **argv) {
     }
 
     // Run Tests
-    TestMinimalCube(rank);
-    TestBoundaryClamping(rank);
-    TestDegenerateDetection(rank);
-    TestParallelMeshGeneration(rank, size);
-    TestDMPlexTopology(rank);
-    TestSmoothingConvergence(rank, size);
-    TestNonUnitDomain(rank, size);
-    TestExplicitSmoothingVisuals(rank, size);
-    TestHighResolutionMesh(rank, size);
-    TestWatertightVolume(rank);
-    TestPETScBoundaryLabels(rank);
-    TestAsymmetricMPI(rank, size);
+    RUN_TEST_TIMED(TestMinimalCube(rank));
+    RUN_TEST_TIMED(TestBoundaryClamping(rank));
+    RUN_TEST_TIMED(TestDegenerateDetection(rank));
+    RUN_TEST_TIMED(TestParallelMeshGeneration(rank, size));
+    RUN_TEST_TIMED(TestDMPlexTopology(rank));
+    RUN_TEST_TIMED(TestSmoothingConvergence(rank, size));
+    RUN_TEST_TIMED(TestNonUnitDomain(rank, size));
+    RUN_TEST_TIMED(TestExplicitSmoothingVisuals(rank, size));
+    RUN_TEST_TIMED(TestHighResolutionMesh(rank, size));
+    RUN_TEST_TIMED(TestWatertightVolume(rank));
+    RUN_TEST_TIMED(TestPETScBoundaryLabels(rank));
+    RUN_TEST_TIMED(TestAsymmetricMPI(rank, size));
+    RUN_TEST_TIMED(TestDMPlexInternalValidity(rank));
+    RUN_TEST_TIMED(TestMeshResolutionScaling(rank));
+    // RUN_TEST_TIMED(TestLargeMeshGeneration(rank, size));
+    RUN_TEST_TIMED(TestExtremelyFlatDomain(rank, size));
+    RUN_TEST_TIMED(TestOwnerRankDetermination(rank));
 
     if (rank == 0) {
         std::cout << "=========================================\n";
