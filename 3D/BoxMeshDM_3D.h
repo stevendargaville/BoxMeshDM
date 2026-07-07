@@ -1,9 +1,13 @@
 #ifndef TET_MESH_GEN_H
 #define TET_MESH_GEN_H
 
-#include <cstdint>
 #include <mpi.h>
 #include <petscdm.h>
+
+// C++ only API
+#ifdef __cplusplus
+
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -54,6 +58,9 @@ bool apply_boundary_constraint_3D(Point3D &p, double &dx, double &dy, double &dz
 
 int get_owner_rank_3D(const Point3D &p);
 
+#endif /* __cplusplus */
+
+// Public C / C++ API:
 // Main generator
 PETSC_EXTERN DM GenerateBoxMeshDM_3D(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height,
                                      double domain_depth, int final_smooth_its, double factor, double dt,
