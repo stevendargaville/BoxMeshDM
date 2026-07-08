@@ -9,6 +9,7 @@
 #include <mpi.h>
 #include <petscdmplex.h>
 #include <petscsf.h>
+#include <petscviewerhdf5.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1669,11 +1670,54 @@ std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz, double spaci
     return points;
 }
 
+// (filename must include .vtu extension)
 void WriteTetrahedralMeshVTU(DM dm, const std::string &filename, MPI_Comm comm) {
     PetscViewer viewer;
     PetscViewerVTKOpen(comm, filename.c_str(), FILE_MODE_WRITE, &viewer);
     DMView(dm, viewer);
     PetscViewerDestroy(&viewer);
+}
+
+/*
+Can view this in paraview with:
+/home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
+then using the XDMF reader with:
+paraview box_mesh.xmf
+(filename must include .h5 extension)
+*/
+void WriteTetrahedralMeshH5(DM dm, const std::string &filename, MPI_Comm comm) {
+    PetscViewer viewer;
+    PetscViewerHDF5Open(comm, filename.c_str(), FILE_MODE_WRITE, &viewer);
+    DMView(dm, viewer);
+    PetscViewerDestroy(&viewer);
+}
+
+// Write output if requested (filename must not include an extension)
+void WriteTetrahedralMesh(DM dm, const std::string &filename, MPI_Comm comm, PetscInt write_mesh, PetscBool print_stats) {
+    int comm_rank;
+    MPI_Comm_rank(comm, &comm_rank);
+
+    if (write_mesh == 1) {
+#ifdef PETSC_HAVE_HDF5
+        if (comm_rank == 0 && print_stats) {
+            std::cout << "Writing out mesh to " + filename + ".h5...\n";
+        }
+        WriteTetrahedralMeshH5(dm, filename + ".h5", comm);
+#else
+        if (comm_rank == 0) {
+            std::cerr << "-write_mesh=1 (H5 output mode) not available without HDF5 enabled in PETSc. Consider setting "
+                         "write_mesh=2 (VTU output mode).\n";
+        }
+#endif
+    }
+    // Can directly view the output in Paraview
+    if (write_mesh == 2) {
+        if (comm_rank == 0 && print_stats) {
+            std::cout << "Writing out mesh to " + filename + ".vtu...\n";
+        }
+        // Using your existing VTU writer
+        WriteTetrahedralMeshVTU(dm, filename + ".vtu", comm);
+    }
 }
 
 DM GenerateBoxMeshDM_3D(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height,
@@ -1778,3 +1822,60 @@ DM GenerateBoxMeshDM_3D(MPI_Comm comm, double target_edge_length, double domain_
 
     return dm;
 }
+
+// Main Driver
+// (Generates a 3D mesh using either the values parsed via the commandline, otherwise using default values)
+#ifdef STANDALONE_MESH_GEN
+int main(int argc, char **argv) {
+    PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
+
+    // Parse command line options with defaults
+    double target_len = 0.02;
+    PetscBool set;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &target_len, &set));
+
+    PetscInt write_mesh = 1;
+    PetscCall(PetscOptionsGetInt(NULL, NULL, "-write_mesh", &write_mesh, NULL));
+
+    PetscBool integrity_check = PETSC_FALSE;
+    PetscCall(PetscOptionsGetBool(NULL, NULL, "-integrity_check", &integrity_check, NULL));
+
+    PetscBool print_stats = PETSC_TRUE;
+    PetscCall(PetscOptionsGetBool(NULL, NULL, "-print_stats", &print_stats, NULL));
+
+    PetscInt final_smooth_its = 4;
+    PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, &set));
+
+    double domain_width = 1.0;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_width", &domain_width, &set));
+
+    double domain_height = 1.0;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_height", &domain_height, &set));
+
+    double domain_depth = 1.0;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_depth", &domain_depth, &set));
+
+    double lloyd_factor = 0.5;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-lloyd_factor", &lloyd_factor, &set));
+
+    double spring_dt = 0.2;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-spring_dt", &spring_dt, &set));
+
+    // Generate the DMPlex for this mesh
+    DM dm = GenerateBoxMeshDM_3D(PETSC_COMM_WORLD, target_len, domain_width, domain_height, domain_depth, final_smooth_its,
+                                 lloyd_factor, spring_dt, integrity_check, print_stats);
+
+    // Check a valid mesh has been generated
+    if (dm) {
+        // Write output if requested
+        WriteTetrahedralMesh(dm, "box_mesh_3D", PETSC_COMM_WORLD, write_mesh, print_stats);
+        PetscCall(DMDestroy(&dm));
+    } else {
+        PetscCall(PetscFinalize());
+        return EXIT_FAILURE;
+    }
+
+    PetscCall(PetscFinalize());
+    return 0;
+}
+#endif

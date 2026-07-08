@@ -52,6 +52,7 @@ MPIEXEC_FLAGS ?= -bind-to none
 # Targets and rules
 TARGET_CXX := test_runner
 TARGET_C   := c_test_runner
+TARGET_GEN_3D := BoxMeshDM_3D_runner
 
 # Source files
 LIB_SRC    := BoxMeshDM_3D.cpp
@@ -63,7 +64,7 @@ OBJS_CXX   := $(SRCS_CXX:.cpp=.o)
 SRCS_C     := test_lib_3D.c
 OBJS_C     := $(SRCS_C:.c=.o)
 
-all: $(TARGET_CXX) $(TARGET_C)
+all: $(TARGET_CXX) $(TARGET_C) $(TARGET_GEN_3D)
 
 # Builds C++ Test Suite
 $(TARGET_CXX): $(LIB_OBJ) $(OBJS_CXX)
@@ -72,6 +73,9 @@ $(TARGET_CXX): $(LIB_OBJ) $(OBJS_CXX)
 # Build C Integration Test (Link with CXX to ensure C++ runtime/std linkage)
 $(TARGET_C): $(LIB_OBJ) $(OBJS_C)
 	$(CXX) $(CXXFLAGS) $(LIB_OBJ) $(OBJS_C) $(LIBS) -o $(TARGET_C)
+
+$(TARGET_GEN_3D): BoxMeshDM_3D.cpp
+	$(CXX) $(CXXFLAGS) -DSTANDALONE_MESH_GEN $(INCLUDES) BoxMeshDM_3D.cpp $(LIBS) -o $(TARGET_GEN_3D)
 
 # Object compilation rules
 %.o: %.cpp
@@ -123,7 +127,7 @@ release:
 	$(MAKE) MODE=release
 
 clean:
-	rm -f $(LIB_OBJ) $(OBJS_CXX) $(OBJS_C) $(TARGET_CXX) $(TARGET_C)
+	rm -f $(LIB_OBJ) $(OBJS_CXX) $(OBJS_C) $(TARGET_CXX) $(TARGET_C) $(TARGET_GEN_3D)
 	rm -rf test_outputs/
 
 .PHONY: all clean test test_1 test_2 test_4 test_8 test_c debug release
