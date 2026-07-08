@@ -78,7 +78,7 @@ void ValidateMeshQualityAndPrint(MPI_Comm comm, int iterations, const std::vecto
 }
 
 // Write VTU using the decoupled PETSc DM
-void WriteTestVTU(DM dm, const std::string &filename, MPI_Comm comm) { WriteTetrahedralMeshVTU(dm, filename, comm); }
+void WriteTestVTU(DM dm, const std::string &filename, MPI_Comm comm) { WriteMeshVTU(dm, filename, comm); }
 
 // Test 1: Minimal structural sanity checks
 void TestMinimalCube(int rank) {

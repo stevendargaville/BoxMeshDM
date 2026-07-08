@@ -38,12 +38,12 @@ std::vector<Point3D> GenerateStructuredGrid(int nx, int ny, int nz, double spaci
 DM CreateDMPlex3D(MPI_Comm comm, const std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets);
 
 // Writes tetrahedral mesh to VTU file (unstructured grid)
-void WriteTetrahedralMeshVTU(DM dm, const std::string &filename, MPI_Comm comm);
+void WriteMeshVTU(DM dm, const std::string &filename, MPI_Comm comm);
 
 // Writes tetrahedral mesh to h5 file
-void WriteTetrahedralMeshH5(DM dm, const std::string &filename, MPI_Comm comm);
+void WriteMeshH5(DM dm, const std::string &filename, MPI_Comm comm);
 
-void WriteTetrahedralMesh(DM dm, const std::string &filename, MPI_Comm comm, PetscInt write_mesh, PetscBool print_stats);
+void WriteMesh(DM dm, const std::string &filename, MPI_Comm comm, PetscInt write_mesh, PetscBool print_stats);
 
 // Lloyd-smoothing: Moves vertices towards the volume-weighted centroid
 void relax_points_lloyd_3D(std::vector<Point3D> &points, const std::vector<Tetrahedron> &tets, double factor, double min_x,

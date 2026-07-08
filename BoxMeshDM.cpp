@@ -1941,7 +1941,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
 // ~~~~~~~~~~~~~~~~~
 
 // (filename must include .vtu extension)
-void WriteTetrahedralMeshVTU(DM dm, const std::string &filename, MPI_Comm comm) {
+void WriteMeshVTU(DM dm, const std::string &filename, MPI_Comm comm) {
     PetscViewer viewer;
     PetscViewerVTKOpen(comm, filename.c_str(), FILE_MODE_WRITE, &viewer);
     DMView(dm, viewer);
@@ -1955,7 +1955,7 @@ then using the XDMF reader with:
 paraview box_mesh.xmf
 (filename must include .h5 extension)
 */
-void WriteTetrahedralMeshH5(DM dm, const std::string &filename, MPI_Comm comm) {
+void WriteMeshH5(DM dm, const std::string &filename, MPI_Comm comm) {
     PetscViewer viewer;
     PetscViewerHDF5Open(comm, filename.c_str(), FILE_MODE_WRITE, &viewer);
     DMView(dm, viewer);
@@ -1963,7 +1963,7 @@ void WriteTetrahedralMeshH5(DM dm, const std::string &filename, MPI_Comm comm) {
 }
 
 // Write output if requested (filename must not include an extension)
-void WriteTetrahedralMesh(DM dm, const std::string &filename, MPI_Comm comm, PetscInt write_mesh, PetscBool print_stats) {
+void WriteMesh(DM dm, const std::string &filename, MPI_Comm comm, PetscInt write_mesh, PetscBool print_stats) {
     int comm_rank;
     MPI_Comm_rank(comm, &comm_rank);
 
@@ -1972,7 +1972,7 @@ void WriteTetrahedralMesh(DM dm, const std::string &filename, MPI_Comm comm, Pet
         if (comm_rank == 0 && print_stats) {
             std::cout << "Writing out mesh to " + filename + ".h5...\n";
         }
-        WriteTetrahedralMeshH5(dm, filename + ".h5", comm);
+        WriteMeshH5(dm, filename + ".h5", comm);
 #else
         if (comm_rank == 0) {
             std::cerr << "-write_mesh=1 (H5 output mode) not available without HDF5 enabled in PETSc. Consider setting "
@@ -1986,7 +1986,7 @@ void WriteTetrahedralMesh(DM dm, const std::string &filename, MPI_Comm comm, Pet
             std::cout << "Writing out mesh to " + filename + ".vtu...\n";
         }
         // Using your existing VTU writer
-        WriteTetrahedralMeshVTU(dm, filename + ".vtu", comm);
+        WriteMeshVTU(dm, filename + ".vtu", comm);
     }
 }
 
@@ -2179,7 +2179,7 @@ int main(int argc, char **argv) {
     // Check a valid mesh has been generated
     if (dm) {
         // Write output if requested
-        WriteTetrahedralMesh(dm, "box_mesh", MPI_COMM_WORLD, write_mesh, print_stats);
+        WriteMesh(dm, "box_mesh", MPI_COMM_WORLD, write_mesh, print_stats);
         PetscCall(DMDestroy(&dm));
     } else {
         PetscCall(PetscFinalize());
