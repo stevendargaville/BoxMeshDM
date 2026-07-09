@@ -2149,10 +2149,10 @@ int main(int argc, char **argv) {
     PetscBool set;
     PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &target_len, &set));
 
-    PetscInt write_mesh = 1;
+    PetscInt write_mesh = 0;
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-write_mesh", &write_mesh, NULL));
 
-    PetscBool integrity_check = PETSC_FALSE;
+    PetscBool integrity_check = PETSC_TRUE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-integrity_check", &integrity_check, NULL));
 
     PetscBool print_stats = PETSC_TRUE;
