@@ -839,35 +839,38 @@ static void ComputeValenceAndEdges(const std::vector<Point> &points, const std::
 
 // ~~~~~~~~~~~~~~~~~
 
-// // Helper to remove duplicates from cloud
-// static void remove_duplicates(std::vector<Point>& points) {
-//     if (points.empty()) return;
+// Helper to remove duplicates from cloud
+static void remove_duplicates(std::vector<Point> &points) {
+    if (points.empty())
+        return;
 
-//     // Use strict lexicographical sort.
-//     std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
-//         if (a.x != b.x) return a.x < b.x;
-//         if (a.y != b.y) return a.y < b.y;
-//         return a.unique_hash_id < b.unique_hash_id; // Tie-breaker for absolute stability
-//     });
+    // Use strict lexicographical sort.
+    std::sort(points.begin(), points.end(), [](const Point &a, const Point &b) {
+        if (a.x != b.x)
+            return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
+        return a.unique_hash_id < b.unique_hash_id; // Tie-breaker for absolute stability
+    });
 
-//     std::vector<Point> unique_points;
-//     unique_points.reserve(points.size());
-//     unique_points.push_back(points[0]);
+    std::vector<Point> unique_points;
+    unique_points.reserve(points.size());
+    unique_points.push_back(points[0]);
 
-//     for (size_t i = 1; i < points.size(); ++i) {
-//         const Point& prev = unique_points.back();
-//         const Point& curr = points[i];
+    for (size_t i = 1; i < points.size(); ++i) {
+        const Point &prev = unique_points.back();
+        const Point &curr = points[i];
 
-//         // Check distance with tolerance
-//         double dist_sq = (prev.x - curr.x)*(prev.x - curr.x) + (prev.y - curr.y)*(prev.y - curr.y);
+        // Check distance with tolerance
+        double dist_sq = (prev.x - curr.x) * (prev.x - curr.x) + (prev.y - curr.y) * (prev.y - curr.y);
 
-//         // Only keep if distance is physically significant relative to mesh size
-//         if (dist_sq > TOL_LEN_SQ) {
-//             unique_points.push_back(curr);
-//         }
-//     }
-//     points = unique_points;
-// }
+        // Only keep if distance is physically significant relative to mesh size
+        if (dist_sq > TOL_LEN_SQ) {
+            unique_points.push_back(curr);
+        }
+    }
+    points = unique_points;
+}
 
 // ~~~~~~~~~~~~~~~~~
 
@@ -1056,7 +1059,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // existing_hashes.clear();
 
     // Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
-    // remove_duplicates(points_with_halos);
+    remove_duplicates(points_with_halos);
 
     // 4. ITERATIONS
     // We relax all points that are strictly inside the generated cloud.
