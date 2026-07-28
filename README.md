@@ -36,7 +36,7 @@ There are 7 input variables that can be changed from the command line:
    | `-target_edge_length` | 0.0025 | Target edge length for elements. Resulting mesh will have edges close to this value. |
    | `-final_smooth_its` | 4 | How many iterations of smoothing (LLoyds + springs) to do. More iterations will increase mesh quality and runtime. |
    | `-write_mesh` | 0 | Output the PETSc DM to disk in HDF5 format (1) or the VTK format (2). |
-   | `-integrity_check` | true | Run mesh integrity checks and return NULL if not valid. This takes extra memory and time. Recommend disabling this for production runs. |
+   | `-integrity_check` | false | Run mesh integrity checks and return NULL if not valid. This takes extra memory and time. Recommend disabling this for production runs. |
    | `-print_stats` | true | Print global mesh statistics on rank 0. This takes extra memory and time. Recommend disabling this for production runs. |
  | `-domain_width` | 1.0 | The length of the side of the cube in the x direction. |
 | `-domain_height` | 1.0 | The length of the side of the cube in the y direction. |

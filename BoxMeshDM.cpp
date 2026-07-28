@@ -2152,7 +2152,7 @@ int main(int argc, char **argv) {
     PetscInt write_mesh = 0;
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-write_mesh", &write_mesh, NULL));
 
-    PetscBool integrity_check = PETSC_TRUE;
+    PetscBool integrity_check = PETSC_FALSE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-integrity_check", &integrity_check, NULL));
 
     PetscBool print_stats = PETSC_TRUE;
