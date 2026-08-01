@@ -121,14 +121,14 @@ tests_lib: test_lib
 tests: BoxMeshDM
 	@echo "Running tests on executable..."
 	./BoxMeshDM
-	./BoxMeshDM -target_edge_length 0.002 -integrity_check 1
-	./BoxMeshDM -target_edge_length 0.003 -final_smooth_its 5 -integrity_check 1
+	./BoxMeshDM -target_edge_length 0.002
+	./BoxMeshDM -target_edge_length 0.003 -final_smooth_its 5
 	./BoxMeshDM -target_edge_length 0.004 -integrity_check 0
-	./BoxMeshDM -target_edge_length 0.005 -print_stats 0 -integrity_check 1
+	./BoxMeshDM -target_edge_length 0.005 -print_stats 0
 	./BoxMeshDM -target_edge_length 0.006 -integrity_check 0 -print_stats 0
-	./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5 -integrity_check 1
-	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0 -integrity_check 1
-	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5 -integrity_check 1
+	./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
+	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0
+	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
 	$(MAKE) lib
 	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"

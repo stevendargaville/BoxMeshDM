@@ -2020,7 +2020,7 @@ int main(int argc, char** argv) {
     PetscBool write_mesh = PETSC_FALSE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &write_mesh, NULL));
 
-    PetscBool integrity_check = PETSC_FALSE;
+    PetscBool integrity_check = PETSC_TRUE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-integrity_check", &integrity_check, NULL));    
 
     PetscBool print_stats = PETSC_TRUE;
