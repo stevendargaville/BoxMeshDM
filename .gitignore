@@ -1,0 +1,16 @@
+# Build products (see the clean rule in the Makefile)
+/BoxMeshDM
+*.o
+/test_lib
+libboxmeshdm.a
+libboxmeshdm.so
+libboxmeshdm.dylib
+*.dat
+
+# Mesh output from -write_mesh and petsc_gen_xdmf.py
+*.h5
+*.xmf
+
+# Editor/OS cruft
+*~
+.DS_Store

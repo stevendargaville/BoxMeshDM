@@ -1631,8 +1631,8 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         if (!area_pass || !perim_pass || !euler_pass || !edge_pass) {
             success = 0;
             std::cout << "\n!!! MESH INTEGRITY CHECK FAILED !!!\n";
-            if (!area_pass) std::cout << "  [FAIL] Total Area: " << std::fixed << std::setprecision(6) << global_total_area << " (Expected 1.0)\n";
-            if (!perim_pass) std::cout << "  [FAIL] Boundary Perimeter: " << global_boundary_len << " (Expected 4.0)\n";
+            if (!area_pass) std::cout << "  [FAIL] Total Area: " << std::fixed << std::setprecision(6) << global_total_area << " (Expected " << expected_area << ")\n";
+            if (!perim_pass) std::cout << "  [FAIL] Boundary Perimeter: " << global_boundary_len << " (Expected " << expected_perimeter << ")\n";
             if (!euler_pass) std::cout << "  [FAIL] Euler Characteristic: " << euler << " (Expected 1)\n";
             if (!edge_pass) {
                 std::cout << "  [FAIL] Bad Edges: " << global_bad_edge_count << " edges > " << MAX_EDGE_RATIO << "x target.\n";
