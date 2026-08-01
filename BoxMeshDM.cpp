@@ -353,6 +353,28 @@ static bool apply_boundary_constraint(Point& p, double& dx, double& dy) {
     return on_boundary;
 }
 
+// Check a tangential move of a wall point stays clear of the corners.
+// wall_p must already be snapped by apply_boundary_constraint, so comparing
+// against the walls exactly identifies which wall(s) it is on.
+// Clamping the move instead would place the point exactly on the corner
+// (or inside its EPSILON capture zone), creating a duplicate of the explicit
+// corner point; Triangle then drops one of the two and the orphaned vertex
+// breaks the Euler characteristic in CheckMeshIntegrity.
+// Rejecting the move keeps the previous position, which is already distinct,
+// so no coincident points can ever be created.
+static bool boundary_move_valid(const Point& wall_p, const Point& candidate) {
+    double corner_margin = 0.25 * TARGET_EDGE_LENGTH;
+    // On left/right wall: the point slides in y, keep it away from the corners
+    if (wall_p.x == 0.0 || wall_p.x == DOMAIN_WIDTH) {
+        if (candidate.y < corner_margin || candidate.y > DOMAIN_HEIGHT - corner_margin) return false;
+    }
+    // On bottom/top wall: the point slides in x
+    if (wall_p.y == 0.0 || wall_p.y == DOMAIN_HEIGHT) {
+        if (candidate.x < corner_margin || candidate.x > DOMAIN_WIDTH - corner_margin) return false;
+    }
+    return true;
+}
+
 // Ensure interior points stay interior by reflecting them back if they cross the boundary
 static void keep_interior_point_inside(Point& p) {
     // Reflect X
@@ -416,17 +438,16 @@ static void apply_jitter(std::vector<Point>& points, double amount, int seed_off
         // CRITICAL: Boundary nodes effectively ignore perpendicular jitter here
         bool was_boundary = apply_boundary_constraint(points[i], jx, jy);
 
-        points[i].x += jx;
-        points[i].y += jy;
-        
+        Point candidate = points[i];
+        candidate.x += jx;
+        candidate.y += jy;
+
         if (!was_boundary) {
-            keep_interior_point_inside(points[i]);
-        } else {
-            // Clamp boundary points strictly to [0, DOMAIN] to handle float drift
-            if (points[i].x < 0) points[i].x = 0;
-            if (points[i].x > DOMAIN_WIDTH) points[i].x = DOMAIN_WIDTH;
-            if (points[i].y < 0) points[i].y = 0;
-            if (points[i].y > DOMAIN_HEIGHT) points[i].y = DOMAIN_HEIGHT;
+            keep_interior_point_inside(candidate);
+            points[i] = candidate;
+        } else if (boundary_move_valid(points[i], candidate)) {
+            // Reject tangential jitter that would take a wall point into a corner
+            points[i] = candidate;
         }
     }
 }
@@ -607,11 +628,9 @@ static void relax_points_lloyd(std::vector<Point>& points, const std::vector<Tri
 
                 if (!was_boundary) {
                     keep_interior_point_inside(candidate);
-                } else {
-                    if (candidate.x < 0) candidate.x = 0;
-                    if (candidate.x > DOMAIN_WIDTH) candidate.x = DOMAIN_WIDTH;
-                    if (candidate.y < 0) candidate.y = 0;
-                    if (candidate.y > DOMAIN_HEIGHT) candidate.y = DOMAIN_HEIGHT;
+                } else if (!boundary_move_valid(temp_p, candidate)) {
+                    // Reject candidates that would take a wall point into a corner
+                    continue;
                 }
 
                 // Inline max cosine calculation using CSR
@@ -721,11 +740,9 @@ static void relax_points_spring(std::vector<Point>& points, const std::vector<Tr
 
             if (!was_boundary) {
                 keep_interior_point_inside(candidate);
-            } else {
-                if (candidate.x < 0) candidate.x = 0;
-                if (candidate.x > DOMAIN_WIDTH) candidate.x = DOMAIN_WIDTH;
-                if (candidate.y < 0) candidate.y = 0;
-                if (candidate.y > DOMAIN_HEIGHT) candidate.y = DOMAIN_HEIGHT;
+            } else if (!boundary_move_valid(temp_p, candidate)) {
+                // Reject a tangential move that would take a wall point into a corner
+                continue;
             }
 
             points[i] = candidate;
@@ -1514,8 +1531,14 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         // Orphan points (owned point but not in any owned triangle on this rank)
         // legitimately have valence 0 here
         if (valence[i] == 0 && appears_in_triangle[i] && get_owner_rank(p, size) == rank) {
-            std::cout << "[Rank " << rank << "] UNCONNECTED POINT: (" << p.x << ", " << p.y 
+            std::cout << "[Rank " << rank << "] UNCONNECTED POINT: (" << p.x << ", " << p.y
                      << ") ID: " << p.unique_hash_id << " Valence: " << valence[i] << "\n";
+        }
+        // On a single rank every point should be in a triangle - an orphan here
+        // means a duplicate/dropped vertex and shows up as an Euler failure below
+        if (size == 1 && !appears_in_triangle[i]) {
+            std::cout << "[Rank " << rank << "] ORPHAN POINT ON SINGLE RANK: (" << p.x << ", " << p.y
+                     << ") ID: " << p.unique_hash_id << "\n";
         }
     }
     appears_in_triangle.clear();
@@ -1997,7 +2020,7 @@ int main(int argc, char** argv) {
     PetscBool write_mesh = PETSC_FALSE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &write_mesh, NULL));
 
-    PetscBool integrity_check = PETSC_FALSE;
+    PetscBool integrity_check = PETSC_TRUE;
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-integrity_check", &integrity_check, NULL));    
 
     PetscBool print_stats = PETSC_TRUE;
