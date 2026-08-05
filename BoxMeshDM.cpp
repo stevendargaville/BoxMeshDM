@@ -35,6 +35,17 @@
 
 static int TILE_DIM_X = -1;
 static int TILE_DIM_Y = -1;
+
+// Agglomeration: the fine tile grid is forced to be a refinement of a coarse
+// grid of COARSE_DIM_X x COARSE_DIM_Y tiles, each coarse tile being split into
+// SUB_DIM_X x SUB_DIM_Y fine tiles. AGG_FACTOR = SUB_DIM_X * SUB_DIM_Y fine
+// ranks make up one coarse group, and they are numbered consecutively.
+static int AGG_FACTOR = 1;     // k: fine ranks per coarse group
+static int COARSE_DIM_X = -1;  // Mc
+static int COARSE_DIM_Y = -1;  // Nc
+static int SUB_DIM_X = 1;      // a: sub-block tiles in x per coarse tile
+static int SUB_DIM_Y = 1;      // b: sub-block tiles in y per coarse tile
+
 static double DOMAIN_WIDTH = 1.0;
 static double DOMAIN_HEIGHT = 1.0;
 static double TARGET_EDGE_LENGTH = 0.0025;
@@ -123,6 +134,22 @@ static void FiniOutput_Triangle(struct triangulateio *outputCtx)
 
 // ~~~~~~~~~~~~~~~~~
 
+// Hierarchical tile <-> rank mapping. The AGG_FACTOR fine tiles that make up
+// coarse group cg are exactly ranks [cg*AGG_FACTOR, (cg+1)*AGG_FACTOR), so a
+// downstream consumer merging every AGG_FACTOR consecutive ranks recovers the
+// coarse decomposition. With AGG_FACTOR == 1 these reduce to plain row-major.
+static inline int tile_to_rank(int tx, int ty) {
+    int cx = tx / SUB_DIM_X, sx = tx % SUB_DIM_X;
+    int cy = ty / SUB_DIM_Y, sy = ty % SUB_DIM_Y;
+    return (cy * COARSE_DIM_X + cx) * AGG_FACTOR + (sy * SUB_DIM_X + sx);
+}
+
+static inline void rank_to_tile(int rank, int *tx, int *ty) {
+    int cg = rank / AGG_FACTOR, sub = rank % AGG_FACTOR;
+    *tx = (cg % COARSE_DIM_X) * SUB_DIM_X + (sub % SUB_DIM_X);
+    *ty = (cg / COARSE_DIM_X) * SUB_DIM_Y + (sub / SUB_DIM_X);
+}
+
 // Helper to determine which rank owns a point based on spatial location
 static int get_owner_rank(const Point& p, int size) {
 
@@ -137,9 +164,8 @@ static int get_owner_rank(const Point& p, int size) {
     if (ty < 0) ty = 0; 
     if (ty >= TILE_DIM_Y) ty = TILE_DIM_Y - 1;
 
-    int global_tile_id = ty * TILE_DIM_X + tx;
-    // With 1 tile per rank, the tile ID is the rank
-    return global_tile_id;
+    // With 1 tile per rank, the tile maps directly to a rank
+    return tile_to_rank(tx, ty);
 }
 
 // Deterministically resolve ownership of boundary nodes
@@ -182,9 +208,9 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
     
     // Simple neighbor discovery: check all ranks (for small scale) or use grid logic
     // Here we use the grid logic to only send to actual neighbors
-    int tx = rank % TILE_DIM_X;
-    int ty = rank / TILE_DIM_X;
-    
+    int tx, ty;
+    rank_to_tile(rank, &tx, &ty);
+
     for (auto& p : points) {
         // Check if point is within the resolution box
         // We use strict inequality to match relax_points logic (points on the exact edge of the box are frozen)
@@ -220,7 +246,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point>& points, 
                         if (p.y > n_max_y + safe_pad) relevant = false;
                         
                         if (relevant) {
-                            int n_rank = ny * TILE_DIM_X + nx;
+                            int n_rank = tile_to_rank(nx, ny);
                             send_buffers[n_rank].push_back({p.unique_hash_id, my_geo_rank, p.x, p.y});
                         }
                     }
@@ -1861,7 +1887,51 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
 
 // ~~~~~~~~~~~~~~~~~
 
-PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
+// Factorize n into M x N such that M*N = n
+// (Tries to match the W x H aspect ratio as closely as possible
+// by finding the minimum total halo surface area possible)
+static void factorize_min_cut(int n, double W, double H, int *m_out, int *n_out) {
+
+    int best_m = 1;
+    int best_n = n;
+    double best_surface_area = 1e30;
+
+    // Find all factor pairs of n
+    for (int m = 1; m * m <= n; ++m) {
+        if (n % m == 0) {
+            int nn = n / m;
+
+            // Calculate the total internal interface length for this decomposition.
+            // In 2D this is the communication cut length, not a surface area.
+            // There are (M - 1) vertical cuts of height H and
+            // (N - 1) horizontal cuts of width W.
+            double surface_area = (m - 1) * H + (nn - 1) * W;
+
+            if (surface_area < best_surface_area) {
+                best_surface_area = surface_area;
+                best_m = m;
+                best_n = nn;
+            }
+
+            // Also try the swapped decomposition (n x m) to ensure symmetry
+            // This handles cases where the domain is rotated (width vs height swapped)
+            double swapped_surface_area = (nn - 1) * H + (m - 1) * W;
+
+            if (swapped_surface_area < best_surface_area) {
+                best_surface_area = swapped_surface_area;
+                best_m = nn;
+                best_n = m;
+            }
+        }
+    }
+
+    *m_out = best_m;
+    *n_out = best_n;
+}
+
+// ~~~~~~~~~~~~~~~~~
+
+PETSC_EXTERN DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats, int agglomeration_factor) {
     int comm_rank, comm_size;
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
@@ -1888,67 +1958,57 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, doub
     TOL_LEN_SQ = TOL_LEN * TOL_LEN;
     TOL_VOLUME = TOL_LEN_SQ * 1e-2;
 
-    // Factorize comm_size into M x N such that M*N = comm_size
-    // (Tries to match the domain aspect ratio as closely as possible
-    // by finding the minimum total halo surface area possible)
-    
-    int best_m = 1;
-    int best_n = comm_size;
-    double best_surface_area = 1e30;
-    
-    // Find all factor pairs of comm_size
-    for (int m = 1; m * m <= comm_size; ++m) {
-        if (comm_size % m == 0) {
-            int n = comm_size / m;
-            
-            // Calculate the total internal interface length for this decomposition.
-            // In 2D this is the communication cut length, not a surface area.
-            // There are (M - 1) vertical cuts of height DOMAIN_HEIGHT and
-            // (N - 1) horizontal cuts of width DOMAIN_WIDTH.
-            double surface_area = (m - 1) * DOMAIN_HEIGHT + (n - 1) * DOMAIN_WIDTH;
-            
-            if (surface_area < best_surface_area) {
-                best_surface_area = surface_area;
-                best_m = m;
-                best_n = n;
-            }
-            
-            // Also try the swapped decomposition (n x m) to ensure symmetry
-            // This handles cases where the domain is rotated (width vs height swapped)
-            double swapped_surface_area = (n - 1) * DOMAIN_HEIGHT + (m - 1) * DOMAIN_WIDTH;
-            
-            if (swapped_surface_area < best_surface_area) {
-                best_surface_area = swapped_surface_area;
-                best_m = n;
-                best_n = m;
-            }
+    // Validate the agglomeration factor - the fine grid has to split evenly
+    // into comm_size/agglomeration_factor coarse groups
+    if (agglomeration_factor < 1) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Agglomeration factor " << agglomeration_factor
+                      << " must be at least 1.\n";
         }
+        MPI_Abort(comm, EXIT_FAILURE);
     }
-    
-    TILE_DIM_X = best_m;
-    TILE_DIM_Y = best_n;
+    if (agglomeration_factor > 1 && comm_size % agglomeration_factor != 0) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Number of MPI ranks " << comm_size
+                      << " is not divisible by the agglomeration factor " << agglomeration_factor << ".\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
+    AGG_FACTOR = agglomeration_factor;
+
+    // Build the coarse grid the same way an ordinary run on comm_size/k ranks would,
+    // then split each coarse tile into a compact sub-block of k fine tiles. The fine
+    // grid is therefore a refinement of the coarse one by construction.
+    factorize_min_cut(comm_size / AGG_FACTOR, DOMAIN_WIDTH, DOMAIN_HEIGHT, &COARSE_DIM_X, &COARSE_DIM_Y);
+    // Factorize the sub-block against the coarse tile aspect ratio so we get
+    // compact blocks (e.g. 3x2 for k=6) rather than degenerate 1xk strips
+    factorize_min_cut(AGG_FACTOR, DOMAIN_WIDTH / COARSE_DIM_X, DOMAIN_HEIGHT / COARSE_DIM_Y, &SUB_DIM_X, &SUB_DIM_Y);
+
+    TILE_DIM_X = COARSE_DIM_X * SUB_DIM_X;
+    TILE_DIM_Y = COARSE_DIM_Y * SUB_DIM_Y;
 
     if (comm_rank == 0 && print_stats) {
         std::cout << "Generating Unstructured Mesh of 2D box...\n";
         std::cout << "Target Edge Length: " << TARGET_EDGE_LENGTH << "\n";
         std::cout << "Domain Width: " << DOMAIN_WIDTH << ", Domain Height: " << DOMAIN_HEIGHT << "\n";
         std::cout << "Running on " << comm_size << " MPI ranks with decomposition " << TILE_DIM_X << "x" << TILE_DIM_Y << ".\n";
+        if (AGG_FACTOR > 1) {
+            std::cout << "Agglomeration factor " << AGG_FACTOR << ": coarse grid "
+                      << COARSE_DIM_X << "x" << COARSE_DIM_Y << " of "
+                      << SUB_DIM_X << "x" << SUB_DIM_Y << " sub-blocks -> fine grid "
+                      << TILE_DIM_X << "x" << TILE_DIM_Y << ".\n";
+        }
     }
 
     std::vector<Point> points_on_owned_triangles_and_orphans;
     std::vector<Triangle> triangles_owned;
 
     // 2. Distribute tiles (1 per rank)
-    for (int y = 0; y < TILE_DIM_Y; ++y) {
-        for (int x = 0; x < TILE_DIM_X; ++x) {
-            int global_id = y * TILE_DIM_X + x;
-            
-            // Since we have exactly comm_size tiles, global_id maps directly to rank
-            if (global_id == comm_rank) {
-                process_tile(comm, final_smooth_its, x, y, points_on_owned_triangles_and_orphans, triangles_owned);
-            }
-        }
-    }
+    // Since we have exactly comm_size tiles, the rank maps directly to a tile
+    int my_tx, my_ty;
+    rank_to_tile(comm_rank, &my_tx, &my_ty);
+    process_tile(comm, final_smooth_its, my_tx, my_ty, points_on_owned_triangles_and_orphans, triangles_owned);
 
     //if (print_stats) std::cout << "Rank " << comm_rank << " generated " << triangles_owned.size() << " triangles_owned.\n";
 
@@ -2001,6 +2061,13 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, doub
     return dm;
 }
 
+// ~~~~~~~~~~~~~~~~~
+
+// Original entry point - equivalent to an agglomeration factor of 1
+PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
+    return GenerateBoxMeshDMAgglom(comm, target_edge_length, domain_width, domain_height, final_smooth_its, integrity_check, print_stats, 1);
+}
+
 // =========================================================
 // Main Driver
 // =========================================================
@@ -2036,12 +2103,16 @@ int main(int argc, char** argv) {
     double domain_height = 1.0;
     PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_height", &domain_height, &set));
 
+    PetscInt agglomeration_factor = 1;
+    PetscCall(PetscOptionsGetInt(NULL, NULL, "-agglomeration_factor", &agglomeration_factor, &set));
+    int agglom_factor = agglomeration_factor;
+
     // Update global variables with parsed values
     DOMAIN_WIDTH = domain_width;
     DOMAIN_HEIGHT = domain_height;
 
     // Generate the DMPlex for this mesh
-    DM dm = GenerateBoxMeshDM(MPI_COMM_WORLD, target_len, domain_width, domain_height, final_smooths, integrity_check, print_stats);
+    DM dm = GenerateBoxMeshDMAgglom(MPI_COMM_WORLD, target_len, domain_width, domain_height, final_smooths, integrity_check, print_stats, agglom_factor);
 
     // Check a valid mesh has been generated
     if (dm) {

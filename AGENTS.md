@@ -37,8 +37,8 @@ make clean && make tests    # executable tests, then builds lib and runs tests_l
 ```
 
 `make tests` is the gate — it runs the executable across several edge lengths, smoothing
-counts, flag combinations, non-square domains, and 1 and 2 MPI ranks, then builds the library
-and runs [test_lib.c](test_lib.c) on 1 and 2 ranks. CI
+counts, flag combinations, non-square domains, agglomeration factors, and 1 and 2 MPI ranks,
+then builds the library and runs [test_lib.c](test_lib.c) on 1 and 2 ranks. CI
 ([.github/workflows/ci_build.yml](.github/workflows/ci_build.yml)) runs exactly this inside the
 Docker images in [dockerfiles/](dockerfiles) (debug, opt, 64-bit, PFLARE) plus a macOS build.
 Debug CI runs with `PETSC_OPTIONS="-on_error_abort -fp_trap on"`, so new floating-point
@@ -53,13 +53,24 @@ root and are untracked; there is no `.gitignore`.
 DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length,
                      double width, double height, int final_smooth_its,
                      PetscBool integrity_check, PetscBool print_stats);
+
+DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length,
+                           double width, double height, int final_smooth_its,
+                           PetscBool integrity_check, PetscBool print_stats,
+                           int agglomeration_factor);
 ```
 
 Returns a distributed `DMPlex` named `"Mesh"`, or `NULL` if `integrity_check` is on and the
 mesh fails validation. Collective on `comm`. Caller destroys with `DMDestroy`.
 
+`GenerateBoxMeshDMAgglom` holds the implementation; `GenerateBoxMeshDM` is a forwarder passing
+`agglomeration_factor = 1`. Both have C linkage, so C and C++ callers use the same two names —
+deliberately no C++-only overload, since C linkage allows only one function per name and having
+the spelling differ by language would be a trap.
+
 Executable options (parsed in `main`): `-target_edge_length`, `-final_smooth_its`,
-`-domain_width`, `-domain_height`, `-write_mesh`, `-integrity_check`, `-print_stats`.
+`-domain_width`, `-domain_height`, `-write_mesh`, `-integrity_check`, `-print_stats`,
+`-agglomeration_factor`.
 
 ## Algorithm / control flow
 
@@ -68,7 +79,8 @@ Executable options (parsed in `main`): `-target_edge_length`, `-final_smooth_its
 1. **Set globals** — `TARGET_EDGE_LENGTH`, `DOMAIN_WIDTH`, `DOMAIN_HEIGHT`, and the tolerances
    `TOL_LEN`, `TOL_LEN_SQ`, `TOL_VOLUME` (all derived from the target edge length).
 2. **Factor `comm_size` into `TILE_DIM_X x TILE_DIM_Y`** minimising the total interface cut
-   length for the domain aspect ratio. **Exactly one tile per rank**, so `tile id == rank`.
+   length for the domain aspect ratio (`factorize_min_cut`). **Exactly one tile per rank**, so
+   tiles and ranks are in bijection — see [Agglomeration](#agglomeration) for the mapping.
 3. **`process_tile`** (BoxMeshDM.cpp:818) — each rank builds its own subdomain, independently.
 4. **`ComputeValenceAndEdges`**, then optionally **`CheckMeshIntegrity`** and
    **`ComputeAndPrintStats`**.
@@ -126,6 +138,21 @@ between subdomains or duplicated/lost vertices at tile interfaces — usually sh
 Euler-characteristic or perimeter failure in `CheckMeshIntegrity`, or as a hang/error inside
 `DMPlexCreateFromCellListParallelPetsc`.
 
+### Agglomeration
+
+`agglomeration_factor` (k) makes the fine rank grid a refinement of the grid a plain
+`comm_size/k`-rank run would use, and reorders ranks so the k fine ranks composing coarse group
+j are exactly ranks `[j*k, (j+1)*k)`. `factorize_min_cut` is called twice: once on `comm_size/k`
+against the domain aspect ratio to get `COARSE_DIM_X x COARSE_DIM_Y`, once on k against the
+*coarse tile* aspect ratio to get the compact sub-block `SUB_DIM_X x SUB_DIM_Y`;
+`TILE_DIM_X/Y` is their product. Tile↔rank conversion goes exclusively through `tile_to_rank`
+and `rank_to_tile`, which reduce to plain row-major at k=1 — never open-code
+`ty * TILE_DIM_X + tx` again. Since global numbering is contiguous in rank order, each coarse
+group's rows form one contiguous range, so a consumer can merge them without a repartitioner.
+
+Ownership tie-breaks (hash ids, "lowest claimant rank") are deterministic under any rank
+permutation, so the reordering does not affect the determinism invariants above.
+
 ### `CreateDM` — global numbering
 
 Owned points get contiguous global IDs via `MPI_Exscan`. Ghost points (vertices of owned
@@ -164,6 +191,7 @@ Both cost extra time and memory; production runs should disable them.
 | `START_JITTER` | `0.30` | Jitter amplitude as a fraction of target edge length. |
 | `ANNEAL_ITERS` | `3` | Jitter+smooth rounds before the jitter-free final smooths. |
 | `TILE_DIM_X/Y` | computed | Rank grid; one tile per rank. |
+| `AGG_FACTOR`, `COARSE_DIM_X/Y`, `SUB_DIM_X/Y` | computed | Agglomeration; all 1/trivial by default. |
 | `TOL_LEN`, `TOL_LEN_SQ`, `TOL_VOLUME` | derived | Length/degenerate-triangle tolerances. |
 
 `ANNEAL_ITERS` and `final_smooth_its` both feed the halo width, so raising them raises memory

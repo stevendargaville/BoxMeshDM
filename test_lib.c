@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
     // Set target mesh edge length
     double target_edge_length = 0.007;
     // Set the number of smoothing iterations
-    PetscInt final_smooth_its = 4;
+    int final_smooth_its = 4;
     // Check the integrity of the mesh and error if not valid
     PetscBool integrity_check = PETSC_TRUE;
     // Print global mesh statistics from MPI rank 0
@@ -48,6 +48,25 @@ int main(int argc, char** argv) {
         (void)ierr;
     } else {
         PetscPrintf(PETSC_COMM_WORLD, "Rectangular mesh generation failed!\n");
+        PetscCall(PetscFinalize());
+        return 1;
+    }
+
+    PetscPrintf(PETSC_COMM_WORLD, "\n=== Testing Agglomerated Square Mesh (1.0 x 1.0) ===\n");
+
+    // Generate a square mesh with all the ranks in a single coarse group. Calling this from a C
+    // translation unit also checks the agglomeration entry point has C linkage.
+    PetscMPIInt comm_size;
+    PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD, &comm_size));
+
+    dm = GenerateBoxMeshDMAgglom(PETSC_COMM_WORLD, target_edge_length, square_width, square_height, final_smooth_its, integrity_check, print_stats, (int)comm_size);
+
+    if (dm) {
+        PetscPrintf(PETSC_COMM_WORLD, "Agglomerated mesh generation successful!\n");
+        ierr = DMDestroy(&dm);
+        (void)ierr;
+    } else {
+        PetscPrintf(PETSC_COMM_WORLD, "Agglomerated mesh generation failed!\n");
         PetscCall(PetscFinalize());
         return 1;
     }
