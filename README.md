@@ -29,7 +29,7 @@ To enable this several compromises were made, namely:
 
 To build an executable which can be called from the command line for small scale testing, ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
-There are five input variables that can be changed from the command line:   
+There are six input variables that can be changed from the command line:   
    | Command line argument  | Default value | Details |
    | --- | -- | -- |
    | ``-target_edge_length`` | 0.0025 | Target edge length for elements. Resulting mesh will have edges close to this value. |
@@ -37,6 +37,7 @@ There are five input variables that can be changed from the command line:
    | ``-write_mesh`` | false | Output the PETSc DM to disk in HDF5 format. |
    | ``-integrity_check`` | true | Run mesh integrity checks and return NULL if not valid. This takes extra memory and time. Recommend disabling this for production runs. |
    | ``-print_stats`` | true | Print global mesh statistics on rank 0. This takes extra memory and time. Recommend disabling this for production runs. |
+   | ``-agglomeration_factor`` | 1 | Number of MPI ranks per coarse group, see [Agglomeration](#agglomeration). Must divide the number of MPI ranks. |
  
  For example, after building the executable we can generate a mesh using 2 MPI ranks on the command line by calling:
 
@@ -68,7 +69,7 @@ In your code, to generate a PETSc DM that can then be used as normal, you can ca
      // Set target mesh edge length
      double target_edge_length = 0.0025;
      // Set the number of smoothing iterations
-     PetscInt final_smooth_its = 4;
+     int final_smooth_its = 4;
      // Check the integrity of the mesh and error if not valid
      PetscBool integrity_check = PETSC_TRUE;
      // Print global mesh statistics from MPI rank 0
@@ -83,6 +84,24 @@ In your code, to generate a PETSc DM that can then be used as normal, you can ca
 
      // Enable the use of command line options for this DM
      ierr = DMSetFromOptions(dm);
+
+### Agglomeration
+
+The domain is decomposed into one tile per MPI rank, with the decomposition chosen to minimise the total interface length. By default decompositions aren't nested, which can be inconvenient in some cases. For example, consider a node on a HPC system with one CPU (with 64 cores) and 4 GPUs and we want to run a simulation where we have one MPI rank per GPU. BoxMeshDM runs on the CPU - given this we would like to use the full 64 CPU cores to generate the mesh, assemble a matrix and then redistribute the matrix onto a sub-communicator with 4 ranks ready to run on the GPUs, but without having to call a repartitioner like ParMETIS. 
+
+BoxMeshDM allows you to specify an "agglomeration factor" such that the decomposition contains nested ranks. That way it is easy to redistribute the matrix on a sub-communicator, while still ensuring low total interface length. In the example above, if we run BoxMeshDM with ``n = 64`` ranks and we specify an agglomeration factor ``k = 16``, the decomposition is built as a coarse grid of ``n/k = 4`` tiles, with each split into ``k = 16`` fine tiles. The rank numbering of the ``k`` fine tiles is contiguous, and if the unknown ordering in the matrix is contiguous in rank order, that means a contiguous range of rows can be merged to reproduce a matrix that would have been produced by a plain 4 rank decomposition. 
+
+For the example case, if we have an MPI program run on 64 ranks, in C/C++ you can call:
+
+     int agglom_factor = 16;
+     dm = GenerateBoxMeshDMAgglom(PETSC_COMM_WORLD, target_edge_length, 1.0, 1.0, final_smooth_its, integrity_check, print_stats, agglom_factor);
+     
+     // ... assemble a matrix 
+     // ... if the target_edge_length results in a matrix with, say, 1000 rows,
+     // ... the rows are numbered contiguously with rank
+     // ... merge contiguous rows in blocks of 250 onto a sub-communicator with 4 ranks
+
+Setting ``agglom_factor = 1`` produces exactly the same mesh as ``GenerateBoxMeshDM``.
 
 ### Weak scaling   
 
