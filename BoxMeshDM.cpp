@@ -1373,8 +1373,27 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
 
 // ~~~~~~~~~~~~~~~~~
 
+// The domain size is stored on each DM we create (and on every refinement of it),
+// so the refinement hook labels against that mesh's domain rather than the globals,
+// which are overwritten by any later call to GenerateBoxMeshDM
+struct BoxDomain {
+    double width, height;
+};
+static const char BOX_DOMAIN_KEY[] = "BoxMeshDM_domain";
+
+static PetscErrorCode SetBoxDomain(DM dm, double width, double height) {
+    BoxDomain *domain;
+    PetscFunctionBeginUser;
+    PetscCall(PetscNew(&domain));
+    domain->width = width;
+    domain->height = height;
+    // The container (and domain) are freed when the DM is destroyed
+    PetscCall(PetscObjectContainerCompose((PetscObject)dm, BOX_DOMAIN_KEY, domain, PetscCtxDestroyDefault));
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 // Label boundary faces and vertices based on geometric location
-static void LabelBoundaries(DM dm) {
+static void LabelBoundaries(DM dm, double domain_width, double domain_height) {
 
     // Create or get "Face Sets" label (standard name for boundary markers)
     // Values: 1=Bottom, 2=Right, 3=Top, 4=Left
@@ -1416,8 +1435,8 @@ static void LabelBoundaries(DM dm) {
             PetscInt val = 0;
             // Priority for corners: Bottom > Right > Top > Left
             if (std::abs(y) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(x - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
-            else if (std::abs(y - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
+            else if (std::abs(x - domain_width) < EPSILON) val = 2; // Right
+            else if (std::abs(y - domain_height) < EPSILON) val = 3; // Top
             else if (std::abs(x) < EPSILON) val = 4;         // Left
 
             if (val != 0) PetscCallVoid(DMLabelSetValue(label, v, val));
@@ -1458,8 +1477,8 @@ static void LabelBoundaries(DM dm) {
             
             PetscInt val = 0;
             if (std::abs(cy) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(cx - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
-            else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
+            else if (std::abs(cx - domain_width) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - domain_height) < EPSILON) val = 3; // Top
             else if (std::abs(cx) < EPSILON) val = 4;         // Left
 
             if (val != 0) {
@@ -1503,8 +1522,8 @@ static void LabelBoundaries(DM dm) {
             
             PetscInt val = 0;
             if (std::abs(cy) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(cx - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
-            else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
+            else if (std::abs(cx - domain_width) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - domain_height) < EPSILON) val = 3; // Top
             else if (std::abs(cx) < EPSILON) val = 4;         // Left
 
             if (val != 0) {
@@ -1520,11 +1539,16 @@ static void LabelBoundaries(DM dm) {
 
 // ~~~~~~~~~~~~~~~~~
 
-// Add these callback functions before LabelBoundaries:
+// Refinement hook, re-labels the boundaries of the refined mesh
 static PetscErrorCode RefineHook_LabelBoundaries(DM dm, DM dmf, void *ctx) {
+    BoxDomain *domain = NULL;
     PetscFunctionBeginUser;
+    PetscCall(PetscObjectContainerQuery((PetscObject)dm, BOX_DOMAIN_KEY, &domain));
+    PetscCheck(domain, PetscObjectComm((PetscObject)dm), PETSC_ERR_ARG_WRONGSTATE, "DM has no BoxMeshDM domain attached");
+    // Carry the domain down so further refinements can find it
+    PetscCall(SetBoxDomain(dmf, domain->width, domain->height));
     // Label the fine (refined) mesh
-    LabelBoundaries(dmf);
+    LabelBoundaries(dmf, domain->width, domain->height);
     // Also add the hook to the refined mesh so further refinements work
     PetscCall(DMRefineHookAdd(dmf, RefineHook_LabelBoundaries, NULL, NULL));
     PetscFunctionReturn(PETSC_SUCCESS);
@@ -2051,7 +2075,8 @@ PETSC_EXTERN DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length
     ierr = PetscObjectSetName((PetscObject)dm, "Mesh");
     
     // 6. Label boundaries
-    LabelBoundaries(dm);
+    ierr = SetBoxDomain(dm, DOMAIN_WIDTH, DOMAIN_HEIGHT);
+    LabelBoundaries(dm, DOMAIN_WIDTH, DOMAIN_HEIGHT);
 
     // 7. Add refinement hook so labels are applied after any refinement
     ierr = DMRefineHookAdd(dm, RefineHook_LabelBoundaries, NULL, NULL);
@@ -2105,10 +2130,6 @@ int main(int argc, char** argv) {
     PetscInt agglomeration_factor = 1;
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-agglomeration_factor", &agglomeration_factor, &set));
     int agglom_factor = agglomeration_factor;
-
-    // Update global variables with parsed values
-    DOMAIN_WIDTH = domain_width;
-    DOMAIN_HEIGHT = domain_height;
 
     // Generate the DMPlex for this mesh
     DM dm = GenerateBoxMeshDMAgglom(MPI_COMM_WORLD, target_len, domain_width, domain_height, final_smooths, integrity_check, print_stats, agglom_factor);
