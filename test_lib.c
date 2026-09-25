@@ -71,6 +71,28 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    PetscPrintf(PETSC_COMM_WORLD, "\n=== Testing for Memory Leaks ===\n");
+
+    // Generate and destroy a small mesh twice. The first call can leave behind
+    // one-off PETSc allocations (class registration etc), so only the second is
+    // checked. Current usage is only tracked in debug builds (or with -malloc_debug),
+    // otherwise both readings are zero and this passes trivially.
+    PetscLogDouble mem_before, mem_after;
+    for (int i = 0; i < 2; ++i) {
+        PetscCall(PetscMallocGetCurrentUsage(&mem_before));
+        dm = GenerateBoxMeshDM(PETSC_COMM_WORLD, 0.02, 1.0, 1.0, 0, PETSC_FALSE, PETSC_FALSE);
+        PetscCall(DMDestroy(&dm));
+        PetscCall(PetscMallocGetCurrentUsage(&mem_after));
+    }
+    PetscLogDouble leaked = mem_after - mem_before, max_leaked;
+    PetscCallMPI(MPI_Allreduce(&leaked, &max_leaked, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD));
+    if (max_leaked != 0) {
+        PetscPrintf(PETSC_COMM_WORLD, "Leaked %g bytes generating and destroying a mesh!\n", max_leaked);
+        PetscCall(PetscFinalize());
+        return 1;
+    }
+    PetscPrintf(PETSC_COMM_WORLD, "No memory leaked.\n");
+
     PetscCall(PetscFinalize());
     return 0;
 }

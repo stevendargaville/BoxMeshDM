@@ -1351,11 +1351,10 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
         }
     }
 
-    // Build the DM
+    // Build the DM - DMPlexCreateFromCellListParallelPetsc creates it, so we
+    // must not DMCreate one ourselves first or it leaks
     DM dm;
     PetscErrorCode ierr;
-    ierr = DMCreate(comm, &dm);
-    ierr = DMSetType(dm, DMPLEX);
 
     PetscInt two = 2;
     PetscInt three = 3;
