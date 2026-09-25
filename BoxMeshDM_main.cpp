@@ -15,7 +15,8 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);    
 
     // Parse command line options
-    double target_len = 0.0025;
+    // Reals are read as PetscReal, which is float in single precision builds of PETSc
+    PetscReal target_len = 0.0025;
     PetscBool set;
     PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &target_len, &set));
 
@@ -32,10 +33,10 @@ int main(int argc, char** argv) {
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, &set));
     int final_smooths = final_smooth_its;
 
-    double domain_width = 1.0;
+    PetscReal domain_width = 1.0;
     PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_width", &domain_width, &set));
     
-    double domain_height = 1.0;
+    PetscReal domain_height = 1.0;
     PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_height", &domain_height, &set));
 
     PetscInt agglomeration_factor = 1;
