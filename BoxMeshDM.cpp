@@ -1262,7 +1262,15 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
         if (recv_counts[r] > 0) {
             send_answers[r].resize(recv_counts[r]);
             for(int k=0; k<recv_counts[r]; ++k) {
-                send_answers[r][k] = points_owned_l2g_map[recv_ids[r][k]];
+                // If we don't have the point the ranks disagree about the geometry,
+                // error rather than silently handing back a bogus global id
+                auto it = points_owned_l2g_map.find(recv_ids[r][k]);
+                if (it == points_owned_l2g_map.end()) {
+                    std::cerr << "Error: [Rank " << comm_rank << "] rank " << r << " asked for the global id of point "
+                              << recv_ids[r][k] << ", which this rank does not own.\n";
+                    MPI_Abort(comm, EXIT_FAILURE);
+                }
+                send_answers[r][k] = it->second;
             }
         }
     }
