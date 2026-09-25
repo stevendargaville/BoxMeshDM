@@ -1626,8 +1626,13 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     long local_boundary_edge_count = 0;
     long local_bad_edge_count = 0;
     double local_max_edge_len = 0.0;
+    // Largest cosine of any triangle angle, i.e. the smallest angle
+    double local_max_cosine = -1.0;
     
     const double MAX_EDGE_RATIO = 3.0; 
+    // Deliberately loose - smoothed meshes have minimum angles of ~15-30 degrees, this
+    // only catches slivers (e.g. a wall point stuck next to a corner)
+    const double MIN_ANGLE_DEG = 5.0;
     const double THRESHOLD_LEN = TARGET_EDGE_LENGTH * MAX_EDGE_RATIO;
 
     int bad_edge_print_count = 0;
@@ -1648,6 +1653,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         double d20 = std::sqrt(d20_sq);
 
         local_max_edge_len = std::max({local_max_edge_len, d01, d12, d20});
+        local_max_cosine = std::max(local_max_cosine, get_max_cosine_tri(p0, p1, p2));
 
         if (d01 > THRESHOLD_LEN || d12 > THRESHOLD_LEN || d20 > THRESHOLD_LEN) {
             local_bad_edge_count++;
@@ -1691,6 +1697,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     double global_total_area, global_boundary_len;
     long global_boundary_edge_count, global_bad_edge_count;
     double global_max_edge_len;
+    double global_max_cosine;
 
     MPI_Reduce(&num_tris_owned, &num_tris_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&num_points_owned, &num_points_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
@@ -1699,6 +1706,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     MPI_Reduce(&local_boundary_edge_count, &global_boundary_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_bad_edge_count, &global_bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_max_edge_len, &global_max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    MPI_Reduce(&local_max_cosine, &global_max_cosine, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
 
     int success = 1;
     if (rank == 0) {
@@ -1715,8 +1723,10 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 2.5e-5 * expected_perimeter;
         bool euler_pass = (euler == 1);
         bool edge_pass = (global_bad_edge_count == 0);
+        double global_min_angle = std::acos(clamp_val(global_max_cosine)) * 180.0 / 3.14159265358979323846;
+        bool angle_pass = (global_min_angle >= MIN_ANGLE_DEG);
 
-        if (!area_pass || !perim_pass || !euler_pass || !edge_pass) {
+        if (!area_pass || !perim_pass || !euler_pass || !edge_pass || !angle_pass) {
             success = 0;
             std::cout << "\n!!! MESH INTEGRITY CHECK FAILED !!!\n";
             if (!area_pass) std::cout << "  [FAIL] Total Area: " << std::fixed << std::setprecision(6) << global_total_area << " (Expected " << expected_area << ")\n";
@@ -1726,6 +1736,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
                 std::cout << "  [FAIL] Bad Edges: " << global_bad_edge_count << " edges > " << MAX_EDGE_RATIO << "x target.\n";
                 std::cout << "         Max Edge: " << global_max_edge_len << "\n";
             }
+            if (!angle_pass) std::cout << "  [FAIL] Min Angle: " << global_min_angle << " deg (Expected >= " << MIN_ANGLE_DEG << " deg)\n";
             std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
         }
     }
