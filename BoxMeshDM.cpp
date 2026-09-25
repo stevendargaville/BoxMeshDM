@@ -501,8 +501,10 @@ static std::vector<Triangle> triangulation(const std::vector<Point>& points) {
         in.pointlist[i * 2 + 1] = points[i].y;
     }
 
+    // z: zero-based indexing, Q: quiet. We only use the triangle list, so don't
+    // ask for the edge list (e), which Triangle would build and we'd just free
     char args[32];
-    (void)PetscStrncpy(args, "ezQ", sizeof(args));    
+    (void)PetscStrncpy(args, "zQ", sizeof(args));    
 
     triangulate(args, &in, &out, NULL);
 
