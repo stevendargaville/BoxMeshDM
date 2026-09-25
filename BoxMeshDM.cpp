@@ -935,13 +935,21 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // 2. EXPLICIT BOUNDARY GENERATION (Edges only)
     // Iterate 4 boundaries. Add points if they fall within search box.
     // Exclude corners (EPSILON checks) to avoid duplication with explicit corners above.
+
+    // Wall points are spaced evenly, round(length / TARGET_EDGE_LENGTH) pieces per wall, so the
+    // last one is a full spacing from the far corner. Stepping by TARGET_EDGE_LENGTH could put a
+    // wall point arbitrarily close to that corner (0.01 L for L = 0.0099), where
+    // boundary_move_valid won't let it move out, leaving a sliver triangle. When the wall length
+    // is a whole multiple of TARGET_EDGE_LENGTH the spacing (and so the mesh) is unchanged.
+    double wall_dx = DOMAIN_WIDTH / std::max(1.0, std::round(DOMAIN_WIDTH / TARGET_EDGE_LENGTH));
+    double wall_dy = DOMAIN_HEIGHT / std::max(1.0, std::round(DOMAIN_HEIGHT / TARGET_EDGE_LENGTH));
     
     // Left (x=0)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON) {
-        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
+        int min_i = floor(search_min_y / wall_dy);
+        int max_i = ceil(search_max_y / wall_dy);
         for(int i=min_i; i<=max_i; ++i) {
-            double y = i * TARGET_EDGE_LENGTH;
+            double y = i * wall_dy;
             if (y > EPSILON && y < DOMAIN_HEIGHT - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(0.0, y, 0, i, 1));
             }
@@ -949,10 +957,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     }
     // Right (x=DOMAIN_WIDTH)
     if (search_min_x <= DOMAIN_WIDTH + EPSILON && search_max_x >= DOMAIN_WIDTH - EPSILON) {
-        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
+        int min_i = floor(search_min_y / wall_dy);
+        int max_i = ceil(search_max_y / wall_dy);
         for(int i=min_i; i<=max_i; ++i) {
-            double y = i * TARGET_EDGE_LENGTH;
+            double y = i * wall_dy;
             if (y > EPSILON && y < DOMAIN_HEIGHT - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_WIDTH, y, max_idx, i, 1));
             }
@@ -960,10 +968,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     }
     // Bottom (y=0)
     if (search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
+        int min_i = floor(search_min_x / wall_dx);
+        int max_i = ceil(search_max_x / wall_dx);
         for(int i=min_i; i<=max_i; ++i) {
-            double x = i * TARGET_EDGE_LENGTH;
+            double x = i * wall_dx;
             if (x > EPSILON && x < DOMAIN_WIDTH - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(x, 0.0, i, 0, 1));
             }
@@ -971,10 +979,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     }
     // Top (y=DOMAIN_HEIGHT)
     if (search_min_y <= DOMAIN_HEIGHT + EPSILON && search_max_y >= DOMAIN_HEIGHT - EPSILON) {
-        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
+        int min_i = floor(search_min_x / wall_dx);
+        int max_i = ceil(search_max_x / wall_dx);
         for(int i=min_i; i<=max_i; ++i) {
-            double x = i * TARGET_EDGE_LENGTH;
+            double x = i * wall_dx;
             if (x > EPSILON && x < DOMAIN_WIDTH - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(x, DOMAIN_HEIGHT, i, max_idx, 1));
             }

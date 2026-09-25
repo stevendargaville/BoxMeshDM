@@ -41,7 +41,7 @@ make clean && make tests    # executable tests, then builds lib and runs tests_l
 
 `make tests` is the gate — it runs the executable across several edge lengths, smoothing
 counts, flag combinations, non-square domains, a very large (1e7) and a very small (1e-7)
-domain, agglomeration factors, and 1 and 2 MPI ranks, then builds the library and runs
+domain, an edge length that doesn't divide the domain (0.0099), agglomeration factors, and 1 and 2 MPI ranks, then builds the library and runs
 [test_lib.c](test_lib.c) on 1 and 2 ranks. `test_lib` also checks that refining a mesh after
 generating one of a different size keeps all four boundary labels, and that generating and
 destroying a mesh leaks no memory (only measurable in debug builds). CI
@@ -106,8 +106,11 @@ Executable options (parsed in `main`): `-target_edge_length`, `-final_smooth_its
   smoothing distortion propagates roughly one edge per iteration. The code hard-errors if
   `pad > min(tile_size)/2` — that would require neighbour-of-neighbour data. This is why the
   code is not robust with few elements per rank.
-- **Point creation.** Corners explicitly; then boundary points on a regular 1D lattice of
-  spacing `TARGET_EDGE_LENGTH` along each of the four walls; then interior points, one
+- **Point creation.** Corners explicitly; then boundary points on a regular 1D lattice along
+  each of the four walls, with spacing `length / round(length / TARGET_EDGE_LENGTH)` so the
+  last wall point is a full spacing from the far corner (identical to `TARGET_EDGE_LENGTH` when
+  the length is a whole multiple of it; stepping by `TARGET_EDGE_LENGTH` could strand a wall
+  point next to a corner as a sliver); then interior points, one
   pseudo-randomly placed inside each cell of a `TARGET_EDGE_LENGTH` grid, with rejection
   sampling near the walls (`exclusion = TARGET_EDGE_LENGTH * (START_JITTER + 0.25)`) so
   interior points can never collide with the boundary lattice.
@@ -191,7 +194,8 @@ hook reads it from the coarse DM and attaches it to the refined one.
 
 - `CheckMeshIntegrity` checks, globally: total area == `width*height` (relative tolerance
   1e-6), boundary perimeter == `2*(width+height)` (relative tolerance 2.5e-5), Euler
-  characteristic `V - E + F == 1`, and that no edge exceeds `3x` the target length. The
+  characteristic `V - E + F == 1`, that no edge exceeds `3x` the target length, and that no
+  triangle has an angle below 5 degrees (loose, it only catches slivers). The
   tolerances are relative so the check is independent of domain scale. Returns false on rank
   0's verdict, broadcast to all; `GenerateBoxMeshDM` then returns `NULL`.
 - `ComputeAndPrintStats` prints point counts and load imbalance, valence histogram, triangle
