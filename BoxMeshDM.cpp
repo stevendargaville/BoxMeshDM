@@ -60,6 +60,10 @@ const double START_JITTER = 0.30;
 // Jitter + smooth iterations first
 const int ANNEAL_ITERS = 3; 
 
+// Grid index used for the right/top walls in the unique hash id. Every other grid
+// index must stay below this (and so within the 31 bits packed into the hash id)
+const int MAX_GRID_IDX = 2000000000;
+
 // ~~~~~~~~~~~~~~~~~
 
 struct Point {
@@ -903,7 +907,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // (1,0) -> Max,0
     // (0,1) -> 0,Max
     // (1,1) -> Max,Max
-    int max_idx = 2000000000; // Just a large number for the "1.0" side
+    int max_idx = MAX_GRID_IDX; // Just a large number for the "1.0" side
 
     // (0,0)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
@@ -1969,23 +1973,38 @@ PETSC_EXTERN DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
 
+    // Validate the inputs
+    if (!(target_edge_length > 0.0) || !std::isfinite(target_edge_length) ||
+        !(domain_width > 0.0) || !std::isfinite(domain_width) ||
+        !(domain_height > 0.0) || !std::isfinite(domain_height) || final_smooth_its < 0) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Target edge length (" << target_edge_length << "), domain width (" << domain_width
+                      << ") and domain height (" << domain_height << ") must be positive and finite, "
+                      << "and final smooth iterations (" << final_smooth_its << ") must be non-negative.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
+    // Ensure the grid indices fit in the unique hash id. The largest index is at the far
+    // edge of the halo around the domain, which is at most max(width, height) + pad from
+    // the origin, plus a couple of cells for rounding. This bounds the number of points
+    // along a side of the domain, the distributed mesh itself can be larger
+    double max_grid_idx = std::max(domain_width, domain_height) / target_edge_length
+                          + (ANNEAL_ITERS + final_smooth_its + 8) + 2;
+    if (max_grid_idx >= MAX_GRID_IDX) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Target edge length " << target_edge_length
+                      << " is too small for the domain size, it needs grid indices up to " << max_grid_idx
+                      << ", beyond the limit of " << MAX_GRID_IDX << " in the 31-bit index hashing scheme.\n"
+                      << "Rewrite create_point_with_unique_hash_id to go further.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
     // 1. Setup Globals
     TARGET_EDGE_LENGTH = target_edge_length;
     DOMAIN_WIDTH = domain_width;
     DOMAIN_HEIGHT = domain_height;
-
-    // Ensure edge length is not too small for 31-bit indexing
-    // Max index is ~2 billion. 1.0 / 2e9 = 5e-10
-    // That means this MPI rank can't have more than 2 billion points
-    // The distributed mesh can have more however
-    if (TARGET_EDGE_LENGTH < 5e-10) {
-        if (comm_rank == 0) {
-            std::cerr << "WARNING: Target edge length " << TARGET_EDGE_LENGTH 
-                      << " is extremely small. It approaches the limit of the local 31-bit index hashing scheme.\n"
-                      << "Rewrite the create_point_with_unique_hash_id \n";
-            MPI_Abort(comm, EXIT_FAILURE);
-        }
-    }    
 
     TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
     TOL_LEN_SQ = TOL_LEN * TOL_LEN;
