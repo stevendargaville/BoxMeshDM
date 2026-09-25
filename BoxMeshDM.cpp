@@ -60,6 +60,10 @@ const double START_JITTER = 0.30;
 // Jitter + smooth iterations first
 const int ANNEAL_ITERS = 3; 
 
+// Grid index used for the right/top walls in the unique hash id. Every other grid
+// index must stay below this (and so within the 31 bits packed into the hash id)
+const int MAX_GRID_IDX = 2000000000;
+
 // ~~~~~~~~~~~~~~~~~
 
 struct Point {
@@ -497,8 +501,10 @@ static std::vector<Triangle> triangulation(const std::vector<Point>& points) {
         in.pointlist[i * 2 + 1] = points[i].y;
     }
 
+    // z: zero-based indexing, Q: quiet. We only use the triangle list, so don't
+    // ask for the edge list (e), which Triangle would build and we'd just free
     char args[32];
-    (void)PetscStrncpy(args, "ezQ", sizeof(args));    
+    (void)PetscStrncpy(args, "zQ", sizeof(args));    
 
     triangulate(args, &in, &out, NULL);
 
@@ -903,7 +909,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // (1,0) -> Max,0
     // (0,1) -> 0,Max
     // (1,1) -> Max,Max
-    int max_idx = 2000000000; // Just a large number for the "1.0" side
+    int max_idx = MAX_GRID_IDX; // Just a large number for the "1.0" side
 
     // (0,0)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON && 
@@ -929,13 +935,21 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // 2. EXPLICIT BOUNDARY GENERATION (Edges only)
     // Iterate 4 boundaries. Add points if they fall within search box.
     // Exclude corners (EPSILON checks) to avoid duplication with explicit corners above.
+
+    // Wall points are spaced evenly, round(length / TARGET_EDGE_LENGTH) pieces per wall, so the
+    // last one is a full spacing from the far corner. Stepping by TARGET_EDGE_LENGTH could put a
+    // wall point arbitrarily close to that corner (0.01 L for L = 0.0099), where
+    // boundary_move_valid won't let it move out, leaving a sliver triangle. When the wall length
+    // is a whole multiple of TARGET_EDGE_LENGTH the spacing (and so the mesh) is unchanged.
+    double wall_dx = DOMAIN_WIDTH / std::max(1.0, std::round(DOMAIN_WIDTH / TARGET_EDGE_LENGTH));
+    double wall_dy = DOMAIN_HEIGHT / std::max(1.0, std::round(DOMAIN_HEIGHT / TARGET_EDGE_LENGTH));
     
     // Left (x=0)
     if (search_min_x <= EPSILON && search_max_x >= -EPSILON) {
-        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
+        int min_i = floor(search_min_y / wall_dy);
+        int max_i = ceil(search_max_y / wall_dy);
         for(int i=min_i; i<=max_i; ++i) {
-            double y = i * TARGET_EDGE_LENGTH;
+            double y = i * wall_dy;
             if (y > EPSILON && y < DOMAIN_HEIGHT - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(0.0, y, 0, i, 1));
             }
@@ -943,10 +957,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     }
     // Right (x=DOMAIN_WIDTH)
     if (search_min_x <= DOMAIN_WIDTH + EPSILON && search_max_x >= DOMAIN_WIDTH - EPSILON) {
-        int min_i = floor(search_min_y / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_y / TARGET_EDGE_LENGTH);
+        int min_i = floor(search_min_y / wall_dy);
+        int max_i = ceil(search_max_y / wall_dy);
         for(int i=min_i; i<=max_i; ++i) {
-            double y = i * TARGET_EDGE_LENGTH;
+            double y = i * wall_dy;
             if (y > EPSILON && y < DOMAIN_HEIGHT - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(DOMAIN_WIDTH, y, max_idx, i, 1));
             }
@@ -954,10 +968,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     }
     // Bottom (y=0)
     if (search_min_y <= EPSILON && search_max_y >= -EPSILON) {
-        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
+        int min_i = floor(search_min_x / wall_dx);
+        int max_i = ceil(search_max_x / wall_dx);
         for(int i=min_i; i<=max_i; ++i) {
-            double x = i * TARGET_EDGE_LENGTH;
+            double x = i * wall_dx;
             if (x > EPSILON && x < DOMAIN_WIDTH - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(x, 0.0, i, 0, 1));
             }
@@ -965,10 +979,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     }
     // Top (y=DOMAIN_HEIGHT)
     if (search_min_y <= DOMAIN_HEIGHT + EPSILON && search_max_y >= DOMAIN_HEIGHT - EPSILON) {
-        int min_i = floor(search_min_x / TARGET_EDGE_LENGTH);
-        int max_i = ceil(search_max_x / TARGET_EDGE_LENGTH);
+        int min_i = floor(search_min_x / wall_dx);
+        int max_i = ceil(search_max_x / wall_dx);
         for(int i=min_i; i<=max_i; ++i) {
-            double x = i * TARGET_EDGE_LENGTH;
+            double x = i * wall_dx;
             if (x > EPSILON && x < DOMAIN_WIDTH - EPSILON) {
                 points_with_halos.push_back(create_point_with_unique_hash_id(x, DOMAIN_HEIGHT, i, max_idx, 1));
             }
@@ -1262,7 +1276,15 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
         if (recv_counts[r] > 0) {
             send_answers[r].resize(recv_counts[r]);
             for(int k=0; k<recv_counts[r]; ++k) {
-                send_answers[r][k] = points_owned_l2g_map[recv_ids[r][k]];
+                // If we don't have the point the ranks disagree about the geometry,
+                // error rather than silently handing back a bogus global id
+                auto it = points_owned_l2g_map.find(recv_ids[r][k]);
+                if (it == points_owned_l2g_map.end()) {
+                    std::cerr << "Error: [Rank " << comm_rank << "] rank " << r << " asked for the global id of point "
+                              << recv_ids[r][k] << ", which this rank does not own.\n";
+                    MPI_Abort(comm, EXIT_FAILURE);
+                }
+                send_answers[r][k] = it->second;
             }
         }
     }
@@ -1351,11 +1373,10 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
         }
     }
 
-    // Build the DM
+    // Build the DM - DMPlexCreateFromCellListParallelPetsc creates it, so we
+    // must not DMCreate one ourselves first or it leaks
     DM dm;
     PetscErrorCode ierr;
-    ierr = DMCreate(comm, &dm);
-    ierr = DMSetType(dm, DMPLEX);
 
     PetscInt two = 2;
     PetscInt three = 3;
@@ -1374,8 +1395,27 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point>& points_on_owned_tria
 
 // ~~~~~~~~~~~~~~~~~
 
+// The domain size is stored on each DM we create (and on every refinement of it),
+// so the refinement hook labels against that mesh's domain rather than the globals,
+// which are overwritten by any later call to GenerateBoxMeshDM
+struct BoxDomain {
+    double width, height;
+};
+static const char BOX_DOMAIN_KEY[] = "BoxMeshDM_domain";
+
+static PetscErrorCode SetBoxDomain(DM dm, double width, double height) {
+    BoxDomain *domain;
+    PetscFunctionBeginUser;
+    PetscCall(PetscNew(&domain));
+    domain->width = width;
+    domain->height = height;
+    // The container (and domain) are freed when the DM is destroyed
+    PetscCall(PetscObjectContainerCompose((PetscObject)dm, BOX_DOMAIN_KEY, domain, PetscCtxDestroyDefault));
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 // Label boundary faces and vertices based on geometric location
-static void LabelBoundaries(DM dm) {
+static void LabelBoundaries(DM dm, double domain_width, double domain_height) {
 
     // Create or get "Face Sets" label (standard name for boundary markers)
     // Values: 1=Bottom, 2=Right, 3=Top, 4=Left
@@ -1417,8 +1457,8 @@ static void LabelBoundaries(DM dm) {
             PetscInt val = 0;
             // Priority for corners: Bottom > Right > Top > Left
             if (std::abs(y) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(x - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
-            else if (std::abs(y - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
+            else if (std::abs(x - domain_width) < EPSILON) val = 2; // Right
+            else if (std::abs(y - domain_height) < EPSILON) val = 3; // Top
             else if (std::abs(x) < EPSILON) val = 4;         // Left
 
             if (val != 0) PetscCallVoid(DMLabelSetValue(label, v, val));
@@ -1459,8 +1499,8 @@ static void LabelBoundaries(DM dm) {
             
             PetscInt val = 0;
             if (std::abs(cy) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(cx - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
-            else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
+            else if (std::abs(cx - domain_width) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - domain_height) < EPSILON) val = 3; // Top
             else if (std::abs(cx) < EPSILON) val = 4;         // Left
 
             if (val != 0) {
@@ -1504,8 +1544,8 @@ static void LabelBoundaries(DM dm) {
             
             PetscInt val = 0;
             if (std::abs(cy) < EPSILON) val = 1;              // Bottom
-            else if (std::abs(cx - DOMAIN_WIDTH) < EPSILON) val = 2; // Right
-            else if (std::abs(cy - DOMAIN_HEIGHT) < EPSILON) val = 3; // Top
+            else if (std::abs(cx - domain_width) < EPSILON) val = 2; // Right
+            else if (std::abs(cy - domain_height) < EPSILON) val = 3; // Top
             else if (std::abs(cx) < EPSILON) val = 4;         // Left
 
             if (val != 0) {
@@ -1521,11 +1561,16 @@ static void LabelBoundaries(DM dm) {
 
 // ~~~~~~~~~~~~~~~~~
 
-// Add these callback functions before LabelBoundaries:
+// Refinement hook, re-labels the boundaries of the refined mesh
 static PetscErrorCode RefineHook_LabelBoundaries(DM dm, DM dmf, void *ctx) {
+    BoxDomain *domain = NULL;
     PetscFunctionBeginUser;
+    PetscCall(PetscObjectContainerQuery((PetscObject)dm, BOX_DOMAIN_KEY, &domain));
+    PetscCheck(domain, PetscObjectComm((PetscObject)dm), PETSC_ERR_ARG_WRONGSTATE, "DM has no BoxMeshDM domain attached");
+    // Carry the domain down so further refinements can find it
+    PetscCall(SetBoxDomain(dmf, domain->width, domain->height));
     // Label the fine (refined) mesh
-    LabelBoundaries(dmf);
+    LabelBoundaries(dmf, domain->width, domain->height);
     // Also add the hook to the refined mesh so further refinements work
     PetscCall(DMRefineHookAdd(dmf, RefineHook_LabelBoundaries, NULL, NULL));
     PetscFunctionReturn(PETSC_SUCCESS);
@@ -1589,8 +1634,13 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     long local_boundary_edge_count = 0;
     long local_bad_edge_count = 0;
     double local_max_edge_len = 0.0;
+    // Largest cosine of any triangle angle, i.e. the smallest angle
+    double local_max_cosine = -1.0;
     
     const double MAX_EDGE_RATIO = 3.0; 
+    // Deliberately loose - smoothed meshes have minimum angles of ~15-30 degrees, this
+    // only catches slivers (e.g. a wall point stuck next to a corner)
+    const double MIN_ANGLE_DEG = 5.0;
     const double THRESHOLD_LEN = TARGET_EDGE_LENGTH * MAX_EDGE_RATIO;
 
     int bad_edge_print_count = 0;
@@ -1611,6 +1661,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         double d20 = std::sqrt(d20_sq);
 
         local_max_edge_len = std::max({local_max_edge_len, d01, d12, d20});
+        local_max_cosine = std::max(local_max_cosine, get_max_cosine_tri(p0, p1, p2));
 
         if (d01 > THRESHOLD_LEN || d12 > THRESHOLD_LEN || d20 > THRESHOLD_LEN) {
             local_bad_edge_count++;
@@ -1654,6 +1705,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     double global_total_area, global_boundary_len;
     long global_boundary_edge_count, global_bad_edge_count;
     double global_max_edge_len;
+    double global_max_cosine;
 
     MPI_Reduce(&num_tris_owned, &num_tris_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&num_points_owned, &num_points_owned_global, 1, MPI_LONG, MPI_SUM, 0, comm);
@@ -1662,6 +1714,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     MPI_Reduce(&local_boundary_edge_count, &global_boundary_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_bad_edge_count, &global_bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_max_edge_len, &global_max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    MPI_Reduce(&local_max_cosine, &global_max_cosine, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
 
     int success = 1;
     if (rank == 0) {
@@ -1672,12 +1725,16 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         long long F_total = num_tris_owned_global;
         long long euler = V_total - E_total + F_total;
 
-        bool area_pass = std::abs(global_total_area - expected_area) < 1e-6;
-        bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 1e-4;
+        // Tolerances are relative so the check is independent of the domain scale.
+        // On the unit square they equal the previous absolute tolerances of 1e-6 and 1e-4
+        bool area_pass = std::abs(global_total_area - expected_area) < 1e-6 * expected_area;
+        bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 2.5e-5 * expected_perimeter;
         bool euler_pass = (euler == 1);
         bool edge_pass = (global_bad_edge_count == 0);
+        double global_min_angle = std::acos(clamp_val(global_max_cosine)) * 180.0 / 3.14159265358979323846;
+        bool angle_pass = (global_min_angle >= MIN_ANGLE_DEG);
 
-        if (!area_pass || !perim_pass || !euler_pass || !edge_pass) {
+        if (!area_pass || !perim_pass || !euler_pass || !edge_pass || !angle_pass) {
             success = 0;
             std::cout << "\n!!! MESH INTEGRITY CHECK FAILED !!!\n";
             if (!area_pass) std::cout << "  [FAIL] Total Area: " << std::fixed << std::setprecision(6) << global_total_area << " (Expected " << expected_area << ")\n";
@@ -1687,6 +1744,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
                 std::cout << "  [FAIL] Bad Edges: " << global_bad_edge_count << " edges > " << MAX_EDGE_RATIO << "x target.\n";
                 std::cout << "         Max Edge: " << global_max_edge_len << "\n";
             }
+            if (!angle_pass) std::cout << "  [FAIL] Min Angle: " << global_min_angle << " deg (Expected >= " << MIN_ANGLE_DEG << " deg)\n";
             std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
         }
     }
@@ -1936,23 +1994,38 @@ PETSC_EXTERN DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length
     MPI_Comm_rank(comm, &comm_rank);
     MPI_Comm_size(comm, &comm_size);
 
+    // Validate the inputs
+    if (!(target_edge_length > 0.0) || !std::isfinite(target_edge_length) ||
+        !(domain_width > 0.0) || !std::isfinite(domain_width) ||
+        !(domain_height > 0.0) || !std::isfinite(domain_height) || final_smooth_its < 0) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Target edge length (" << target_edge_length << "), domain width (" << domain_width
+                      << ") and domain height (" << domain_height << ") must be positive and finite, "
+                      << "and final smooth iterations (" << final_smooth_its << ") must be non-negative.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
+    // Ensure the grid indices fit in the unique hash id. The largest index is at the far
+    // edge of the halo around the domain, which is at most max(width, height) + pad from
+    // the origin, plus a couple of cells for rounding. This bounds the number of points
+    // along a side of the domain, the distributed mesh itself can be larger
+    double max_grid_idx = std::max(domain_width, domain_height) / target_edge_length
+                          + (ANNEAL_ITERS + final_smooth_its + 8) + 2;
+    if (max_grid_idx >= MAX_GRID_IDX) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Target edge length " << target_edge_length
+                      << " is too small for the domain size, it needs grid indices up to " << max_grid_idx
+                      << ", beyond the limit of " << MAX_GRID_IDX << " in the 31-bit index hashing scheme.\n"
+                      << "Rewrite create_point_with_unique_hash_id to go further.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
     // 1. Setup Globals
     TARGET_EDGE_LENGTH = target_edge_length;
     DOMAIN_WIDTH = domain_width;
     DOMAIN_HEIGHT = domain_height;
-
-    // Ensure edge length is not too small for 31-bit indexing
-    // Max index is ~2 billion. 1.0 / 2e9 = 5e-10
-    // That means this MPI rank can't have more than 2 billion points
-    // The distributed mesh can have more however
-    if (TARGET_EDGE_LENGTH < 5e-10) {
-        if (comm_rank == 0) {
-            std::cerr << "WARNING: Target edge length " << TARGET_EDGE_LENGTH 
-                      << " is extremely small. It approaches the limit of the local 31-bit index hashing scheme.\n"
-                      << "Rewrite the create_point_with_unique_hash_id \n";
-            MPI_Abort(comm, EXIT_FAILURE);
-        }
-    }    
 
     TOL_LEN = TARGET_EDGE_LENGTH * 1e-4;
     TOL_LEN_SQ = TOL_LEN * TOL_LEN;
@@ -2052,7 +2125,8 @@ PETSC_EXTERN DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length
     ierr = PetscObjectSetName((PetscObject)dm, "Mesh");
     
     // 6. Label boundaries
-    LabelBoundaries(dm);
+    ierr = SetBoxDomain(dm, DOMAIN_WIDTH, DOMAIN_HEIGHT);
+    LabelBoundaries(dm, DOMAIN_WIDTH, DOMAIN_HEIGHT);
 
     // 7. Add refinement hook so labels are applied after any refinement
     ierr = DMRefineHookAdd(dm, RefineHook_LabelBoundaries, NULL, NULL);
@@ -2067,84 +2141,3 @@ PETSC_EXTERN DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length
 PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
     return GenerateBoxMeshDMAgglom(comm, target_edge_length, domain_width, domain_height, final_smooth_its, integrity_check, print_stats, 1);
 }
-
-// =========================================================
-// Main Driver
-// =========================================================
-#ifdef STANDALONE_MESH_GEN
-int main(int argc, char** argv) {
-    PetscCall(PetscInitialize(&argc, &argv, NULL, NULL));
-
-    int comm_rank, comm_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);    
-
-    // Parse command line options
-    double target_len = 0.0025;
-    PetscBool set;
-    PetscCall(PetscOptionsGetReal(NULL, NULL, "-target_edge_length", &target_len, &set));
-
-    PetscBool write_mesh = PETSC_FALSE;
-    PetscCall(PetscOptionsGetBool(NULL, NULL, "-write_mesh", &write_mesh, NULL));
-
-    PetscBool integrity_check = PETSC_TRUE;
-    PetscCall(PetscOptionsGetBool(NULL, NULL, "-integrity_check", &integrity_check, NULL));    
-
-    PetscBool print_stats = PETSC_TRUE;
-    PetscCall(PetscOptionsGetBool(NULL, NULL, "-print_stats", &print_stats, NULL));    
-
-    PetscInt final_smooth_its = 4;
-    PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, &set));
-    int final_smooths = final_smooth_its;
-
-    double domain_width = 1.0;
-    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_width", &domain_width, &set));
-    
-    double domain_height = 1.0;
-    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_height", &domain_height, &set));
-
-    PetscInt agglomeration_factor = 1;
-    PetscCall(PetscOptionsGetInt(NULL, NULL, "-agglomeration_factor", &agglomeration_factor, &set));
-    int agglom_factor = agglomeration_factor;
-
-    // Update global variables with parsed values
-    DOMAIN_WIDTH = domain_width;
-    DOMAIN_HEIGHT = domain_height;
-
-    // Generate the DMPlex for this mesh
-    DM dm = GenerateBoxMeshDMAgglom(MPI_COMM_WORLD, target_len, domain_width, domain_height, final_smooths, integrity_check, print_stats, agglom_factor);
-
-    // Check a valid mesh has been generated
-    if (dm) {
-
-        // Write output if requested
-        // Can view this in paraview with:
-        // /home/sdargavi/projects/dependencies/petsc_main/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5
-        // then using the XDMF reader with:
-        // paraview box_mesh.xmf
-        if (write_mesh) {
-#ifdef PETSC_HAVE_HDF5         
-           PetscViewer viewer;
-           if (comm_rank == 0 && print_stats) {
-                 std::cout << "Writing out mesh...\n";        
-           }
-           PetscCall(PetscViewerHDF5Open(MPI_COMM_WORLD, "box_mesh.h5", FILE_MODE_WRITE, &viewer));
-           PetscCall(DMView(dm, viewer));
-           PetscCall(PetscViewerDestroy(&viewer));     
-#else 
-           if (comm_rank == 0) {
-               std::cerr << "-write_mesh not available without HDF5 enabled in PETSc.\n";
-           } 
-#endif
-         }
-
-        PetscCall(DMDestroy(&dm));
-    } else {
-        PetscCall(PetscFinalize());
-        return EXIT_FAILURE;
-    }
-
-    PetscCall(PetscFinalize());
-    return 0;
-}
-#endif

@@ -57,7 +57,8 @@ LIB_OUT = libboxmeshdm.so
 endif
 endif
 
-# All the files required by BoxMeshDM
+# All the files required by BoxMeshDM - the library is built from these, the
+# executable also links in BoxMeshDM_main.o, which is the only object with main
 OBJS := BoxMeshDM.o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -67,16 +68,12 @@ OBJS := BoxMeshDM.o
 # This builds the executable with main in it
 all: $(OUT)
 
-# Add STANDALONE define only if not building the library
-ifndef BUILD_LIB
-override CXXFLAGS += -DSTANDALONE_MESH_GEN
-endif
+$(OUT): $(OBJS) BoxMeshDM_main.o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Create the library - use recursive make to set BUILD_LIB and avoid the define
-lib:
-	$(MAKE) $(LIB_OUT) BUILD_LIB=1
+# Create the library
+lib: $(LIB_OUT)
 
 $(LIB_OUT): $(OBJS)
 ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)	
@@ -129,6 +126,12 @@ tests: BoxMeshDM
 	./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.01 -domain_width 1.0 -domain_height 1.0
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5
+# Same number of points as a unit square with edge length 0.01 - integrity check tolerances must scale
+	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 1e5 -domain_width 1e7 -domain_height 1e7
+# Tiny edge length on a tiny domain - only 250 cells per side so within the index limit
+	./BoxMeshDM -target_edge_length 4e-10 -domain_width 1e-7 -domain_height 1e-7
+# 1/0.0099 is not whole - stepping the wall points by the edge length left a sliver at the corner
+	./BoxMeshDM -target_edge_length 0.0099
 	./BoxMeshDM -target_edge_length 0.005 -agglomeration_factor 1
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -agglomeration_factor 2
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5 -agglomeration_factor 2
@@ -140,4 +143,4 @@ tests: BoxMeshDM
 
 # Cleanup
 clean::
-	$(RM) $(OUT) $(LIB_OUT) $(OBJS) test_lib test_lib.o *.dat
+	$(RM) $(OUT) $(LIB_OUT) $(OBJS) BoxMeshDM_main.o test_lib test_lib.o *.dat
