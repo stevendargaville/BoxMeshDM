@@ -7,9 +7,12 @@ Guidance for AI coding agents working in this repository.
 BoxMeshDM generates **fully unstructured 2D triangular meshes on a rectangular domain
 `[0,width] x [0,height]`, in parallel with MPI, and returns a distributed PETSc `DMPlex`.**
 
-The whole thing is one translation unit: [BoxMeshDM.cpp](BoxMeshDM.cpp) (~2000 lines) plus a
-one-function public header [BoxMeshDM.h](BoxMeshDM.h). It can be built either as a standalone
-executable (`main` guarded by `STANDALONE_MESH_GEN`) or as a library (`libboxmeshdm`).
+The whole mesh generator is one translation unit, [BoxMeshDM.cpp](BoxMeshDM.cpp) (~2000
+lines), plus the public header [BoxMeshDM.h](BoxMeshDM.h). The executable's `main` lives on its
+own in [BoxMeshDM_main.cpp](BoxMeshDM_main.cpp), so the library (`libboxmeshdm`) is built from
+`BoxMeshDM.o` alone and never contains a `main`, and the executable links `BoxMeshDM.o` with
+`BoxMeshDM_main.o`. Both use only PETSc's standard make rules; keep it that way rather than
+adding custom compile rules or per-target defines.
 
 The design point that drives everything: generate a *load-balanced, fully unstructured* mesh
 with **no file I/O and no mesh partitioner** (no ParMETIS). Each MPI rank generates its own
@@ -25,11 +28,11 @@ if the version is too old or Triangle is missing. For meshes beyond ~2B global p
 must also be configured `--with-64-bit-indices`.
 
 ```bash
-make clean && make          # executable ./BoxMeshDM (defines -DSTANDALONE_MESH_GEN)
+make clean && make          # executable ./BoxMeshDM (BoxMeshDM.o + BoxMeshDM_main.o)
 ```
 
 ```bash
-make clean && make lib      # libboxmeshdm.so / .dylib / .a (no STANDALONE define)
+make clean && make lib      # libboxmeshdm.so / .dylib / .a (BoxMeshDM.o only)
 ```
 
 ```bash
@@ -37,15 +40,21 @@ make clean && make tests    # executable tests, then builds lib and runs tests_l
 ```
 
 `make tests` is the gate — it runs the executable across several edge lengths, smoothing
-counts, flag combinations, non-square domains, agglomeration factors, and 1 and 2 MPI ranks,
-then builds the library and runs [test_lib.c](test_lib.c) on 1 and 2 ranks. CI
+counts, flag combinations, non-square domains, a very large (1e7) and a very small (1e-7)
+domain, agglomeration factors, and 1 and 2 MPI ranks, then builds the library and runs
+[test_lib.c](test_lib.c) on 1 and 2 ranks. `test_lib` also checks that refining a mesh after
+generating one of a different size keeps all four boundary labels, and that generating and
+destroying a mesh leaks no memory (only measurable in debug builds). CI
 ([.github/workflows/ci_build.yml](.github/workflows/ci_build.yml)) runs exactly this inside the
 Docker images in [dockerfiles/](dockerfiles) (debug, opt, 64-bit, PFLARE) plus a macOS build.
 Debug CI runs with `PETSC_OPTIONS="-on_error_abort -fp_trap on"`, so new floating-point
 operations must not generate NaN/Inf even transiently.
 
-Build products (`BoxMeshDM`, `BoxMeshDM.o`, `libboxmeshdm.so`, `test_lib`) live in the repo
-root and are untracked; there is no `.gitignore`.
+Build products (`BoxMeshDM`, `*.o`, `libboxmeshdm.so`, `test_lib`) live in the repo root and
+are ignored by [.gitignore](.gitignore).
+
+The Makefile needs `PETSC_DIR` and `PETSC_ARCH` set for every target, including `make clean`:
+without them the Triangle check runs `awk` with no file and waits on stdin forever.
 
 ## Public API
 
@@ -61,7 +70,10 @@ DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length,
 ```
 
 Returns a distributed `DMPlex` named `"Mesh"`, or `NULL` if `integrity_check` is on and the
-mesh fails validation. Collective on `comm`. Caller destroys with `DMDestroy`.
+mesh fails validation. Collective on `comm`. Caller destroys with `DMDestroy`. Invalid input
+(non-positive or non-finite edge length/width/height, negative `final_smooth_its`, a bad
+agglomeration factor, or more cells along a side than the hash id can index) calls
+`MPI_Abort`.
 
 `GenerateBoxMeshDMAgglom` holds the implementation; `GenerateBoxMeshDM` is a forwarder passing
 `agglomeration_factor = 1`. Both have C linkage, so C and C++ callers use the same two names —
@@ -74,19 +86,18 @@ Executable options (parsed in `main`): `-target_edge_length`, `-final_smooth_its
 
 ## Algorithm / control flow
 
-`GenerateBoxMeshDM` (BoxMeshDM.cpp:1841) is the driver:
+`GenerateBoxMeshDMAgglom` is the driver:
 
-1. **Set globals** — `TARGET_EDGE_LENGTH`, `DOMAIN_WIDTH`, `DOMAIN_HEIGHT`, and the tolerances
+1. **Validate inputs, then set globals** — `TARGET_EDGE_LENGTH`, `DOMAIN_WIDTH`, `DOMAIN_HEIGHT`, and the tolerances
    `TOL_LEN`, `TOL_LEN_SQ`, `TOL_VOLUME` (all derived from the target edge length).
 2. **Factor `comm_size` into `TILE_DIM_X x TILE_DIM_Y`** minimising the total interface cut
    length for the domain aspect ratio (`factorize_min_cut`). **Exactly one tile per rank**, so
    tiles and ranks are in bijection — see [Agglomeration](#agglomeration) for the mapping.
-3. **`process_tile`** (BoxMeshDM.cpp:818) — each rank builds its own subdomain, independently.
+3. **`process_tile`** — each rank builds its own subdomain, independently.
 4. **`ComputeValenceAndEdges`**, then optionally **`CheckMeshIntegrity`** and
    **`ComputeAndPrintStats`**.
-5. **`CreateDM`** (BoxMeshDM.cpp:1119) — assign global vertex numbers and build the `DMPlex`.
-6. **`LabelBoundaries`** (BoxMeshDM.cpp:1335) plus a `DMRefineHookAdd` so labels survive
-   `-dm_refine`.
+5. **`CreateDM`** — assign global vertex numbers and build the `DMPlex`.
+6. **`LabelBoundaries`** plus a `DMRefineHookAdd` so labels survive `-dm_refine`.
 
 ### `process_tile` — point generation and smoothing
 
@@ -102,7 +113,8 @@ Executable options (parsed in `main`): `-target_edge_length`, `-final_smooth_its
   interior points can never collide with the boundary lattice.
 - **Anneal loop.** `ANNEAL_ITERS` (=3) rounds of `apply_jitter` → `triangulation` →
   `relax_points_lloyd` → `relax_points_spring` → `ResolveBoundaryOwnership`, followed by
-  `final_smooth_its` rounds of the same without jitter, then one final triangulation.
+  `final_smooth_its` rounds of the same without jitter, then one final triangulation and one
+  more `ResolveBoundaryOwnership` before filtering.
 - **Freezing.** Smoothing only moves points inside a "safe box" (tile ± `sync_margin`, where
   `sync_margin = pad - 1.5 * TARGET_EDGE_LENGTH`). The outer rim of each halo is frozen so the
   halo doesn't collapse inward. Every point that is *allowed* to move is inside the region that
@@ -119,10 +131,12 @@ must generate *bit-identical* coordinates for it. This is enforced by:
 
 - **`unique_hash_id`** (`create_point_with_unique_hash_id`): packs `[type:2][ix:31][iy:31]`
   into a `uint64_t` from the *global* grid indices, not from coordinates. Two ranks generating
-  the same lattice site produce the same ID. `type` is 0=interior, 1=boundary/corner.
+  the same lattice site produce the same ID. `type` is 0=interior, 1=boundary/corner. The
+  right/top walls use index `MAX_GRID_IDX` (2e9), so every other grid index must stay below
+  it; `GenerateBoxMeshDMAgglom` checks `max(width, height)/edge length` plus the halo against it.
 - **Stateless RNG.** `splitmix64` seeded from the packed `(ix, iy)` for placement, and from
   `unique_hash_id ^ iteration` for jitter. No shared RNG state, no rank dependence.
-- **`ResolveBoundaryOwnership`** (BoxMeshDM.cpp:146): after every smoothing round, ranks
+- **`ResolveBoundaryOwnership`**: after every smoothing round, ranks
   exchange `{id, geo_rank, x, y}` claims with their 8 grid neighbours, and every rank adopts
   the coordinates supplied by the **lowest-numbered claiming rank**. This kills float drift
   before it can cause ranks to disagree about geometry.
@@ -157,7 +171,8 @@ permutation, so the reordering does not affect the determinism invariants above.
 
 Owned points get contiguous global IDs via `MPI_Exscan`. Ghost points (vertices of owned
 triangles owned by a neighbour) are resolved in a two-phase point-to-point exchange: send the
-`unique_hash_id` to the owner (tag 100), receive the global ID back (tag 101). Cells are then
+`unique_hash_id` to the owner (tag 100), receive the global ID back (tag 101). An owner asked
+for a point it does not have aborts (that means the ranks disagree about geometry). Cells are then
 handed to `DMPlexCreateFromCellListParallelPetsc` with only the *owned* vertex coordinates.
 `DMPlexDistributeSetDefault(dm, PETSC_FALSE)` is set deliberately — the mesh is already
 balanced and calling a partitioner would be expensive. Users who want ParMETIS can call
@@ -168,15 +183,17 @@ balanced and calling a partitioner would be expensive. Users who want ParMETIS c
 `LabelBoundaries` labels vertices and facets geometrically into both `"Face Sets"` and
 `"markers"`, with values **1=Bottom, 2=Right, 3=Top, 4=Left**. Corners resolve by that priority
 order. `RefineHook_LabelBoundaries` re-labels and re-registers itself after each refinement.
+The domain size is not read from the globals (a later `GenerateBoxMeshDM` call overwrites them):
+it is attached to each DM with `SetBoxDomain` (a `PetscContainer`, freed with the DM), and the
+hook reads it from the coarse DM and attaches it to the refined one.
 
 ### Validation
 
-- `CheckMeshIntegrity` (BoxMeshDM.cpp:1494) checks, globally: total area == `width*height`,
-  boundary perimeter == `2*(width+height)`, Euler characteristic `V - E + F == 1`, and that no
-  edge exceeds `3x` the target length. Returns false on rank 0's verdict, broadcast to all;
-  `GenerateBoxMeshDM` then returns `NULL`. Note the two hardcoded failure messages say
-  "Expected 1.0" / "Expected 4.0" — those strings are stale for non-unit domains, the
-  comparison itself is correct.
+- `CheckMeshIntegrity` checks, globally: total area == `width*height` (relative tolerance
+  1e-6), boundary perimeter == `2*(width+height)` (relative tolerance 2.5e-5), Euler
+  characteristic `V - E + F == 1`, and that no edge exceeds `3x` the target length. The
+  tolerances are relative so the check is independent of domain scale. Returns false on rank
+  0's verdict, broadcast to all; `GenerateBoxMeshDM` then returns `NULL`.
 - `ComputeAndPrintStats` prints point counts and load imbalance, valence histogram, triangle
   count, min/max volume and ratio, min/max angle, average edge length, and an edge-orientation
   histogram in 10-degree bins. Rank 0 only.
@@ -193,6 +210,7 @@ Both cost extra time and memory; production runs should disable them.
 | `TILE_DIM_X/Y` | computed | Rank grid; one tile per rank. |
 | `AGG_FACTOR`, `COARSE_DIM_X/Y`, `SUB_DIM_X/Y` | computed | Agglomeration; all 1/trivial by default. |
 | `TOL_LEN`, `TOL_LEN_SQ`, `TOL_VOLUME` | derived | Length/degenerate-triangle tolerances. |
+| `MAX_GRID_IDX` | `2e9` | Grid index of the right/top walls in the hash id; all other indices must be below it. |
 
 `ANNEAL_ITERS` and `final_smooth_its` both feed the halo width, so raising them raises memory
 and the minimum viable elements-per-rank.
