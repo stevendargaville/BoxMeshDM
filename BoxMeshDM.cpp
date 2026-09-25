@@ -1695,8 +1695,10 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         long long F_total = num_tris_owned_global;
         long long euler = V_total - E_total + F_total;
 
-        bool area_pass = std::abs(global_total_area - expected_area) < 1e-6;
-        bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 1e-4;
+        // Tolerances are relative so the check is independent of the domain scale.
+        // On the unit square they equal the previous absolute tolerances of 1e-6 and 1e-4
+        bool area_pass = std::abs(global_total_area - expected_area) < 1e-6 * expected_area;
+        bool perim_pass = std::abs(global_boundary_len - expected_perimeter) < 2.5e-5 * expected_perimeter;
         bool euler_pass = (euler == 1);
         bool edge_pass = (global_bad_edge_count == 0);
 
