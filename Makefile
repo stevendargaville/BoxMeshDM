@@ -57,7 +57,8 @@ LIB_OUT = libboxmeshdm.so
 endif
 endif
 
-# All the files required by BoxMeshDM
+# All the files required by BoxMeshDM - the library is built from these, the
+# executable also links in BoxMeshDM_main.o, which is the only object with main
 OBJS := BoxMeshDM.o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -67,16 +68,12 @@ OBJS := BoxMeshDM.o
 # This builds the executable with main in it
 all: $(OUT)
 
-# Add STANDALONE define only if not building the library
-ifndef BUILD_LIB
-override CXXFLAGS += -DSTANDALONE_MESH_GEN
-endif
+$(OUT): $(OBJS) BoxMeshDM_main.o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Create the library - use recursive make to set BUILD_LIB and avoid the define
-lib:
-	$(MAKE) $(LIB_OUT) BUILD_LIB=1
+# Create the library
+lib: $(LIB_OUT)
 
 $(LIB_OUT): $(OBJS)
 ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)	
@@ -142,4 +139,4 @@ tests: BoxMeshDM
 
 # Cleanup
 clean::
-	$(RM) $(OUT) $(LIB_OUT) $(OBJS) test_lib test_lib.o *.dat
+	$(RM) $(OUT) $(LIB_OUT) $(OBJS) BoxMeshDM_main.o test_lib test_lib.o *.dat
