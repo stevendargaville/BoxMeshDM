@@ -34,8 +34,9 @@
 // 2. Interior Gen: Create random points inside small squares, REJECTING those near boundaries.
 // 3. Iterate: jitter -> triangulate -> smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
-// 5. 3D only: move the vertices of slivers, then of the wider low-quality band, on the final
-//    tetrahedralisation (RepairSlivers).
+// 5. 3D only: on the final tetrahedralisation, move the vertices of slivers, change the
+//    connectivity by quality-driven flips, then move the vertices of the wider low-quality band
+//    (RepairSlivers).
 //
 // Structure: the pipeline is written once as templates on the dimension DIM. Everything that
 // depends on the dimension (the Delaunay backend, the hash id layout, the simplex kernels, the
@@ -1247,11 +1248,12 @@ static void relax_points_spring(std::vector<Point<DIM> >& points, const std::vec
 // slivers (four nearly coplanar, nearly cospherical points with good edge lengths but almost no
 // volume). Lloyd removes nearly all of them from the connectivity it is given, but the next
 // Delaunay tetrahedralisation brings them straight back. So in 3D the final tetrahedralisation is
-// kept, and vertices are moved on that fixed connectivity in two passes. First the sliver repair:
-// the vertices of tetrahedra with eta^3 < SLIVER_REPAIR_ETA3_3D try steps along the normal of the
-// face opposite them in their worst tetrahedron and along that tetrahedron's eta^3 gradient,
-// keeping the one that most improves the worst eta^3 of the star. Then a quality-guarded
-// smoothing of the wider low-quality band (tetrahedra with eta^3 < SMOOTH_ETA3_3D): a vertex steps
+// kept, and vertices are moved on it in two passes, with flips (see FlipTetrahedra3D) between
+// them. First the sliver repair: the vertices of tetrahedra with eta^3 < SLIVER_REPAIR_ETA3_3D try
+// steps along the normal of the face opposite them in their worst tetrahedron and along that
+// tetrahedron's eta^3 gradient, keeping the one that most improves the worst eta^3 of the star.
+// Then the flips change the connectivity. Then a quality-guarded smoothing of the wider
+// low-quality band (tetrahedra with eta^3 < SMOOTH_ETA3_3D) on the new connectivity: a vertex steps
 // down the gradient of F = sum over its star of 1 / eta^3, which is dominated by the worst
 // tetrahedra but also looks after the rest of the star, with a few step halvings. The mesh is
 // then no longer exactly Delaunay, but it stays valid: in each round only an independent set of
@@ -1260,7 +1262,8 @@ static void relax_points_spring(std::vector<Point<DIM> >& points, const std::vec
 // vertex of the star where it will stay, so no tetrahedron can become inverted.
 //
 // Determinism: a vertex is only moved by the rank that owns it (get_owner_rank), whose
-// tetrahedralisation is exact around its own tile (at least pad inside its point cloud), and the
+// tetrahedralisation is exact around its own tile (up to about pad - 2 target edge lengths
+// outside it, measured: see FLIP_MAINTAINED_MARGIN_3D), and the
 // owner sends the new position to every neighbour that uses the point (any copy within a few
 // edge lengths of its tile; far-rim copies may go stale harmlessly) before the next round.
 // Every decision (which tetrahedra are bad, which vertices move, the candidate positions) is a
@@ -1426,63 +1429,758 @@ static void SendMovedPoints3D(MPI_Comm comm, std::vector<Point<3> >& points, con
     }
 }
 
-// Move the vertices of badly shaped simplices on the final (fixed) connectivity, see above.
-// Called after the final triangulation and ResolveBoundaryOwnership, before the simplices are
-// filtered
+// ~~~~~~~~~~~~~~~~~
+
+// Flips (3D). Moving vertices on a fixed connectivity plateaus: many of the remaining poor
+// tetrahedra are poor because of how their vertices are connected, not where they are. So between
+// the sliver repair and the guarded smoothing (see RepairSlivers) the connectivity is changed by
+// flips, as in Klingner and Shewchuk, "Aggressive tetrahedral mesh improvement": the 2-3 flip of a
+// face and the removal of an edge (3-2, 4-4 and the general edge removal of a ring of up to
+// FLIP_MAX_RING_3D tetrahedra, replaced by the best triangulation of the ring). The candidates are
+// the tetrahedra whose smallest dihedral-angle sine is below FLIP_SINE_3D, and a flip is only made
+// if the smallest such sine of the new tetrahedra is strictly larger than of the old ones. The new
+// tetrahedra are then all positively oriented with a margin, so the mesh stays valid; the boundary
+// surface is never changed (only faces shared by two tetrahedra and edges with a closed ring go).
+//
+// Parallel consistency, by construction. The flips go in rounds, each with two exchanges with the
+// neighbouring ranks:
+// - Every flip has a key vertex in all of its old tetrahedra: the smallest id of the removed edge
+//   (edge removal) or of the removed face (2-3). Only the rank owning the key vertex proposes the
+//   flip, and it holds all the old tetrahedra (the star of an owned vertex is exact).
+// - Proposals go to every neighbouring rank that may maintain one of the flip's vertices (below).
+//   A proposal wins if it goes before (larger new smallest sine, then a hash of the ids) every other
+//   proposal that shares an old tetrahedron with it. Two such proposals share a tetrahedron, which
+//   contains both key vertices, so each owner has received the other's proposal and both decide
+//   with the same data: at most one of them wins. The winners of a round share no tetrahedron, so
+//   they can be applied in any order, and their result depends only on the positions and ids.
+// - Every rank maintains exactly the tetrahedra with at least one vertex in a FIXED set: the points
+//   whose position at the start of RepairSlivers is within FLIP_MAINTAINED_MARGIN_3D target edge
+//   lengths of its tile. The rest of its tetrahedralisation (the inexact rim of the halo) is dropped
+//   before anything reads it. The winners go to the same ranks as the proposals, and each rank
+//   removes the old tetrahedra it holds and adds the new ones with a vertex in its set. Membership
+//   is a property of a tetrahedron alone, so if a rank's set of tetrahedra was exact before a round
+//   it is exact after it, and the inexact rim can never creep inwards.
+// - Everything that reads the tetrahedra afterwards only reads stars of maintained points: the
+//   vertex moves read the stars of owned points and of their neighbours (checked, see
+//   RepairSlivers), and a tetrahedron is output by the owner of its smallest-id vertex, which is
+//   maintained. Owned points stay within REPAIR_MAX_DISPLACEMENT_3D of where they started, so a
+//   margin of a few edge lengths covers them and their neighbours.
+// Every decision is a function of the unique hash ids and the synchronised positions only; the
+// winners are applied in the order of their hash, so the order of the tetrahedron list (which the
+// owned-point numbering follows) is deterministic.
+
+// Tetrahedra whose smallest dihedral-angle sine is below this (sin 30 degrees) are flip candidates
+const double FLIP_SINE_3D = 0.5;
+// Largest number of flip rounds, and of tetrahedra around an edge that is removed
+const int FLIP_ROUNDS_3D = 8;
+const int FLIP_MAX_RING_3D = 7;
+// The points a rank maintains the tetrahedra of: those that started within this many target edge
+// lengths of its tile
+const double FLIP_MAINTAINED_MARGIN_3D = 4.5;
+
+// Smallest sine of the six dihedral angles of the tetrahedron q (in positive order), or -1 if its
+// normalised 6x volume is <= 1e-12 (inverted, flat or too thin). The sine at the edge ij is
+// 6V |e_ij| / (|n_k| |n_l|), with n_k and n_l the normals (twice the area) of the two faces
+// through the edge. The smallest sine is small both for a small and for a large dihedral angle
+static double tet_min_sine(const double *const *q) {
+    double e[4][3];
+    for (int a = 1; a < 4; ++a) {
+        for (int k = 0; k < 3; ++k) e[a][k] = (q[a][k] - q[0][k]) / TARGET_EDGE_LENGTH;
+    }
+    // n[k] is the normal of the face opposite vertex k, n[1] first for the volume
+    double n[4][3];
+    n[1][0] = e[2][1] * e[3][2] - e[2][2] * e[3][1];
+    n[1][1] = e[2][2] * e[3][0] - e[2][0] * e[3][2];
+    n[1][2] = e[2][0] * e[3][1] - e[2][1] * e[3][0];
+    double det = e[1][0] * n[1][0] + e[1][1] * n[1][1] + e[1][2] * n[1][2];
+    if (!(det > 1e-12)) return -1.0;
+    double u[3], w[3];
+    for (int k = 0; k < 3; ++k) {
+        u[k] = e[2][k] - e[1][k];
+        w[k] = e[3][k] - e[1][k];
+    }
+    n[0][0] = u[1] * w[2] - u[2] * w[1];
+    n[0][1] = u[2] * w[0] - u[0] * w[2];
+    n[0][2] = u[0] * w[1] - u[1] * w[0];
+    n[2][0] = e[1][1] * e[3][2] - e[1][2] * e[3][1];
+    n[2][1] = e[1][2] * e[3][0] - e[1][0] * e[3][2];
+    n[2][2] = e[1][0] * e[3][1] - e[1][1] * e[3][0];
+    n[3][0] = e[1][1] * e[2][2] - e[1][2] * e[2][1];
+    n[3][1] = e[1][2] * e[2][0] - e[1][0] * e[2][2];
+    n[3][2] = e[1][0] * e[2][1] - e[1][1] * e[2][0];
+    double n_sq[4];
+    for (int k = 0; k < 4; ++k) n_sq[k] = dist_sq<3>(n[k]);
+    // Edge ij and the two faces through it (opposite the other two vertices)
+    static const int pairs[6][4] = {{0, 1, 2, 3}, {0, 2, 1, 3}, {0, 3, 1, 2}, {1, 2, 0, 3}, {1, 3, 0, 2}, {2, 3, 0, 1}};
+    double smallest = 1e300;
+    for (int p = 0; p < 6; ++p) {
+        double d[3];
+        for (int k = 0; k < 3; ++k) d[k] = (pairs[p][0] == 0) ? e[pairs[p][1]][k] : e[pairs[p][1]][k] - e[pairs[p][0]][k];
+        smallest = std::min(smallest, dist_sq<3>(d) / (n_sq[pairs[p][2]] * n_sq[pairs[p][3]]));
+    }
+    return det * std::sqrt(smallest);
+}
+
+// tet_min_sine of the tetrahedron (v0, v1, v2, v3), given in positive order. canonical: evaluate it
+// in canonical order (see canonical_tet_order), for a tetrahedron of the mesh whose stored vertex
+// order may differ between ranks; otherwise in the order given, for the new tetrahedra of a flip,
+// whose vertex order is already a function of the ids
+static double flip_quality(const std::vector<Point<3> >& points, int v0, int v1, int v2, int v3, bool canonical) {
+    int v[4] = {v0, v1, v2, v3};
+    const double *q[4];
+    if (canonical) {
+        uint64_t ids[4];
+        int o[4];
+        for (int a = 0; a < 4; ++a) ids[a] = points[v[a]].unique_hash_id;
+        canonical_tet_order(ids, o);
+        for (int a = 0; a < 4; ++a) q[a] = points[v[o[a]]].c;
+    } else {
+        for (int a = 0; a < 4; ++a) q[a] = points[v[a]].c;
+    }
+    return tet_min_sine(q);
+}
+
+// A flip, as exchanged between ranks (all vertices as unique hash ids). Both kinds are described
+// by an edge (bottom a, top b) and a ring of m vertices counterclockwise seen from b, starting at
+// its smallest id. The edge configuration is the m tetrahedra (a, b, r_i, r_i+1); the triangulated
+// configuration is, for each triangle (i, j, k) of a triangulation of the ring (in ring order),
+// the tetrahedra (r_i, r_j, r_k, b) and (r_i, r_k, r_j, a). An edge removal (type 1) goes from the
+// edge configuration to the triangulation tri of the ring; a 2-3 flip (type 0) from the
+// triangulated configuration of a ring of 3 (the face) to the edge configuration
+struct FlipMessage3D {
+    uint64_t a, b, ring[FLIP_MAX_RING_3D];
+    uint64_t hash;    // of the ids, the tie break between proposals
+    double new_min;   // smallest tet_min_sine of the new tetrahedra, the priority
+    int type, m;
+    int tri[3 * (FLIP_MAX_RING_3D - 2)];
+};
+
+// The tetrahedra of a flip in positive order (as ids): the old ones if old, else the new ones.
+// Returns their number
+static int flip_tetrahedra(const FlipMessage3D& f, bool old, uint64_t (*t)[4]) {
+    bool edge_configuration = (f.type == 1) == old;
+    int count = 0;
+    if (edge_configuration) {
+        for (int i = 0; i < f.m; ++i) {
+            t[count][0] = f.a; t[count][1] = f.b; t[count][2] = f.ring[i]; t[count][3] = f.ring[(i + 1) % f.m];
+            count++;
+        }
+    } else {
+        // A 2-3 flip's face is the single triangle (0, 1, 2)
+        static const int face[3] = {0, 1, 2};
+        int num_triangles = (f.type == 1) ? f.m - 2 : 1;
+        for (int k = 0; k < num_triangles; ++k) {
+            const int *tr = (f.type == 1) ? &f.tri[3 * k] : face;
+            uint64_t ri = f.ring[tr[0]], rj = f.ring[tr[1]], rk = f.ring[tr[2]];
+            t[count][0] = ri; t[count][1] = rj; t[count][2] = rk; t[count][3] = f.b;
+            count++;
+            t[count][0] = ri; t[count][1] = rk; t[count][2] = rj; t[count][3] = f.a;
+            count++;
+        }
+    }
+    return count;
+}
+
+// Whether flip x goes before flip y: the larger smallest sine of the new tetrahedra, then the hash
+static bool flip_before(const FlipMessage3D& x, const FlipMessage3D& y) {
+    if (x.new_min != y.new_min) return x.new_min > y.new_min;
+    return x.hash > y.hash;
+}
+
+// Exchange byte buffers with every neighbouring rank (send[k] to and recv[k] from neighbours[k]):
+// the sizes first on tag, then the data on tag + 1. Every pair exchanges a size on every call
+static void ExchangeWithNeighbours3D(MPI_Comm comm, const std::vector<TileNeighbour3D>& neighbours,
+                                     const std::vector<std::vector<char> >& send, std::vector<std::vector<char> >& recv, int tag) {
+    int num_neighbours = neighbours.size();
+    recv.assign(num_neighbours, std::vector<char>());
+    if (num_neighbours == 0) return;
+    std::vector<long> send_sizes(num_neighbours), recv_sizes(num_neighbours, 0);
+    std::vector<MPI_Request> requests;
+    for (int k = 0; k < num_neighbours; ++k) {
+        send_sizes[k] = send[k].size();
+        MPI_Request req;
+        MPI_Irecv(&recv_sizes[k], 1, MPI_LONG, neighbours[k].rank, tag, comm, &req);
+        requests.push_back(req);
+    }
+    for (int k = 0; k < num_neighbours; ++k) {
+        MPI_Request req;
+        MPI_Isend(&send_sizes[k], 1, MPI_LONG, neighbours[k].rank, tag, comm, &req);
+        requests.push_back(req);
+    }
+    MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    requests.clear();
+    for (int k = 0; k < num_neighbours; ++k) {
+        if (recv_sizes[k] > 0) {
+            recv[k].resize(recv_sizes[k]);
+            MPI_Request req;
+            MPI_Irecv(recv[k].data(), (int)recv_sizes[k], MPI_BYTE, neighbours[k].rank, tag + 1, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    for (int k = 0; k < num_neighbours; ++k) {
+        if (send_sizes[k] > 0) {
+            MPI_Request req;
+            MPI_Isend(send[k].data(), (int)send_sizes[k], MPI_BYTE, neighbours[k].rank, tag + 1, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    if (!requests.empty()) MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+}
+
+// Improve the tetrahedra tets (this rank's maintained set, see above) by flips. maintained says
+// which points are in the rank's fixed set, id_to_index maps an id to its index in points
+static void FlipTetrahedra3D(MPI_Comm comm, const std::vector<Point<3> >& points, std::vector<Simplex<3> >& tets,
+                             const std::vector<char>& maintained, const std::vector<TileNeighbour3D>& neighbours,
+                             const std::unordered_map<uint64_t, int>& id_to_index) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+    const int MAX_R = FLIP_MAX_RING_3D;
+    int n = points.size();
+    auto id = [&](int v) { return points[v].unique_hash_id; };
+    auto local = [&](uint64_t i) {
+        std::unordered_map<uint64_t, int>::const_iterator it = id_to_index.find(i);
+        return (it == id_to_index.end()) ? -1 : it->second;
+    };
+    auto fail = [&](const char *what) {
+        std::cerr << "ERROR: [Rank " << rank << "] 3D flips: " << what << ". This is a bug in BoxMeshDM.\n";
+        MPI_Abort(comm, EXIT_FAILURE);
+    };
+
+    // Point to tetrahedron lists, the flip quality of each tetrahedron, and which are alive
+    std::vector<std::vector<int> > vstar(n);
+    for (size_t k = 0; k < tets.size(); ++k) {
+        for (int a = 0; a < 4; ++a) vstar[tets[k].v[a]].push_back((int)k);
+    }
+    std::vector<char> alive(tets.size(), 1);
+    std::vector<double> q(tets.size());
+    for (size_t k = 0; k < tets.size(); ++k) q[k] = flip_quality(points, tets[k].v[0], tets[k].v[1], tets[k].v[2], tets[k].v[3], true);
+
+    // Points whose star changed in this round (touched_next) and in the last (touched), and the
+    // candidates of the round
+    std::vector<char> touched(n, 1), touched_next(n, 0), is_candidate;
+    std::vector<int> candidates;
+    auto kill = [&](int k) {
+        alive[k] = 0;
+        for (int a = 0; a < 4; ++a) {
+            std::vector<int>& st = vstar[tets[k].v[a]];
+            st.erase(std::find(st.begin(), st.end(), k));
+            touched_next[tets[k].v[a]] = 1;
+        }
+    };
+    auto add = [&](const int *v) {
+        Simplex<3> t;
+        for (int a = 0; a < 4; ++a) t.v[a] = v[a];
+        int k = tets.size();
+        tets.push_back(t);
+        alive.push_back(1);
+        q.push_back(flip_quality(points, v[0], v[1], v[2], v[3], true));
+        for (int a = 0; a < 4; ++a) {
+            vstar[v[a]].push_back(k);
+            touched_next[v[a]] = 1;
+        }
+    };
+    // The alive tetrahedron with the vertices v (local, any order), -1 if there is none
+    auto find_tet = [&](const int *v) {
+        const std::vector<int>& st = vstar[v[0]];
+        for (size_t s = 0; s < st.size(); ++s) {
+            const int *w = tets[st[s]].v;
+            int hits = 0;
+            for (int a = 1; a < 4; ++a) {
+                if (w[0] == v[a] || w[1] == v[a] || w[2] == v[a] || w[3] == v[a]) hits++;
+            }
+            if (hits == 3) return st[s];
+        }
+        return -1;
+    };
+
+    // The closed ring of the edge (a, b), a the bottom (see FlipMessage3D), and its tetrahedra.
+    // Returns m, or 0 if the ring is open (a boundary edge) or has more than FLIP_MAX_RING_3D
+    auto edge_ring = [&](int a, int b, int *ring, int *ring_tets) {
+        int m = 0, xs[MAX_R], ys[MAX_R];
+        for (size_t s = 0; s < vstar[a].size(); ++s) {
+            int k = vstar[a][s];
+            const int *v = tets[k].v;
+            int pa = -1, pb = -1;
+            for (int c = 0; c < 4; ++c) {
+                if (v[c] == a) pa = c;
+                if (v[c] == b) pb = c;
+            }
+            if (pb < 0) continue;
+            if (m == MAX_R) return 0;
+            // (a, b, x, y) is an even permutation of the stored (positive) order
+            int other[2], num_other = 0;
+            for (int c = 0; c < 4; ++c) {
+                if (c != pa && c != pb) other[num_other++] = c;
+            }
+            int perm[4] = {pa, pb, other[0], other[1]}, inversions = 0;
+            for (int i = 0; i < 4; ++i) {
+                for (int j = i + 1; j < 4; ++j) {
+                    if (perm[i] > perm[j]) inversions++;
+                }
+            }
+            int x = v[other[0]], y = v[other[1]];
+            if (inversions % 2 == 1) std::swap(x, y);
+            xs[m] = x; ys[m] = y; ring_tets[m] = k;
+            m++;
+        }
+        if (m < 3) return 0;
+        // Chain x -> y around the edge
+        int cur = xs[0];
+        for (int i = 0; i < m; ++i) {
+            ring[i] = cur;
+            int j = 0;
+            while (j < m && xs[j] != cur) ++j;
+            if (j == m) return 0;
+            cur = ys[j];
+        }
+        if (cur != ring[0]) return 0;
+        int s0 = 0;
+        for (int i = 1; i < m; ++i) {
+            if (id(ring[i]) < id(ring[s0])) s0 = i;
+        }
+        std::rotate(ring, ring + s0, ring + m);
+        return m;
+    };
+
+    // The triangulation of the ring of edge (a, b) with the largest smallest quality of its
+    // tetrahedra (dynamic programming over the sub-polygons, Shewchuk's edge removal), in tri.
+    // Returns that quality, or -2 if it can not beat floor_q
+    auto ring_triangulation = [&](int a, int b, const int *ring, int m, double floor_q, int *tri) {
+        double quality[MAX_R][MAX_R][MAX_R], best[MAX_R][MAX_R];
+        int split[MAX_R][MAX_R];
+        // Every triangulation has a triangle on the ring edge (0, 1): give up early if none is good enough
+        bool possible = false;
+        for (int k = 2; k < m && !possible; ++k) {
+            if (flip_quality(points, ring[0], ring[1], ring[k], b, false) > floor_q &&
+                flip_quality(points, ring[0], ring[k], ring[1], a, false) > floor_q) possible = true;
+        }
+        if (!possible) return -2.0;
+        for (int i = 0; i < m; ++i) {
+            for (int j = i + 1; j < m; ++j) {
+                for (int k = j + 1; k < m; ++k) {
+                    double q_top = flip_quality(points, ring[i], ring[j], ring[k], b, false);
+                    double q_bottom = (q_top > floor_q) ? flip_quality(points, ring[i], ring[k], ring[j], a, false) : -1.0;
+                    quality[i][j][k] = std::min(q_top, q_bottom);
+                }
+            }
+        }
+        for (int len = 1; len < m; ++len) {
+            for (int i = 0; i + len < m; ++i) {
+                int j = i + len;
+                if (len == 1) {
+                    best[i][j] = 1e300;
+                    split[i][j] = -1;
+                    continue;
+                }
+                best[i][j] = -2.0;
+                split[i][j] = -1;
+                for (int k = i + 1; k < j; ++k) {
+                    double v = std::min(quality[i][k][j], std::min(best[i][k], best[k][j]));
+                    if (v > best[i][j]) {
+                        best[i][j] = v;
+                        split[i][j] = k;
+                    }
+                }
+            }
+        }
+        if (!(best[0][m - 1] > floor_q)) return -2.0;
+        int stack[2 * MAX_R][2], sp = 0, num_triangles = 0;
+        stack[sp][0] = 0; stack[sp][1] = m - 1; sp++;
+        while (sp > 0) {
+            sp--;
+            int i = stack[sp][0], j = stack[sp][1];
+            if (j - i < 2) continue;
+            int k = split[i][j];
+            tri[3 * num_triangles] = i; tri[3 * num_triangles + 1] = k; tri[3 * num_triangles + 2] = j;
+            num_triangles++;
+            stack[sp][0] = i; stack[sp][1] = k; sp++;
+            stack[sp][0] = k; stack[sp][1] = j; sp++;
+        }
+        return best[0][m - 1];
+    };
+
+    auto flip_hash = [&](FlipMessage3D& f) {
+        uint64_t h = 0x9e3779b97f4a7c15ULL * (uint64_t)(f.type + 1);
+        h ^= f.a;
+        h = splitmix64(h);
+        h ^= f.b;
+        h = splitmix64(h);
+        if (f.type == 0) {
+            for (int i = 0; i < 3; ++i) {
+                h ^= f.ring[i];
+                h = splitmix64(h);
+            }
+        }
+        return h;
+    };
+
+    // The removal of edge (a, b), in f, if it improves the smallest quality. old_tets: its tetrahedra
+    auto eval_edge = [&](int a, int b, FlipMessage3D& f, int *old_tets) {
+        std::memset(&f, 0, sizeof(FlipMessage3D));
+        if (id(b) < id(a)) std::swap(a, b);
+        int ring[MAX_R];
+        int m = edge_ring(a, b, ring, old_tets);
+        if (m == 0) return false;
+        double old_min = 2.0;
+        for (int i = 0; i < m; ++i) old_min = std::min(old_min, q[old_tets[i]]);
+        double new_min = ring_triangulation(a, b, ring, m, old_min, f.tri);
+        if (!(new_min > old_min)) return false;
+        f.type = 1; f.m = m; f.a = id(a); f.b = id(b); f.new_min = new_min;
+        for (int i = 0; i < m; ++i) f.ring[i] = id(ring[i]);
+        f.hash = flip_hash(f);
+        return true;
+    };
+    // The 2-3 flip of the face of tetrahedron k opposite its vertex c, in f, if it improves the
+    // smallest quality. Sets other to the tetrahedron on the other side of the face. A face between
+    // two candidates is only evaluated from the one with the smaller index
+    auto eval_face = [&](int k, int c, FlipMessage3D& f, int& other) {
+        std::memset(&f, 0, sizeof(FlipMessage3D));
+        int fv[3], num = 0;
+        for (int a = 0; a < 4; ++a) {
+            if (a != c) fv[num++] = a;
+        }
+        // (f0, f1, f2, d) is an even permutation of the stored (positive) order
+        int perm[4] = {fv[0], fv[1], fv[2], c}, inversions = 0;
+        for (int i = 0; i < 4; ++i) {
+            for (int j = i + 1; j < 4; ++j) {
+                if (perm[i] > perm[j]) inversions++;
+            }
+        }
+        int f0 = tets[k].v[fv[0]], f1 = tets[k].v[fv[1]], f2 = tets[k].v[fv[2]], d = tets[k].v[c];
+        if (inversions % 2 == 1) std::swap(f0, f1);
+        other = -1;
+        const std::vector<int>& st = vstar[f0];
+        for (size_t s = 0; s < st.size() && other < 0; ++s) {
+            int k2 = st[s];
+            if (k2 == k) continue;
+            int hits = 0;
+            for (int a = 0; a < 4; ++a) {
+                if (tets[k2].v[a] == f1 || tets[k2].v[a] == f2) hits++;
+            }
+            if (hits == 2) other = k2;
+        }
+        if (other < 0) return false;
+        if (other < k && is_candidate[other]) return false;
+        int e = -1;
+        for (int a = 0; a < 4; ++a) {
+            int w = tets[other].v[a];
+            if (w != f0 && w != f1 && w != f2) e = w;
+        }
+        double old_min = std::min(q[k], q[other]);
+        // Face rotated to start at its smallest id (which keeps its orientation)
+        int r[3] = {f0, f1, f2}, s0 = 0;
+        for (int i = 1; i < 3; ++i) {
+            if (id(r[i]) < id(r[s0])) s0 = i;
+        }
+        std::rotate(r, r + s0, r + 3);
+        double new_min = 2.0;
+        for (int i = 0; i < 3; ++i) {
+            new_min = std::min(new_min, flip_quality(points, e, d, r[i], r[(i + 1) % 3], false));
+            if (!(new_min > old_min)) return false;
+        }
+        f.type = 0; f.m = 3; f.a = id(e); f.b = id(d); f.new_min = new_min;
+        for (int i = 0; i < 3; ++i) f.ring[i] = id(r[i]);
+        f.hash = flip_hash(f);
+        return true;
+    };
+
+    // Send a list of flips to every neighbour that may maintain one of their points, and receive
+    // theirs. A point is at most REPAIR_MAX_DISPLACEMENT_3D from where it started, so a flip goes to
+    // every neighbour whose tile, widened by a larger margin, the bounding box of its points meets
+    const double send_margin = (FLIP_MAINTAINED_MARGIN_3D + REPAIR_MAX_DISPLACEMENT_3D + 0.5) * TARGET_EDGE_LENGTH;
+    auto send_to_neighbours = [&](const std::vector<FlipMessage3D>& list, std::vector<FlipMessage3D>& received, int tag) {
+        std::vector<std::vector<char> > send(neighbours.size()), recv;
+        if (!neighbours.empty()) {
+            for (size_t i = 0; i < list.size(); ++i) {
+                const FlipMessage3D& f = list[i];
+                uint64_t ids[2 + FLIP_MAX_RING_3D];
+                int num = 0;
+                ids[num++] = f.a;
+                ids[num++] = f.b;
+                for (int j = 0; j < f.m; ++j) ids[num++] = f.ring[j];
+                double lo[3], hi[3];
+                for (int j = 0; j < num; ++j) {
+                    int v = local(ids[j]);
+                    if (v < 0) fail("a flip to send has a point this rank does not hold");
+                    for (int d = 0; d < 3; ++d) {
+                        if (j == 0 || points[v].c[d] < lo[d]) lo[d] = points[v].c[d];
+                        if (j == 0 || points[v].c[d] > hi[d]) hi[d] = points[v].c[d];
+                    }
+                }
+                for (size_t k = 0; k < neighbours.size(); ++k) {
+                    bool meets = true;
+                    for (int d = 0; d < 3; ++d) {
+                        double tile_s = DOMAIN_SIZE[d] / TILE_DIM[d];
+                        if (hi[d] < neighbours[k].tile[d] * tile_s - send_margin || lo[d] > (neighbours[k].tile[d] + 1) * tile_s + send_margin) meets = false;
+                    }
+                    if (!meets) continue;
+                    const char *bytes = reinterpret_cast<const char *>(&f);
+                    send[k].insert(send[k].end(), bytes, bytes + sizeof(FlipMessage3D));
+                }
+            }
+        }
+        ExchangeWithNeighbours3D(comm, neighbours, send, recv, tag);
+        received.clear();
+        for (size_t k = 0; k < recv.size(); ++k) {
+            size_t count = recv[k].size() / sizeof(FlipMessage3D);
+            for (size_t i = 0; i < count; ++i) {
+                FlipMessage3D f;
+                std::memcpy(&f, recv[k].data() + i * sizeof(FlipMessage3D), sizeof(FlipMessage3D));
+                received.push_back(f);
+            }
+        }
+    };
+    // The local tetrahedron t (ids), -1 if this rank does not hold it
+    auto find_by_ids = [&](const uint64_t *t) {
+        int v[4];
+        for (int a = 0; a < 4; ++a) {
+            v[a] = local(t[a]);
+            if (v[a] < 0) return -1;
+        }
+        return find_tet(v);
+    };
+
+    const int (*edges)[2];
+    get_simplex_edges<3>(edges);
+    std::unordered_set<uint64_t> seen_edges;
+    std::vector<FlipMessage3D> proposals, received, winners;
+    std::vector<std::vector<int> > proposal_old_tets;
+    std::vector<int> tet_best;
+    for (int round = 0; round < FLIP_ROUNDS_3D; ++round) {
+        // The candidates: tetrahedra below the threshold with a point whose star changed in the
+        // last round (the flips of the others are the same as in the last round, which found none
+        // or only ones that did not win, whose points are marked below)
+        if (round > 0) {
+            touched.swap(touched_next);
+            std::fill(touched_next.begin(), touched_next.end(), 0);
+        }
+        candidates.clear();
+        is_candidate.assign(tets.size(), 0);
+        for (size_t k = 0; k < tets.size(); ++k) {
+            if (!alive[k] || !(q[k] < FLIP_SINE_3D)) continue;
+            bool any_touched = false;
+            for (int a = 0; a < 4; ++a) {
+                if (touched[tets[k].v[a]]) any_touched = true;
+            }
+            if (!any_touched) continue;
+            candidates.push_back((int)k);
+            is_candidate[k] = 1;
+        }
+
+        // This rank's proposals: every improving flip of a candidate whose key vertex it owns,
+        // each edge and face once
+        proposals.clear();
+        proposal_old_tets.clear();
+        seen_edges.clear();
+        for (size_t c = 0; c < candidates.size(); ++c) {
+            int k = candidates[c];
+            FlipMessage3D f;
+            for (int e = 0; e < 6; ++e) {
+                int a = tets[k].v[edges[e][0]], b = tets[k].v[edges[e][1]];
+                int key = (id(a) < id(b)) ? a : b;
+                if (get_owner_rank(points[key], size) != rank) continue;
+                uint64_t edge_key = (uint64_t)std::min(a, b) * (uint64_t)n + (uint64_t)std::max(a, b);
+                if (!seen_edges.insert(edge_key).second) continue;
+                int old_tets[MAX_R];
+                if (eval_edge(a, b, f, old_tets)) {
+                    proposals.push_back(f);
+                    proposal_old_tets.push_back(std::vector<int>(old_tets, old_tets + f.m));
+                }
+            }
+            for (int c4 = 0; c4 < 4; ++c4) {
+                int key = -1;
+                for (int a = 0; a < 4; ++a) {
+                    if (a != c4 && (key < 0 || id(tets[k].v[a]) < id(key))) key = tets[k].v[a];
+                }
+                if (get_owner_rank(points[key], size) != rank) continue;
+                int other;
+                if (!eval_face(k, c4, f, other)) continue;
+                proposals.push_back(f);
+                int old_tets[2] = {k, other};
+                proposal_old_tets.push_back(std::vector<int>(old_tets, old_tets + 2));
+            }
+        }
+        // The star of an owned (key) vertex is complete: owned points are maintained
+        for (size_t i = 0; i < proposals.size(); ++i) {
+            if (!maintained[local(proposals[i].type == 1 ? proposals[i].a : proposals[i].ring[0])]) fail("an owned point is not maintained");
+        }
+
+        // First exchange: the proposals. Then a proposal of this rank wins if it goes before every
+        // proposal (its own or received) that shares an old tetrahedron with it
+        send_to_neighbours(proposals, received, 107);
+        tet_best.assign(tets.size(), -1);
+        std::vector<FlipMessage3D> all(proposals);
+        all.insert(all.end(), received.begin(), received.end());
+        for (size_t i = 0; i < all.size(); ++i) {
+            std::vector<int> old_tets;
+            if (i < proposals.size()) {
+                old_tets = proposal_old_tets[i];
+            } else {
+                // Only a received proposal's old tetrahedra this rank holds can be shared with its own
+                uint64_t t[2 * FLIP_MAX_RING_3D][4];
+                int num = flip_tetrahedra(all[i], true, t);
+                for (int j = 0; j < num; ++j) {
+                    int k = find_by_ids(t[j]);
+                    if (k >= 0) old_tets.push_back(k);
+                }
+            }
+            for (size_t j = 0; j < old_tets.size(); ++j) {
+                int k = old_tets[j];
+                if (tet_best[k] < 0 || flip_before(all[i], all[tet_best[k]])) tet_best[k] = (int)i;
+            }
+        }
+        winners.clear();
+        for (size_t i = 0; i < proposals.size(); ++i) {
+            bool wins = true;
+            for (size_t j = 0; j < proposal_old_tets[i].size(); ++j) {
+                if (tet_best[proposal_old_tets[i][j]] != (int)i) wins = false;
+            }
+            if (wins) {
+                winners.push_back(proposals[i]);
+            } else {
+                // Evaluate its candidates again next round
+                touched_next[local(proposals[i].a)] = 1;
+                touched_next[local(proposals[i].b)] = 1;
+            }
+        }
+        long num_winners = winners.size(), global_winners = 0;
+
+        // Second exchange: the winners. Apply them all in the order of their hash: remove the old
+        // tetrahedra this rank holds, add the new ones with a maintained vertex
+        send_to_neighbours(winners, received, 109);
+        winners.insert(winners.end(), received.begin(), received.end());
+        std::sort(winners.begin(), winners.end(), [](const FlipMessage3D& x, const FlipMessage3D& y) { return x.hash < y.hash; });
+        for (size_t i = 0; i < winners.size(); ++i) {
+            const FlipMessage3D& f = winners[i];
+            uint64_t t[2 * FLIP_MAX_RING_3D][4];
+            int num = flip_tetrahedra(f, true, t);
+            for (int j = 0; j < num; ++j) {
+                int k = find_by_ids(t[j]);
+                if (k >= 0) {
+                    kill(k);
+                } else {
+                    for (int a = 0; a < 4; ++a) {
+                        int v = local(t[j][a]);
+                        if (v >= 0 && maintained[v]) fail("an old tetrahedron with a maintained vertex is missing");
+                    }
+                }
+            }
+            num = flip_tetrahedra(f, false, t);
+            for (int j = 0; j < num; ++j) {
+                int v[4];
+                bool keep = false, missing = false;
+                for (int a = 0; a < 4; ++a) {
+                    v[a] = local(t[j][a]);
+                    if (v[a] < 0) missing = true;
+                    else if (maintained[v[a]]) keep = true;
+                }
+                if (!keep) continue;
+                if (missing) fail("a new tetrahedron with a maintained vertex has a vertex this rank does not hold");
+                add(v);
+            }
+        }
+        MPI_Allreduce(&num_winners, &global_winners, 1, MPI_LONG, MPI_SUM, comm);
+        if (global_winners == 0) break;
+    }
+
+    // Drop the removed tetrahedra, keeping the order of the rest
+    size_t w = 0;
+    for (size_t k = 0; k < tets.size(); ++k) {
+        if (alive[k]) tets[w++] = tets[k];
+    }
+    tets.resize(w);
+}
+
+// Improve the badly shaped simplices of the final triangulation, see above (3D: move vertices,
+// flip, move vertices; on return simplices holds this rank's maintained tetrahedra, see
+// FlipTetrahedra3D). Called after the final triangulation and ResolveBoundaryOwnership, before the
+// simplices are filtered
 template <int DIM>
-static void RepairSlivers(MPI_Comm comm, std::vector<Point<DIM> >& points, const std::vector<Simplex<DIM> >& simplices, double pad);
+static void RepairSlivers(MPI_Comm comm, std::vector<Point<DIM> >& points, std::vector<Simplex<DIM> >& simplices, double pad);
 
 // 2D: nothing, the smoothed Delaunay triangulation is used as it is
 template <>
-inline void RepairSlivers<2>(MPI_Comm comm, std::vector<Point<2> >& points, const std::vector<Simplex<2> >& simplices, double pad) {
+inline void RepairSlivers<2>(MPI_Comm comm, std::vector<Point<2> >& points, std::vector<Simplex<2> >& simplices, double pad) {
     (void)comm; (void)points; (void)simplices; (void)pad;
 }
 
 template <>
-void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::vector<Simplex<3> >& tets, double pad) {
+void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, std::vector<Simplex<3> >& tets, double pad) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
     int n = points.size();
-
-    // The tetrahedra with their vertices in canonical order, see canonical_tet_order
-    std::vector<Simplex<3> > canonical(tets.size());
-    for (size_t k = 0; k < tets.size(); ++k) {
-        uint64_t ids[4];
-        int o[4];
-        for (int a = 0; a < 4; ++a) ids[a] = points[tets[k].v[a]].unique_hash_id;
-        canonical_tet_order(ids, o);
-        for (int a = 0; a < 4; ++a) canonical[k].v[a] = tets[k].v[o[a]];
-    }
-
-    // CSR point-to-tetrahedron adjacency
-    std::vector<int> tet_offset(n + 1, 0);
-    for (const auto& t : tets) {
-        for (int a = 0; a < 4; ++a) tet_offset[t.v[a] + 1]++;
-    }
-    for (int i = 0; i < n; ++i) tet_offset[i + 1] += tet_offset[i];
-    std::vector<int> tet_data(tet_offset[n]);
-    {
-        std::vector<int> fill(tet_offset.begin(), tet_offset.end() - 1);
-        for (size_t k = 0; k < tets.size(); ++k) {
-            for (int a = 0; a < 4; ++a) tet_data[fill[tets[k].v[a]]++] = (int)k;
-        }
-    }
-
-    // The neighbouring ranks the moves are exchanged with (none on one rank)
-    std::vector<TileNeighbour3D> neighbours;
-    std::unordered_map<uint64_t, int> id_to_index;
-    if (size > 1) {
-        GetTileNeighbours3D(rank, neighbours);
-        id_to_index.reserve(n);
-        for (int i = 0; i < n; ++i) id_to_index[points[i].unique_hash_id] = i;
-    }
 
     // The positions in the final tetrahedralisation, for the displacement limit
     std::vector<double> start(3 * (size_t)n);
     for (int i = 0; i < n; ++i) {
         for (int d = 0; d < 3; ++d) start[3 * (size_t)i + d] = points[i].c[d];
     }
+
+    // The points this rank maintains the tetrahedra of (see the flips above): those that start
+    // within FLIP_MAINTAINED_MARGIN_3D of its tile. Keep only the tetrahedra with such a vertex; the
+    // others (the inexact rim of the halo) are never read, and the flips do not keep them up to date
+    std::vector<char> maintained(n, 1);
+    {
+        int t[3];
+        rank_to_tile<3>(rank, t);
+        double margin = FLIP_MAINTAINED_MARGIN_3D * TARGET_EDGE_LENGTH;
+        for (int i = 0; i < n; ++i) {
+            for (int d = 0; d < 3; ++d) {
+                double tile_s = DOMAIN_SIZE[d] / TILE_DIM[d];
+                double x = start[3 * (size_t)i + d];
+                if (x < t[d] * tile_s - margin || x > (t[d] + 1) * tile_s + margin) maintained[i] = 0;
+            }
+        }
+        size_t w = 0;
+        for (size_t k = 0; k < tets.size(); ++k) {
+            bool keep = false;
+            for (int a = 0; a < 4; ++a) {
+                if (maintained[tets[k].v[a]]) keep = true;
+            }
+            if (keep) tets[w++] = tets[k];
+        }
+        tets.resize(w);
+    }
+
+    // The tetrahedra with their vertices in canonical order, see canonical_tet_order
+    std::vector<Simplex<3> > canonical;
+    // CSR point-to-tetrahedron adjacency
+    std::vector<int> tet_offset, tet_data;
+    std::vector<double> eta3;
+    std::vector<char> star_sorted;
+    auto rebuild = [&]() {
+        canonical.resize(tets.size());
+        for (size_t k = 0; k < tets.size(); ++k) {
+            uint64_t ids[4];
+            int o[4];
+            for (int a = 0; a < 4; ++a) ids[a] = points[tets[k].v[a]].unique_hash_id;
+            canonical_tet_order(ids, o);
+            for (int a = 0; a < 4; ++a) canonical[k].v[a] = tets[k].v[o[a]];
+        }
+        tet_offset.assign(n + 1, 0);
+        for (const auto& t : tets) {
+            for (int a = 0; a < 4; ++a) tet_offset[t.v[a] + 1]++;
+        }
+        for (int i = 0; i < n; ++i) tet_offset[i + 1] += tet_offset[i];
+        tet_data.assign(tet_offset[n], 0);
+        {
+            std::vector<int> fill(tet_offset.begin(), tet_offset.end() - 1);
+            for (size_t k = 0; k < tets.size(); ++k) {
+                for (int a = 0; a < 4; ++a) tet_data[fill[tets[k].v[a]]++] = (int)k;
+            }
+        }
+        star_sorted.assign(n, 0);
+    };
+    rebuild();
+
+    // The neighbouring ranks the moves and flips are exchanged with (none on one rank)
+    std::vector<TileNeighbour3D> neighbours;
+    std::unordered_map<uint64_t, int> id_to_index;
+    GetTileNeighbours3D(rank, neighbours);
+    id_to_index.reserve(n);
+    for (int i = 0; i < n; ++i) id_to_index[points[i].unique_hash_id] = i;
 
     // eta^3 of tetrahedron k in canonical order, with point i at position pi (i = -1: as it is)
     auto tet_eta3 = [&](int k, int i, const double *pi) {
@@ -1507,8 +2205,11 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
         return std::lexicographical_compare(a, a + 4, b, b + 4);
     };
 
-    std::vector<double> eta3(tets.size());
-    for (size_t k = 0; k < tets.size(); ++k) eta3[k] = tet_eta3((int)k, -1, NULL);
+    auto rebuild_eta3 = [&]() {
+        eta3.resize(tets.size());
+        for (size_t k = 0; k < tets.size(); ++k) eta3[k] = tet_eta3((int)k, -1, NULL);
+    };
+    rebuild_eta3();
 
     // The candidate position of point i moved by dir * step target edge lengths. Boundary points
     // slide as in the smoothing. Returns false if the move is not allowed: a boundary point too
@@ -1698,7 +2399,6 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
     // Guarded smoothing move of point i: down the gradient of F, the first of SMOOTH_STEPS_3D that
     // lowers F and strictly raises the worst eta^3 of the star. Returns false if there is none.
     // star_sorted says whether the star of a point is already in canonical order
-    std::vector<char> star_sorted(n, 0);
     auto find_smooth_move = [&](int i, Point<3>& best_candidate) {
         best_candidate = points[i];
         int s0 = tet_offset[i], s1 = tet_offset[i + 1];
@@ -1762,6 +2462,12 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
         std::fill(stale.begin(), stale.end(), 1);
         auto refresh = [&](int i) {
             if (!stale[i]) return;
+            // Only the stars of maintained points are complete (see the flips above)
+            if (!maintained[i]) {
+                std::cerr << "ERROR: [Rank " << rank << "] Sliver repair: the star of a point that is not maintained is needed, "
+                          << "FLIP_MAINTAINED_MARGIN_3D is too small. This is a bug in BoxMeshDM.\n";
+                MPI_Abort(comm, EXIT_FAILURE);
+            }
             stale[i] = 0;
             evaluated[i] = 0;
             can_move[i] = 0;
@@ -1841,7 +2547,11 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
         }
     };
 
+    // The sliver repair, then the flips, then the guarded smoothing on the new connectivity
     run_pass(SLIVER_REPAIR_ROUNDS_3D, SLIVER_REPAIR_ETA3_3D, false);
+    FlipTetrahedra3D(comm, points, tets, maintained, neighbours, id_to_index);
+    rebuild();
+    rebuild_eta3();
     run_pass(SMOOTH_ROUNDS_3D, SMOOTH_ETA3_3D, true);
 }
 
@@ -2225,7 +2935,9 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
     // which no owned simplex reaches (harmless)
     ResolveBoundaryOwnership(comm, points_with_halos, s_min, s_max, interior_min, interior_max, pad);
 
-    // 3D: move the vertices of badly shaped tetrahedra on this final connectivity (nothing in 2D)
+    // 3D: improve the badly shaped tetrahedra of this final tetrahedralisation by vertex moves and
+    // flips; afterwards triangles_with_halos holds only the tetrahedra this rank maintains, which
+    // include every one it owns (nothing in 2D)
     RepairSlivers<DIM>(comm, points_with_halos, triangles_with_halos, pad);
 
     // Pre-allocate remapping array.
