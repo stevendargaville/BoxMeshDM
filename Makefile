@@ -135,6 +135,8 @@ tests: BoxMeshDM
 	./BoxMeshDM -target_edge_length 0.005 -agglomeration_factor 1
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -agglomeration_factor 2
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5 -agglomeration_factor 2
+# Thin domain - the halo is wider than half the tile height, but y is not split between ranks
+	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.1
 	$(MAKE) lib
 	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"

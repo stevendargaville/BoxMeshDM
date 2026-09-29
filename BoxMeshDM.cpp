@@ -886,13 +886,24 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, int tile_x, int ti
     // Safety Check: Ensure the required halo doesn't exceed the tile size.
     // In a domain decomposition, needing a halo larger than the subdomain 
     // implies we need data from neighbors-of-neighbors, which is inefficient/complex.
-    double min_dim = std::min(tile_s_x, tile_s_y);
-    if (pad > min_dim/2.0) {
-        std::cerr << "Error: Annealing iters (" << ANNEAL_ITERS << ") require a halo of " 
-                  << pad << ", which exceeds the tile size (" << min_dim << ").\n"
-                  << "Reduce ANNEAL_ITERS or increase tile size (by having fewer tiles or more points per tile).\n";
-        std::exit(EXIT_FAILURE);
-    }    
+    // Only axes split between ranks matter: along an axis with a single tile there are
+    // no neighbours, the halo is cut off by the domain walls, and ResolveBoundaryOwnership
+    // just treats every point as a boundary candidate along that axis (extra communication
+    // only). With a single tile on both axes there is nothing to check.
+    bool split_x = (TILE_DIM_X > 1);
+    bool split_y = (TILE_DIM_Y > 1);
+    if (split_x || split_y) {
+        double min_dim;
+        if (split_x && split_y) min_dim = std::min(tile_s_x, tile_s_y);
+        else if (split_x) min_dim = tile_s_x;
+        else min_dim = tile_s_y;
+        if (pad > min_dim/2.0) {
+            std::cerr << "Error: Annealing iters (" << ANNEAL_ITERS << ") require a halo of "
+                      << pad << ", which is more than half the tile size of " << min_dim << " along an axis split between ranks.\n"
+                      << "Reduce ANNEAL_ITERS or increase tile size (by having fewer tiles or more points per tile).\n";
+            std::exit(EXIT_FAILURE);
+        }
+    }
 
     double search_min_x = t_min_x - pad; double search_max_x = t_max_x + pad;
     double search_min_y = t_min_y - pad; double search_max_y = t_max_y + pad;

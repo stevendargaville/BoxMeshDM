@@ -59,8 +59,9 @@ tile grid (**exactly one tile per rank**), then runs `process_tile` → optional
 `process_tile`, per rank:
 - **Halo.** Points are generated for the tile plus a halo of
   `pad = TARGET_EDGE_LENGTH * (ANNEAL_ITERS + final_smooth_its + 8)`, since smoothing distortion
-  travels about one edge per iteration. It hard-errors if `pad > min(tile_size)/2` (that would
-  need neighbour-of-neighbour data), which is why few elements per rank fails.
+  travels about one edge per iteration. It hard-errors if `pad` exceeds half the tile size along
+  any axis split between ranks (that would need neighbour-of-neighbour data), which is why few
+  elements per rank fails. An axis with a single tile has no neighbours, so it isn't checked.
 - **Points.** Explicit corners; wall points evenly spaced at
   `length / round(length / TARGET_EDGE_LENGTH)` (stepping by the edge length could strand a
   point next to a corner as a sliver); one jittered interior point per grid cell, rejected near
