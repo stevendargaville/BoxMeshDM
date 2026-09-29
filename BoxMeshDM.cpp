@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <fstream>
 #include <string>
+#include <cstring>
 #include <mpi.h>
 #include <petsc/private/dmpleximpl.h>
 #include <petscdmplex.h>
@@ -1589,6 +1590,143 @@ static PetscErrorCode RefineHook_LabelBoundaries(DM dm, DM dmf, void *ctx) {
 
 // ~~~~~~~~~~~~~~~~~
 
+// Check every ghost point (a vertex of an owned triangle that a neighbour owns) has
+// bit-identical coordinates to the owner's copy. Each rank builds its owned triangles
+// from its own copies of the ghost points, but only the owner's coordinates go into
+// the DM, so a mismatch means the connectivity was built against geometry that is not
+// in the DM. Returns the number of mismatches found on this rank.
+static long CheckGhostCoordinates(MPI_Comm comm, const std::vector<Point>& points_on_owned_triangles_and_orphans) {
+    int comm_rank, comm_size;
+    MPI_Comm_rank(comm, &comm_rank);
+    MPI_Comm_size(comm, &comm_size);
+
+    size_t num_points = points_on_owned_triangles_and_orphans.size();
+
+    // Ask the owner of each ghost point for its coordinates, identified by the unique hash id
+    std::vector<std::vector<uint64_t>> send_ids(comm_size);
+    std::vector<std::vector<int>>      send_req_indices(comm_size);
+    for (size_t i = 0; i < num_points; ++i) {
+        int owner = get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size);
+        if (owner != comm_rank) {
+            send_ids[owner].push_back(points_on_owned_triangles_and_orphans[i].unique_hash_id);
+            send_req_indices[owner].push_back((int)i);
+        }
+    }
+
+    // Exchange counts
+    std::vector<int> send_counts(comm_size), recv_counts(comm_size);
+    for(int r=0; r<comm_size; ++r) send_counts[r] = send_ids[r].size();
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+
+    // Exchange hash ids (requests)
+    std::vector<std::vector<uint64_t>> recv_ids(comm_size);
+    std::vector<MPI_Request> requests;
+    requests.reserve(comm_size * 2);
+    for(int r=0; r<comm_size; ++r) {
+        if (recv_counts[r] > 0) {
+            recv_ids[r].resize(recv_counts[r]);
+            MPI_Request req;
+            MPI_Irecv(recv_ids[r].data(), recv_counts[r], MPI_UINT64_T, r, 102, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    for(int r=0; r<comm_size; ++r) {
+        if (send_counts[r] > 0) {
+            MPI_Request req;
+            MPI_Isend(send_ids[r].data(), send_counts[r], MPI_UINT64_T, r, 102, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    if (!requests.empty()) MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    requests.clear();
+    // Explicitly delete memory
+    std::vector<std::vector<uint64_t>>().swap(send_ids);
+
+    // Answer with the coordinates of our owned points
+    std::unordered_map<uint64_t, size_t> points_owned_map;
+    for (size_t i = 0; i < num_points; ++i) {
+        if (get_owner_rank(points_on_owned_triangles_and_orphans[i], comm_size) == comm_rank) {
+            points_owned_map[points_on_owned_triangles_and_orphans[i].unique_hash_id] = i;
+        }
+    }
+
+    std::vector<std::vector<double>> send_coords(comm_size);
+    for(int r=0; r<comm_size; ++r) {
+        if (recv_counts[r] > 0) {
+            send_coords[r].resize(2 * (size_t)recv_counts[r]);
+            for(int k=0; k<recv_counts[r]; ++k) {
+                auto it = points_owned_map.find(recv_ids[r][k]);
+                if (it == points_owned_map.end()) {
+                    std::cerr << "Error: [Rank " << comm_rank << "] rank " << r << " asked for the coordinates of point "
+                              << recv_ids[r][k] << ", which this rank does not own.\n";
+                    MPI_Abort(comm, EXIT_FAILURE);
+                }
+                send_coords[r][2 * k]     = points_on_owned_triangles_and_orphans[it->second].x;
+                send_coords[r][2 * k + 1] = points_on_owned_triangles_and_orphans[it->second].y;
+            }
+        }
+    }
+    // Explicitly delete memory
+    std::vector<std::vector<uint64_t>>().swap(recv_ids);
+    std::unordered_map<uint64_t, size_t>().swap(points_owned_map);
+
+    // Exchange coordinates (answers)
+    std::vector<std::vector<double>> recv_coords(comm_size);
+    for(int r=0; r<comm_size; ++r) {
+        if (send_counts[r] > 0) {
+            recv_coords[r].resize(2 * (size_t)send_counts[r]);
+            MPI_Request req;
+            MPI_Irecv(recv_coords[r].data(), 2 * send_counts[r], MPI_DOUBLE, r, 103, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    for(int r=0; r<comm_size; ++r) {
+        if (recv_counts[r] > 0) {
+            MPI_Request req;
+            MPI_Isend(send_coords[r].data(), 2 * recv_counts[r], MPI_DOUBLE, r, 103, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    if (!requests.empty()) MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    // Explicitly delete memory
+    std::vector<MPI_Request>().swap(requests);
+    std::vector<std::vector<double>>().swap(send_coords);
+
+    // Compare bitwise - ranks must produce bit-identical coordinates, so no tolerance
+    long mismatch_count = 0;
+    int mismatch_print_count = 0;
+    const int MAX_MISMATCH_PRINTS = 5;
+    for(int r=0; r<comm_size; ++r) {
+        for(int k=0; k<send_counts[r]; ++k) {
+            const Point& p = points_on_owned_triangles_and_orphans[send_req_indices[r][k]];
+            double owner_xy[2] = {recv_coords[r][2 * k], recv_coords[r][2 * k + 1]};
+            double local_xy[2] = {p.x, p.y};
+            if (std::memcmp(owner_xy, local_xy, sizeof(local_xy)) != 0) {
+                mismatch_count++;
+                if (mismatch_print_count < MAX_MISMATCH_PRINTS) {
+                    // Full precision so a 1 ulp difference is visible, then restore the stream
+                    std::streamsize old_precision = std::cout.precision(17);
+                    std::cout << "[Rank " << comm_rank << "] GHOST COORDINATE MISMATCH: local ("
+                              << p.x << ", " << p.y << ") vs owner ("
+                              << owner_xy[0] << ", " << owner_xy[1] << ") Owner: " << r
+                              << " ID: " << p.unique_hash_id << "\n";
+                    std::cout.precision(old_precision);
+                    mismatch_print_count++;
+                }
+            }
+        }
+    }
+    // Explicitly delete memory
+    std::vector<std::vector<int>>().swap(send_req_indices);
+    std::vector<std::vector<double>>().swap(recv_coords);
+    std::vector<int>().swap(send_counts);
+    std::vector<int>().swap(recv_counts);
+
+    return mismatch_count;
+}
+
+// ~~~~~~~~~~~~~~~~~
+
 // Perform rigorous checks on mesh topology and geometry
 static bool CheckMeshIntegrity(MPI_Comm comm, 
                                const std::vector<Point>& points_on_owned_triangles_and_orphans, 
@@ -1710,11 +1848,15 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         }
     }
 
+    // Ghost points must match their owners bit for bit
+    long local_ghost_mismatch_count = CheckGhostCoordinates(comm, points_on_owned_triangles_and_orphans);
+
     // 3. Global Reductions
     long num_tris_owned = triangles_owned.size();
     long num_tris_owned_global, num_points_owned_global;
     double global_total_area, global_boundary_len;
     long global_boundary_edge_count, global_bad_edge_count;
+    long global_ghost_mismatch_count;
     double global_max_edge_len;
     double global_max_cosine;
 
@@ -1724,6 +1866,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     MPI_Reduce(&local_boundary_len, &global_boundary_len, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
     MPI_Reduce(&local_boundary_edge_count, &global_boundary_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_bad_edge_count, &global_bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local_ghost_mismatch_count, &global_ghost_mismatch_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_max_edge_len, &global_max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     MPI_Reduce(&local_max_cosine, &global_max_cosine, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
 
@@ -1744,8 +1887,9 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
         bool edge_pass = (global_bad_edge_count == 0);
         double global_min_angle = std::acos(clamp_val(global_max_cosine)) * 180.0 / 3.14159265358979323846;
         bool angle_pass = (global_min_angle >= MIN_ANGLE_DEG);
+        bool ghost_pass = (global_ghost_mismatch_count == 0);
 
-        if (!area_pass || !perim_pass || !euler_pass || !edge_pass || !angle_pass) {
+        if (!area_pass || !perim_pass || !euler_pass || !edge_pass || !angle_pass || !ghost_pass) {
             success = 0;
             std::cout << "\n!!! MESH INTEGRITY CHECK FAILED !!!\n";
             if (!area_pass) std::cout << "  [FAIL] Total Area: " << std::fixed << std::setprecision(6) << global_total_area << " (Expected " << expected_area << ")\n";
@@ -1756,6 +1900,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
                 std::cout << "         Max Edge: " << global_max_edge_len << "\n";
             }
             if (!angle_pass) std::cout << "  [FAIL] Min Angle: " << global_min_angle << " deg (Expected >= " << MIN_ANGLE_DEG << " deg)\n";
+            if (!ghost_pass) std::cout << "  [FAIL] Ghost coordinates: " << global_ghost_mismatch_count << " mismatches\n";
             std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
         }
     }

@@ -101,7 +101,9 @@ There is no global consensus step for geometry: ranks that generate the same poi
 position depend on rank ordering, unordered-container iteration order, local point counts or
 floating-point accumulation order produces cracks or duplicated/lost vertices at tile
 interfaces, usually seen as an Euler or perimeter failure in `CheckMeshIntegrity` or a
-hang/error in `DMPlexCreateFromCellListParallelPetsc`.
+hang/error in `DMPlexCreateFromCellListParallelPetsc`. `CheckMeshIntegrity` also asks the
+owner of every ghost vertex for its coordinates (tags 102/103) and fails on any bitwise
+mismatch, since triangles are built from the local copy but only the owner's copy reaches the DM.
 
 ## Agglomeration
 
