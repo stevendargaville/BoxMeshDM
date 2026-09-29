@@ -54,9 +54,9 @@ make clean && make tests    # the gate: executable runs (2D, then 3D if TetGen),
 ```
 
 CI ([ci_build.yml](.github/workflows/ci_build.yml)) runs `make tests` in the images in
-[dockerfiles/](dockerfiles) (debug, opt, 64-bit, PFLARE) plus macOS. Only the macOS job builds
-PETSc with TetGen, so only it runs the 3D tests until the Docker base images are rebuilt with
-`--download-tetgen`. Debug CI uses `PETSC_OPTIONS="-on_error_abort -fp_trap on"`, so new
+[dockerfiles/](dockerfiles) (debug, opt, 64-bit, PFLARE) plus macOS. The Docker base images
+and the macOS job all build PETSc with TetGen, so every job runs the 3D tests (a base image
+without TetGen would silently test 2D only, as the Makefile skips them). Debug CI uses `PETSC_OPTIONS="-on_error_abort -fp_trap on"`, so new
 floating-point operations must not generate NaN/Inf even transiently. TetGen is compiled at
 `-O0` in debug PETSc builds, which is why the 3D test sizes are small and mostly use no final
 smoothing.

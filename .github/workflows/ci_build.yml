@@ -42,9 +42,10 @@ jobs:
         run: |
           docker system prune --volumes -af            
 
-  # The Docker jobs build on the stevendargaville/petsc base images. The Makefile only runs the 3D
-  # (TetGen) tests when PETSc has TetGen, so these jobs test 2D only until the base images are
-  # rebuilt with --download-tetgen. The macOS job below builds its own PETSc with TetGen.
+  # The Docker jobs build on the stevendargaville/petsc base images, which are built with
+  # --download-tetgen. The Makefile only runs the 3D (TetGen) tests when PETSc has TetGen, so
+  # a base image without it would silently test 2D only. The macOS job below builds its own
+  # PETSc with TetGen.
   gnu_debug:
     runs-on: ubuntu-22.04
     needs: setup
