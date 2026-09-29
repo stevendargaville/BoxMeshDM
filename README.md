@@ -1,7 +1,5 @@
 This code builds unstructured meshes of a box in parallel with MPI, designed for use with PETSc: triangles on a 2D rectangle, or tetrahedra on a 3D box. It returns a parallel DMPlex object which stores the unstructured mesh. It depends on PETSc configured with Triangle (``--download-triangle``), and 3D meshes also need TetGen (``--download-tetgen``, see [Dependencies and licences](#dependencies-and-licences)). To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
 
-The 2D generator has been validated at scale (see [Weak scaling](#weak-scaling)). The 3D generator is new and has not yet been run at scale.
-
 ### Domain Size
 
 The domain size can be specified by passing in the ``-domain_width`` and ``-domain_height`` command line arguments, and ``-domain_depth`` for 3D meshes. The default domain is [0,1] x [0,1] in 2D and [0,1] x [0,1] x [0,1] in 3D.
