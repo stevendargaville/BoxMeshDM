@@ -74,6 +74,11 @@ const int MAX_GRID_IDX = 2000000000;
 // Number of 10 degree bins in the edge orientation histogram of the stats
 const int NUM_ORIENTATION_BINS = 18;
 
+// 3D stats: number of 0.1 wide bins in the eta^3 histogram, and of 10 degree bins in the
+// histogram of the smallest dihedral angle of each tetrahedron (which is at most 70.53 degrees)
+const int NUM_QUALITY_BINS = 10;
+const int NUM_DIHEDRAL_BINS = 9;
+
 // ~~~~~~~~~~~~~~~~~
 
 template <int DIM>
@@ -902,6 +907,53 @@ static double tet_quality_eta3(const double *const *q, double& det) {
 
     double volume = det / 6.0;
     return 15552.0 * volume * volume / (sum_l_sq * sum_l_sq * sum_l_sq);
+}
+
+// Smallest and largest dihedral angle (degrees) of the tetrahedron c (four vertices). Returns 360
+// and -1 if every pair of faces is degenerate
+static void tet_dihedral_range(const double *const *c, double& min_angle, double& max_angle) {
+    min_angle = 360.0;
+    max_angle = -1.0;
+
+    // Outward normal of the face opposite each vertex, in units of the target edge length
+    double e[4][3];
+    for (int a = 0; a < 4; ++a) {
+        for (int k = 0; k < 3; ++k) e[a][k] = (c[a][k] - c[0][k]) / TARGET_EDGE_LENGTH;
+    }
+    double n[4][3], n_sq[4];
+    for (int k = 0; k < 4; ++k) {
+        int f[3], m = 0;
+        for (int a = 0; a < 4; ++a) {
+            if (a != k) f[m++] = a;
+        }
+        double u[3], v[3], w[3];
+        for (int d = 0; d < 3; ++d) {
+            u[d] = e[f[1]][d] - e[f[0]][d];
+            v[d] = e[f[2]][d] - e[f[0]][d];
+            w[d] = e[k][d] - e[f[0]][d];
+        }
+        n[k][0] = u[1] * v[2] - u[2] * v[1];
+        n[k][1] = u[2] * v[0] - u[0] * v[2];
+        n[k][2] = u[0] * v[1] - u[1] * v[0];
+        // Point it away from the opposite vertex
+        if (n[k][0] * w[0] + n[k][1] * w[1] + n[k][2] * w[2] > 0.0) {
+            for (int d = 0; d < 3; ++d) n[k][d] = -n[k][d];
+        }
+        n_sq[k] = dist_sq<3>(n[k]);
+    }
+
+    // The dihedral angle along the edge shared by the faces opposite k and l is pi minus the
+    // angle between their outward normals
+    for (int k = 0; k < 4; ++k) {
+        for (int l = k + 1; l < 4; ++l) {
+            double norm_sq = n_sq[k] * n_sq[l];
+            if (!(norm_sq > 1e-60)) continue;
+            double cos_angle = -(n[k][0] * n[l][0] + n[k][1] * n[l][1] + n[k][2] * n[l][2]) / std::sqrt(norm_sq);
+            double angle = std::acos(clamp_val(cos_angle)) * 180.0 / 3.14159265358979323846;
+            min_angle = std::min(min_angle, angle);
+            max_angle = std::max(max_angle, angle);
+        }
+    }
 }
 
 // 3D: -eta^3 of the tetrahedron with vertex i replaced by p, keeping the stored (positive)
@@ -2054,33 +2106,26 @@ static void LabelBoundaries(DM dm, const double *domain_size) {
     PetscCallVoid(DMPlexLabelComplete(dm, label));
 
     // 2. Label Edges/Facets (Height 1 in 2D = codimension-1 = facets)
-    // Need to label to BOTH "Face Sets" and "markers"
+    // Need to label to BOTH "Face Sets" and "markers". Each facet is classified once (in 3D that
+    // takes a transitive closure) and set in both labels
     PetscInt eStart, eEnd;
     PetscCallVoid(DMPlexGetHeightStratum(dm, 1, &eStart, &eEnd));
 
-    for (PetscInt e = eStart; e < eEnd; ++e) {
-        PetscInt val;
-        PetscCallVoid(facet_wall_value<DIM>(dm, e, coordSection, coords, domain_size, &val));
-        if (val != 0) {
-            // Label to Face Sets (for boundary conditions)
-            PetscCallVoid(DMLabelSetValue(label, e, val));
-        }
-    }
-    PetscCallVoid(DMPlexLabelComplete(dm, label));
-
-    // Also label edges to "markers" label
     PetscCallVoid(DMCreateLabel(dm, "markers"));
     DMLabel markersLabel;
     PetscCallVoid(DMGetLabel(dm, "markers", &markersLabel));
 
     for (PetscInt e = eStart; e < eEnd; ++e) {
-        PetscInt val;
+        PetscInt val = 0;
         PetscCallVoid(facet_wall_value<DIM>(dm, e, coordSection, coords, domain_size, &val));
         if (val != 0) {
+            // Label to Face Sets (for boundary conditions)
+            PetscCallVoid(DMLabelSetValue(label, e, val));
             // Label to markers
             PetscCallVoid(DMLabelSetValue(markersLabel, e, val));
         }
     }
+    PetscCallVoid(DMPlexLabelComplete(dm, label));
 
     PetscCallVoid(VecRestoreArrayRead(coordsVec, &coords));
     PetscCallVoid(DMPlexLabelComplete(dm, markersLabel));
@@ -2264,6 +2309,8 @@ struct IntegrityAccum {
     double max_badness;         // largest cosine of any triangle angle in 2D, i.e. the smallest angle;
                                 // -(smallest eta^3) in 3D
     long nonpositive_count;     // 3D only: tetrahedra with signed volume <= 0 (always 0 in 2D)
+    long boundary_vertex_count; // 3D only: owned vertices on a wall (always 0 in 2D)
+    double min_dihedral;        // 3D only: smallest dihedral angle in degrees (unused in 2D)
     int bad_print_count;
 };
 
@@ -2273,6 +2320,26 @@ const double MAX_EDGE_RATIO = 3.0;
 // only catches slivers (e.g. a wall point stuck next to a corner)
 const double MIN_ANGLE_DEG = 5.0;
 const int MAX_BAD_PRINTS = 5;
+// Smallest acceptable eta^3 of a tetrahedron in the 3D integrity check. 0 disables the test
+// (eta^3 is never negative) until a threshold is set from measurements of generated meshes;
+// the check prints the measured minimum either way
+const double MIN_ETA3_3D = 0.0;
+
+// Accumulate the integrity measures of one point owned by this rank (orphans included)
+template <int DIM>
+static void integrity_accumulate_owned_point(const Point<DIM>& p, IntegrityAccum& acc);
+
+// 2D: nothing, the 2D checks only need the number of owned points
+template <>
+inline void integrity_accumulate_owned_point<2>(const Point<2>& p, IntegrityAccum& acc) {
+    (void)p; (void)acc;
+}
+
+// 3D: count the owned vertices on the boundary surface, for its Euler characteristic
+template <>
+void integrity_accumulate_owned_point<3>(const Point<3>& p, IntegrityAccum& acc) {
+    if (classify_point_wall<3>(p.c, DOMAIN_SIZE) != 0) acc.boundary_vertex_count++;
+}
 
 // Accumulate the integrity measures of one owned simplex (p in simplex order)
 template <int DIM>
@@ -2378,6 +2445,9 @@ void integrity_accumulate_simplex<3>(const Point<3> *const *p, int rank, int siz
         eta3 = 0.0;
     }
     acc.max_badness = std::max(acc.max_badness, -eta3);
+    double min_angle, max_angle;
+    tet_dihedral_range(q, min_angle, max_angle);
+    acc.min_dihedral = std::min(acc.min_dihedral, min_angle);
 
     // Boundary faces: the face opposite vertex k is on a wall if all three of its vertices are
     for (int k = 0; k < 4; ++k) {
@@ -2458,39 +2528,60 @@ bool evaluate_integrity<2>(long num_tris_owned_global, long num_points_owned_glo
     return success;
 }
 
-// 3D: total signed volume, boundary surface area, no inverted or flat tetrahedra, edge lengths
-// and ghost coordinates. The minimum quality is not tested yet (a threshold is to be set from
-// measurements)
-// TODO: the Euler characteristic, V - E + F - C = 1, counted from the created DM (the 2D
-// pre-DM formula from boundary edge counts does not carry over to 3D)
+// 3D: total signed volume, boundary surface area, no inverted or flat tetrahedra, the boundary
+// surface is a sphere (V - E + F = 2 on it, with 3F = 2E), edge lengths, minimum eta^3 (disabled
+// by default, see MIN_ETA3_3D) and ghost coordinates. The Euler characteristic of the whole mesh
+// is checked on the created DM instead, by CheckDMIntegrity, as the 2D formula from boundary edge
+// counts does not carry over to 3D. Also prints the measured minimum quality
 template <>
 bool evaluate_integrity<3>(long num_tris_owned_global, long num_points_owned_global,
                            const IntegrityAccum& global, long global_ghost_mismatch_count) {
     (void)num_tris_owned_global; (void)num_points_owned_global;
     double expected_volume = DOMAIN_SIZE[0] * DOMAIN_SIZE[1] * DOMAIN_SIZE[2];
     double expected_area = 2.0 * (DOMAIN_SIZE[0] * DOMAIN_SIZE[1] + DOMAIN_SIZE[0] * DOMAIN_SIZE[2] + DOMAIN_SIZE[1] * DOMAIN_SIZE[2]);
+    // Every boundary face lies in exactly one owned tetrahedron and every boundary vertex is owned
+    // by exactly one rank, so these are the global counts
+    long boundary_vertices = global.boundary_vertex_count;
+    long boundary_faces = global.boundary_facet_count;
+    long boundary_euler = boundary_vertices - boundary_faces / 2;
+    double min_eta3 = -global.max_badness;
 
     // Same relative tolerances as the 2D area and perimeter
     bool volume_pass = std::abs(global.total_volume - expected_volume) < 1e-6 * expected_volume;
     bool area_pass = std::abs(global.boundary_measure - expected_area) < 2.5e-5 * expected_area;
     bool orientation_pass = (global.nonpositive_count == 0);
+    bool sphere_pass = (boundary_faces % 2 == 0 && boundary_euler == 2);
     bool edge_pass = (global.bad_edge_count == 0);
+    bool quality_pass = (min_eta3 >= MIN_ETA3_3D);
     bool ghost_pass = (global_ghost_mismatch_count == 0);
 
+    // Restore the stream format afterwards, the stats that follow use the default
+    std::ios_base::fmtflags old_flags = std::cout.flags();
+    std::streamsize old_precision = std::cout.precision();
+
     bool success = true;
-    if (!volume_pass || !area_pass || !orientation_pass || !edge_pass || !ghost_pass) {
+    if (!volume_pass || !area_pass || !orientation_pass || !sphere_pass || !edge_pass || !quality_pass || !ghost_pass) {
         success = false;
         std::cout << "\n!!! MESH INTEGRITY CHECK FAILED !!!\n";
         if (!volume_pass) std::cout << "  [FAIL] Total Volume: " << std::fixed << std::setprecision(6) << global.total_volume << " (Expected " << expected_volume << ")\n";
         if (!area_pass) std::cout << "  [FAIL] Boundary Surface Area: " << global.boundary_measure << " (Expected " << expected_area << ")\n";
         if (!orientation_pass) std::cout << "  [FAIL] Non-positive Tetrahedra: " << global.nonpositive_count << " (Expected 0)\n";
+        if (!sphere_pass) {
+            std::cout << "  [FAIL] Boundary Surface Euler Characteristic: " << boundary_euler << " (Expected 2)\n";
+            std::cout << "         Boundary Vertices: " << boundary_vertices << ", Boundary Faces: " << boundary_faces << "\n";
+        }
         if (!edge_pass) {
             std::cout << "  [FAIL] Bad Edges: " << global.bad_edge_count << " tetrahedra with edges > " << MAX_EDGE_RATIO << "x target.\n";
             std::cout << "         Max Edge: " << global.max_edge_len << "\n";
         }
+        if (!quality_pass) std::cout << "  [FAIL] Min eta^3: " << min_eta3 << " (Expected >= " << MIN_ETA3_3D << ")\n";
         if (!ghost_pass) std::cout << "  [FAIL] Ghost coordinates: " << global_ghost_mismatch_count << " mismatches\n";
         std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
     }
+    std::cout << std::defaultfloat << std::setprecision(6);
+    std::cout << "Integrity Check Min eta^3: " << min_eta3 << ", Min Dihedral Angle: " << global.min_dihedral << " deg\n";
+    std::cout.flags(old_flags);
+    std::cout.precision(old_precision);
     return success;
 }
 
@@ -2534,15 +2625,6 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     // Explicitly delete memory
     std::vector<bool>().swap(appears_in_triangle);
 
-    // 1. Count Owned Points (needed for Euler)
-    long num_points_owned = 0;
-    for (const auto& p : points_on_owned_triangles_and_orphans) {
-        if (get_owner_rank(p, size) == rank) {
-            num_points_owned++;
-        }
-    }
-
-    // 2. Accumulate Local Stats
     IntegrityAccum local;
     local.total_volume = 0.0;
     local.boundary_measure = 0.0;
@@ -2551,7 +2633,20 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     local.max_edge_len = 0.0;
     local.max_badness = -1.0;
     local.nonpositive_count = 0;
+    local.boundary_vertex_count = 0;
+    local.min_dihedral = 360.0;
     local.bad_print_count = 0;
+
+    // 1. Count Owned Points (needed for Euler)
+    long num_points_owned = 0;
+    for (const auto& p : points_on_owned_triangles_and_orphans) {
+        if (get_owner_rank(p, size) == rank) {
+            num_points_owned++;
+            integrity_accumulate_owned_point<DIM>(p, local);
+        }
+    }
+
+    // 2. Accumulate Local Stats
 
     for (const auto& t : triangles_owned) {
         const Point<DIM> *p[DIM + 1];
@@ -2576,9 +2671,11 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     MPI_Reduce(&local.boundary_facet_count, &global.boundary_facet_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local.bad_edge_count, &global.bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local.nonpositive_count, &global.nonpositive_count, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local.boundary_vertex_count, &global.boundary_vertex_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_ghost_mismatch_count, &global_ghost_mismatch_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local.max_edge_len, &global.max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     MPI_Reduce(&local.max_badness, &global.max_badness, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    MPI_Reduce(&local.min_dihedral, &global.min_dihedral, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
 
     int success = 1;
     if (rank == 0) {
@@ -2591,6 +2688,59 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     return (success == 1);
 }
 
+// Checks of the created DM, after CheckMeshIntegrity. Returns true on success (on every rank)
+template <int DIM>
+static bool CheckDMIntegrity(MPI_Comm comm, DM dm);
+
+// 2D: nothing, the Euler characteristic is checked before the DM is created
+template <>
+inline bool CheckDMIntegrity<2>(MPI_Comm comm, DM dm) {
+    (void)comm; (void)dm;
+    return true;
+}
+
+// 3D: the Euler characteristic of the box, V - E + F - C = 1, from the points of the DM itself.
+// Each point is counted by the rank that owns it: per depth, the stratum size minus the point SF
+// leaves (points this rank holds a copy of but another rank owns) in that stratum
+template <>
+bool CheckDMIntegrity<3>(MPI_Comm comm, DM dm) {
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+
+    long local_count[4], global_count[4];
+    for (PetscInt d = 0; d <= 3; ++d) {
+        PetscInt pStart, pEnd;
+        PetscCallAbort(comm, DMPlexGetDepthStratum(dm, d, &pStart, &pEnd));
+        local_count[d] = pEnd - pStart;
+    }
+
+    PetscSF sf;
+    PetscInt nroots, nleaves;
+    const PetscInt *ilocal;
+    PetscCallAbort(comm, DMGetPointSF(dm, &sf));
+    PetscCallAbort(comm, PetscSFGetGraph(sf, &nroots, &nleaves, &ilocal, NULL));
+    // nleaves is negative if the SF graph was never set, then there are no leaves
+    for (PetscInt i = 0; i < nleaves; ++i) {
+        PetscInt p = ilocal ? ilocal[i] : i;
+        PetscInt depth;
+        PetscCallAbort(comm, DMPlexGetPointDepth(dm, p, &depth));
+        if (depth >= 0 && depth <= 3) local_count[depth]--;
+    }
+    MPI_Allreduce(local_count, global_count, 4, MPI_LONG, MPI_SUM, comm);
+
+    long euler = global_count[0] - global_count[1] + global_count[2] - global_count[3];
+    if (euler == 1) return true;
+
+    if (rank == 0) {
+        std::cout << "\n!!! MESH INTEGRITY CHECK FAILED !!!\n";
+        std::cout << "  [FAIL] Euler Characteristic: " << euler << " (Expected 1)\n";
+        std::cout << "         Vertices: " << global_count[0] << ", Edges: " << global_count[1]
+                  << ", Faces: " << global_count[2] << ", Tetrahedra: " << global_count[3] << "\n";
+        std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+    }
+    return false;
+}
+
 // ~~~~~~~~~~~~~~~~~
 
 // Local (and then global) minima/maxima of the simplex quality printed in the stats
@@ -2598,6 +2748,9 @@ struct SimplexQuality {
     double min_volume, max_volume;
     double min_angle, max_angle;   // degrees; the dihedral angles in 3D
     double min_quality;            // 3D only: smallest eta^3 (unused in 2D)
+    long quality_bins[NUM_QUALITY_BINS];   // 3D only: eta^3 histogram (all 0 in 2D)
+    long dihedral_bins[NUM_DIHEDRAL_BINS]; // 3D only: histogram of each tetrahedron's smallest
+                                           // dihedral angle (all 0 in 2D)
 };
 
 // Update q with one owned simplex (p in simplex order)
@@ -2646,45 +2799,19 @@ void stats_accumulate_simplex<3>(const Point<3> *const *p, SimplexQuality& q) {
     double eta3 = tet_quality_eta3(c, det);
     if (eta3 < 0.0) eta3 = 0.0;
     if (eta3 < q.min_quality) q.min_quality = eta3;
+    int quality_bin = static_cast<int>(eta3 * NUM_QUALITY_BINS);
+    if (quality_bin >= NUM_QUALITY_BINS) quality_bin = NUM_QUALITY_BINS - 1;
+    q.quality_bins[quality_bin]++;
 
-    // Outward normal of the face opposite each vertex, in units of the target edge length
-    double e[4][3];
-    for (int a = 0; a < 4; ++a) {
-        for (int k = 0; k < 3; ++k) e[a][k] = (c[a][k] - c[0][k]) / TARGET_EDGE_LENGTH;
-    }
-    double n[4][3], n_sq[4];
-    for (int k = 0; k < 4; ++k) {
-        int f[3], m = 0;
-        for (int a = 0; a < 4; ++a) {
-            if (a != k) f[m++] = a;
-        }
-        double u[3], v[3], w[3];
-        for (int d = 0; d < 3; ++d) {
-            u[d] = e[f[1]][d] - e[f[0]][d];
-            v[d] = e[f[2]][d] - e[f[0]][d];
-            w[d] = e[k][d] - e[f[0]][d];
-        }
-        n[k][0] = u[1] * v[2] - u[2] * v[1];
-        n[k][1] = u[2] * v[0] - u[0] * v[2];
-        n[k][2] = u[0] * v[1] - u[1] * v[0];
-        // Point it away from the opposite vertex
-        if (n[k][0] * w[0] + n[k][1] * w[1] + n[k][2] * w[2] > 0.0) {
-            for (int d = 0; d < 3; ++d) n[k][d] = -n[k][d];
-        }
-        n_sq[k] = dist_sq<3>(n[k]);
-    }
-
-    // The dihedral angle along the edge shared by the faces opposite k and l is pi minus the
-    // angle between their outward normals
-    for (int k = 0; k < 4; ++k) {
-        for (int l = k + 1; l < 4; ++l) {
-            double norm_sq = n_sq[k] * n_sq[l];
-            if (!(norm_sq > 1e-60)) continue;
-            double cos_angle = -(n[k][0] * n[l][0] + n[k][1] * n[l][1] + n[k][2] * n[l][2]) / std::sqrt(norm_sq);
-            double angle = std::acos(clamp_val(cos_angle)) * 180.0 / 3.14159265358979323846;
-            q.min_angle = std::min(q.min_angle, angle);
-            q.max_angle = std::max(q.max_angle, angle);
-        }
+    double min_angle, max_angle;
+    tet_dihedral_range(c, min_angle, max_angle);
+    q.min_angle = std::min(q.min_angle, min_angle);
+    q.max_angle = std::max(q.max_angle, max_angle);
+    // Histogram of the smallest dihedral angle of each tetrahedron (none if all faces are degenerate)
+    if (min_angle <= 180.0) {
+        int dihedral_bin = static_cast<int>(min_angle / 10.0);
+        if (dihedral_bin >= NUM_DIHEDRAL_BINS) dihedral_bin = NUM_DIHEDRAL_BINS - 1;
+        q.dihedral_bins[dihedral_bin]++;
     }
 }
 
@@ -2772,6 +2899,22 @@ void print_simplex_stats<3>(long num_tris_owned_global, const SimplexQuality& gl
 
     // Print average edge length
     std::cout << "  Avg Edge Len: " << (global_edge_count > 0 ? global_total_edge_len / global_edge_count : 0.0) << "\n";
+
+    // Histograms, as counts (slivers are rare) and percentages of the tetrahedra
+    std::cout << "Mean Ratio^3 (eta^3) Histogram:\n";
+    for (int i = 0; i < NUM_QUALITY_BINS; ++i) {
+        double pct = num_tris_owned_global > 0 ? 100.0 * global.quality_bins[i] / num_tris_owned_global : 0.0;
+        std::cout << "  " << std::fixed << std::setprecision(1) << (double)i / NUM_QUALITY_BINS << "-"
+                  << (double)(i + 1) / NUM_QUALITY_BINS << ": " << std::setw(10) << global.quality_bins[i]
+                  << " (" << std::setprecision(2) << pct << "%)\n";
+    }
+    std::cout << "Smallest Dihedral Angle per Tetrahedron (10 deg bins):\n";
+    for (int i = 0; i < NUM_DIHEDRAL_BINS; ++i) {
+        double pct = num_tris_owned_global > 0 ? 100.0 * global.dihedral_bins[i] / num_tris_owned_global : 0.0;
+        std::cout << "  " << std::setw(3) << (i * 10) << "-" << std::setw(3) << ((i + 1) * 10) << " deg: "
+                  << std::setw(10) << global.dihedral_bins[i]
+                  << " (" << std::fixed << std::setprecision(2) << pct << "%)\n";
+    }
 }
 
 // Print mesh statistics on rank 0
@@ -2820,6 +2963,8 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
     local.min_volume = 1e30; local.max_volume = -1.0;
     local.min_angle = 360.0; local.max_angle = -1.0;
     local.min_quality = 1e30;
+    for (int i = 0; i < NUM_QUALITY_BINS; ++i) local.quality_bins[i] = 0;
+    for (int i = 0; i < NUM_DIHEDRAL_BINS; ++i) local.dihedral_bins[i] = 0;
 
     // 3. Edge Orientation Statistics - use the pre-computed edge list
     std::vector<long> local_bins(NUM_ORIENTATION_BINS, 0);
@@ -2881,6 +3026,8 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
     MPI_Reduce(&local.min_angle, &global.min_angle, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
     MPI_Reduce(&local.max_angle, &global.max_angle, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     MPI_Reduce(&local.min_quality, &global.min_quality, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+    MPI_Reduce(local.quality_bins, global.quality_bins, NUM_QUALITY_BINS, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(local.dihedral_bins, global.dihedral_bins, NUM_DIHEDRAL_BINS, MPI_LONG, MPI_SUM, 0, comm);
 
     std::vector<long> global_bins(NUM_ORIENTATION_BINS);
     MPI_Reduce(local_bins.data(), global_bins.data(), NUM_ORIENTATION_BINS, MPI_LONG, MPI_SUM, 0, comm);
@@ -3228,6 +3375,13 @@ static DM GenerateBoxMeshDMImpl(MPI_Comm comm, double target_edge_length, const 
     // Explicitly delete memory
     std::vector<Point<DIM> >().swap(points_on_owned_triangles_and_orphans);
     std::vector<Simplex<DIM> >().swap(triangles_owned);
+
+    // Check the topology of the DM itself (3D only)
+    if (integrity_check && !CheckDMIntegrity<DIM>(comm, dm)) {
+        PetscErrorCode ierr = DMDestroy(&dm);
+        (void)ierr;
+        return NULL;
+    }
 
     PetscErrorCode ierr;
     ierr = PetscObjectSetName((PetscObject)dm, "Mesh");
