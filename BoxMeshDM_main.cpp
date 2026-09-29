@@ -43,8 +43,27 @@ int main(int argc, char** argv) {
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-agglomeration_factor", &agglomeration_factor, &set));
     int agglom_factor = agglomeration_factor;
 
+    // 2D (default) or 3D, and the z extent of a 3D box
+    PetscInt dim = 2;
+    PetscCall(PetscOptionsGetInt(NULL, NULL, "-dim", &dim, &set));
+    if (dim != 2 && dim != 3) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: -dim " << dim << " is not supported, it must be 2 or 3.\n";
+        }
+        PetscCall(PetscFinalize());
+        return EXIT_FAILURE;
+    }
+
+    PetscReal domain_depth = 1.0;
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_depth", &domain_depth, &set));
+
     // Generate the DMPlex for this mesh
-    DM dm = GenerateBoxMeshDMAgglom(MPI_COMM_WORLD, target_len, domain_width, domain_height, final_smooths, integrity_check, print_stats, agglom_factor);
+    DM dm;
+    if (dim == 2) {
+        dm = GenerateBoxMeshDMAgglom(MPI_COMM_WORLD, target_len, domain_width, domain_height, final_smooths, integrity_check, print_stats, agglom_factor);
+    } else {
+        dm = GenerateBoxMeshDM3DAgglom(MPI_COMM_WORLD, target_len, domain_width, domain_height, domain_depth, final_smooths, integrity_check, print_stats, agglom_factor);
+    }
 
     // Check a valid mesh has been generated
     if (dm) {

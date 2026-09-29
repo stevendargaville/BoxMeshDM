@@ -1,13 +1,14 @@
 // =========================================================
 // mesh_checksum - print per-rank hashes of a generated mesh
 //
-// Generates a mesh with GenerateBoxMeshDMAgglom (and, by default, refines it once) and prints
+// Generates a mesh with GenerateBoxMeshDMAgglom or GenerateBoxMeshDM3DAgglom (and, by default, refines it once) and prints
 // FNV-1a hashes of the local topology, coordinates, cell-to-global-vertex connectivity, point
 // SF and boundary labels on every rank. Running the same options against two builds of the
 // library and diffing the output shows whether they generate bit-identical meshes.
 //
-// Options: -target_edge_length, -domain_width, -domain_height, -final_smooth_its,
-//          -agglomeration_factor (defaults as in BoxMeshDM_main.cpp), -refine (default true)
+// Options: -dim, -target_edge_length, -domain_width, -domain_height, -domain_depth,
+//          -final_smooth_its, -agglomeration_factor (defaults as in BoxMeshDM_main.cpp),
+//          -refine (default true)
 // =========================================================
 #include <petscdmplex.h>
 #include <petscsf.h>
@@ -173,8 +174,8 @@ static PetscErrorCode HashMesh(DM dm, const char *name)
 
 int main(int argc, char **argv)
 {
-    PetscReal target_len = 0.0025, domain_width = 1.0, domain_height = 1.0;
-    PetscInt final_smooth_its = 4, agglomeration_factor = 1;
+    PetscReal target_len = 0.0025, domain_width = 1.0, domain_height = 1.0, domain_depth = 1.0;
+    PetscInt final_smooth_its = 4, agglomeration_factor = 1, dim = 2;
     PetscBool refine = PETSC_TRUE;
     DM dm, dm_refined;
 
@@ -185,8 +186,12 @@ int main(int argc, char **argv)
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-final_smooth_its", &final_smooth_its, NULL));
     PetscCall(PetscOptionsGetInt(NULL, NULL, "-agglomeration_factor", &agglomeration_factor, NULL));
     PetscCall(PetscOptionsGetBool(NULL, NULL, "-refine", &refine, NULL));
+    PetscCall(PetscOptionsGetInt(NULL, NULL, "-dim", &dim, NULL));
+    PetscCall(PetscOptionsGetReal(NULL, NULL, "-domain_depth", &domain_depth, NULL));
+    PetscCheck(dim == 2 || dim == 3, PETSC_COMM_WORLD, PETSC_ERR_ARG_OUTOFRANGE, "-dim %" PetscInt_FMT " must be 2 or 3", dim);
 
-    dm = GenerateBoxMeshDMAgglom(PETSC_COMM_WORLD, target_len, domain_width, domain_height, (int)final_smooth_its, PETSC_FALSE, PETSC_FALSE, (int)agglomeration_factor);
+    if (dim == 2) dm = GenerateBoxMeshDMAgglom(PETSC_COMM_WORLD, target_len, domain_width, domain_height, (int)final_smooth_its, PETSC_FALSE, PETSC_FALSE, (int)agglomeration_factor);
+    else dm = GenerateBoxMeshDM3DAgglom(PETSC_COMM_WORLD, target_len, domain_width, domain_height, domain_depth, (int)final_smooth_its, PETSC_FALSE, PETSC_FALSE, (int)agglomeration_factor);
     PetscCheck(dm, PETSC_COMM_WORLD, PETSC_ERR_LIB, "Mesh generation failed");
 
     PetscCall(HashMesh(dm, "mesh"));
