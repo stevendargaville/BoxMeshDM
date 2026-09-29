@@ -1246,11 +1246,17 @@ static void relax_points_spring(std::vector<Point<DIM> >& points, const std::vec
 // slivers (four nearly coplanar, nearly cospherical points with good edge lengths but almost no
 // volume). Lloyd removes nearly all of them from the connectivity it is given, but the next
 // Delaunay tetrahedralisation brings them straight back. So in 3D the final tetrahedralisation is
-// kept, and the vertices of its bad tetrahedra are moved on that fixed connectivity to improve
-// the worst tetrahedron around them. The mesh is then no longer exactly Delaunay, but it stays
-// valid: in each round only an independent set of vertices moves (no two share a tetrahedron),
-// and a vertex only moves if that strictly improves the worst eta^3 of its star, evaluated with
-// every other vertex of the star where it will stay, so no tetrahedron can become inverted.
+// kept, and vertices are moved on that fixed connectivity in two passes. First the sliver repair:
+// the vertices of tetrahedra with eta^3 < SLIVER_REPAIR_ETA3_3D try steps along the normal of the
+// face opposite them in their worst tetrahedron and along that tetrahedron's eta^3 gradient,
+// keeping the one that most improves the worst eta^3 of the star. Then a quality-guarded
+// smoothing of the wider low-quality band (tetrahedra with eta^3 < SMOOTH_ETA3_3D): a vertex steps
+// down the gradient of F = sum over its star of 1 / eta^3, which is dominated by the worst
+// tetrahedra but also looks after the rest of the star, with a few step halvings. The mesh is
+// then no longer exactly Delaunay, but it stays valid: in each round only an independent set of
+// vertices moves (no two share a tetrahedron), and a vertex only moves if that strictly improves
+// the worst eta^3 of its star (and in the second pass also lowers F), evaluated with every other
+// vertex of the star where it will stay, so no tetrahedron can become inverted.
 //
 // Determinism: a vertex is only moved by the rank that owns it (get_owner_rank), whose
 // tetrahedralisation is exact around its own tile (at least pad inside its point cloud), and the
@@ -1258,17 +1264,27 @@ static void relax_points_spring(std::vector<Point<DIM> >& points, const std::vec
 // edge lengths of its tile; far-rim copies may go stale harmlessly) before the next round.
 // Every decision (which tetrahedra are bad, which vertices move, the candidate positions) is a
 // function of the unique hash ids and those synchronised positions only: eta^3 is evaluated in a
-// vertex order sorted by id, not in each rank's own storage order, so every rank holding a region
-// agrees on it. Nothing is re-triangulated, so the halo does not need to grow: a vertex moves at
-// most SLIVER_REPAIR_ROUNDS_3D times, each time by at most the largest of SLIVER_REPAIR_STEPS_3D
-// target edge lengths.
+// vertex order sorted by id, not in each rank's own storage order, and the sums over a star (F
+// and its gradient) run over the star's tetrahedra sorted by their vertex ids, so every rank
+// holding a region agrees on them. Nothing is re-triangulated, and no candidate is accepted
+// that would put a vertex more than REPAIR_MAX_DISPLACEMENT_3D target edge lengths from where
+// the final tetrahedralisation had it, so the halo does not need to grow.
 
-// Number of repair rounds, and the eta^3 below which a tetrahedron's vertices try to move
+// Number of sliver repair rounds, and the eta^3 below which a tetrahedron's vertices try to move
 const int SLIVER_REPAIR_ROUNDS_3D = 24;
 const double SLIVER_REPAIR_ETA3_3D = 0.05;
 // Candidate steps along each direction tried, in target edge lengths (both signs are tried)
 const int NUM_SLIVER_REPAIR_STEPS_3D = 6;
 const double SLIVER_REPAIR_STEPS_3D[NUM_SLIVER_REPAIR_STEPS_3D] = {0.02, 0.05, 0.1, 0.2, 0.3, 0.4};
+// Number of guarded smoothing rounds, the eta^3 below which a tetrahedron's vertices try to move,
+// and the steps down the gradient of F tried in turn, in target edge lengths (the first accepted)
+const int SMOOTH_ROUNDS_3D = 16;
+const double SMOOTH_ETA3_3D = 0.2;
+const int NUM_SMOOTH_STEPS_3D = 3;
+const double SMOOTH_STEPS_3D[NUM_SMOOTH_STEPS_3D] = {0.3, 0.15, 0.075};
+// Largest distance, in target edge lengths, a vertex may end up from its position in the final
+// tetrahedralisation (both passes)
+const double REPAIR_MAX_DISPLACEMENT_3D = 1.0;
 
 // The canonical vertex order of a tetrahedron with unique hash ids ids (in stored, positive
 // order): sorted by id, with the first two swapped for an odd permutation so the orientation is
@@ -1461,6 +1477,12 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
         for (int i = 0; i < n; ++i) id_to_index[points[i].unique_hash_id] = i;
     }
 
+    // The positions in the final tetrahedralisation, for the displacement limit
+    std::vector<double> start(3 * (size_t)n);
+    for (int i = 0; i < n; ++i) {
+        for (int d = 0; d < 3; ++d) start[3 * (size_t)i + d] = points[i].c[d];
+    }
+
     // eta^3 of tetrahedron k in canonical order, with point i at position pi (i = -1: as it is)
     auto tet_eta3 = [&](int k, int i, const double *pi) {
         const double *q[4];
@@ -1487,11 +1509,46 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
     std::vector<double> eta3(tets.size());
     for (size_t k = 0; k < tets.size(); ++k) eta3[k] = tet_eta3((int)k, -1, NULL);
 
-    // Best move of point i: a position with a strictly better worst eta^3 of its star than now.
-    // Returns false if there is none. Depends only on the positions of i and its neighbours
-    auto find_best_move = [&](int i, double& current, Point<3>& best_candidate) {
+    // The candidate position of point i moved by dir * step target edge lengths. Boundary points
+    // slide as in the smoothing. Returns false if the move is not allowed: a boundary point too
+    // close to a corner, or further than REPAIR_MAX_DISPLACEMENT_3D from its starting position
+    auto make_candidate = [&](int i, const double *dir, double step, Point<3>& candidate) {
+        double delta[3];
+        for (int d = 0; d < 3; ++d) delta[d] = dir[d] * step * TARGET_EDGE_LENGTH;
+        Point<3> temp_p = points[i];
+        bool was_boundary = apply_boundary_constraint(temp_p, delta);
+        candidate = temp_p;
+        for (int d = 0; d < 3; ++d) candidate.c[d] += delta[d];
+        if (!was_boundary) {
+            keep_interior_point_inside(candidate);
+        } else if (!boundary_move_valid(temp_p, candidate)) {
+            return false;
+        }
+        double displacement_sq = 0.0;
+        for (int d = 0; d < 3; ++d) {
+            double e = (candidate.c[d] - start[3 * (size_t)i + d]) / TARGET_EDGE_LENGTH;
+            displacement_sq += e * e;
+        }
+        return displacement_sq <= REPAIR_MAX_DISPLACEMENT_3D * REPAIR_MAX_DISPLACEMENT_3D;
+    };
+
+    // Worst eta^3 of the star of point i with i at pi. Stops as soon as it is <= bound, as the
+    // callers only use a value > bound, so the early exit never changes a decision
+    auto star_min_eta3 = [&](int i, const double *pi, double bound) {
+        double worst = 2.0;
+        for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
+            worst = std::min(worst, tet_eta3(tet_data[j], i, pi));
+            if (worst <= bound) break;
+        }
+        return worst;
+    };
+
+    // Sliver repair move of point i: the candidate with the best worst eta^3 of its star, if that
+    // is strictly better than now. Returns false if there is none. Depends only on the positions of
+    // i and its neighbours
+    auto find_sliver_move = [&](int i, Point<3>& best_candidate) {
         // Current worst tetrahedron of the star
-        current = 2.0;
+        double current = 2.0;
         int worst = -1;
         for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
             int k = tet_data[j];
@@ -1565,24 +1622,9 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
         for (int k = 0; k < num_directions; ++k) {
             for (int s = 0; s < 2 * NUM_SLIVER_REPAIR_STEPS_3D; ++s) {
                 double step = SLIVER_REPAIR_STEPS_3D[s / 2] * ((s % 2 == 0) ? 1.0 : -1.0);
-                double delta[3];
-                for (int d = 0; d < 3; ++d) delta[d] = directions[k][d] * step * TARGET_EDGE_LENGTH;
-
-                // Boundary points slide as in the smoothing
-                Point<3> temp_p = points[i];
-                bool was_boundary = apply_boundary_constraint(temp_p, delta);
-                Point<3> candidate = temp_p;
-                for (int d = 0; d < 3; ++d) candidate.c[d] += delta[d];
-                if (!was_boundary) {
-                    keep_interior_point_inside(candidate);
-                } else if (!boundary_move_valid(temp_p, candidate)) {
-                    continue;
-                }
-
-                double candidate_eta3 = 2.0;
-                for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
-                    candidate_eta3 = std::min(candidate_eta3, tet_eta3(tet_data[j], i, candidate.c));
-                }
+                Point<3> candidate;
+                if (!make_candidate(i, directions[k], step, candidate)) continue;
+                double candidate_eta3 = star_min_eta3(i, candidate.c, best_eta3);
                 if (candidate_eta3 > best_eta3) {
                     best_eta3 = candidate_eta3;
                     best_candidate = candidate;
@@ -1592,70 +1634,214 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
         return best_eta3 > current;
     };
 
-    // Per point: whether it is on a bad tetrahedron and has an improving move, its star's worst
-    // eta^3 and the move. Found for every point this rank holds, not just its own, as its own
-    // points must defer to their neighbours; only recomputed when a point of the star has moved
-    std::vector<char> can_move(n, 0), stale(n, 1);
+    // Gradient of eta^3 of tetrahedron k with respect to point i, in target edge length units,
+    // with only the axes in mask. With six = 6V (normalised), n the normal of the face opposite i
+    // (unnormalised, six = n . (x_i - f0)) and S the sum of the squared edge lengths,
+    // eta^3 = 432 six^2 / S^3, so grad eta^3 = 432 six / S^3 (2 n - 3 six grad S / S). The sign of
+    // the face orientation cancels between six and n. Returns false (and a zero gradient) if S is
+    // degenerate
+    auto tet_eta3_gradient = [&](int k, int i, const double *mask, double *g) {
+        const double *f[3];
+        int m = 0;
+        for (int a = 0; a < 4; ++a) {
+            if (canonical[k].v[a] != i) f[m++] = points[canonical[k].v[a]].c;
+        }
+        double fx[3][3], w[3];
+        for (int a = 0; a < 3; ++a) {
+            for (int d = 0; d < 3; ++d) fx[a][d] = (f[a][d] - f[0][d]) / TARGET_EDGE_LENGTH;
+        }
+        for (int d = 0; d < 3; ++d) w[d] = (points[i].c[d] - f[0][d]) / TARGET_EDGE_LENGTH;
+        double normal[3] = {fx[1][1] * fx[2][2] - fx[1][2] * fx[2][1],
+                            fx[1][2] * fx[2][0] - fx[1][0] * fx[2][2],
+                            fx[1][0] * fx[2][1] - fx[1][1] * fx[2][0]};
+        double six_volume = normal[0] * w[0] + normal[1] * w[1] + normal[2] * w[2];
+        double sum_l_sq = 0.0, grad_s[3] = {0.0, 0.0, 0.0};
+        for (int a = 0; a < 3; ++a) {
+            double e[3];
+            for (int d = 0; d < 3; ++d) {
+                e[d] = w[d] - fx[a][d];
+                grad_s[d] += 2.0 * e[d];
+            }
+            sum_l_sq += dist_sq<3>(e);
+            for (int b = a + 1; b < 3; ++b) {
+                for (int d = 0; d < 3; ++d) e[d] = fx[b][d] - fx[a][d];
+                sum_l_sq += dist_sq<3>(e);
+            }
+        }
+        if (!(sum_l_sq > 1e-8)) {
+            g[0] = g[1] = g[2] = 0.0;
+            return false;
+        }
+        double scale = 432.0 * six_volume / (sum_l_sq * sum_l_sq * sum_l_sq);
+        for (int d = 0; d < 3; ++d) g[d] = scale * (2.0 * normal[d] - 3.0 * six_volume * grad_s[d] / sum_l_sq) * mask[d];
+        return true;
+    };
+
+    // F = sum of 1 / eta^3 over the star of point i with i at pi, in the star's canonical order,
+    // and the worst eta^3 (worst). Stops and returns 1e300 as soon as the move is known to fail the
+    // test of the caller (worst <= worst_bound or F >= f_bound; every term is positive), so the
+    // early exit never changes a decision
+    auto star_f = [&](int i, const double *pi, double worst_bound, double f_bound, double& worst) {
+        double f = 0.0;
+        worst = 2.0;
+        for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
+            double e = tet_eta3(tet_data[j], i, pi);
+            worst = std::min(worst, e);
+            if (!(e > 1e-12) || worst <= worst_bound) return 1e300;
+            f += 1.0 / e;
+            if (f >= f_bound) return 1e300;
+        }
+        return f;
+    };
+
+    // Guarded smoothing move of point i: down the gradient of F, the first of SMOOTH_STEPS_3D that
+    // lowers F and strictly raises the worst eta^3 of the star. Returns false if there is none.
+    // star_sorted says whether the star of a point is already in canonical order
+    std::vector<char> star_sorted(n, 0);
+    auto find_smooth_move = [&](int i, Point<3>& best_candidate) {
+        best_candidate = points[i];
+        int s0 = tet_offset[i], s1 = tet_offset[i + 1];
+        if (s0 == s1) return false;
+        // Sort the star by the tetrahedra's vertex ids, so the sums below are the same on every
+        // rank (the order of the star does not matter anywhere else)
+        if (!star_sorted[i]) {
+            star_sorted[i] = 1;
+            std::sort(tet_data.begin() + s0, tet_data.begin() + s1, tet_before);
+        }
+        double current = 2.0;
+        for (int j = s0; j < s1; ++j) current = std::min(current, eta3[tet_data[j]]);
+        if (!(current > 1e-12)) return false;
+
+        // The axes the point can move along (none for a corner)
+        double mask[3] = {1.0, 1.0, 1.0};
+        {
+            Point<3> temp_p = points[i];
+            apply_boundary_constraint(temp_p, mask);
+        }
+        if (mask[0] == 0.0 && mask[1] == 0.0 && mask[2] == 0.0) return false;
+
+        // F and the direction of steepest descent, -grad F = sum of grad eta^3 / (eta^3)^2
+        double f_current = 0.0, descent[3] = {0.0, 0.0, 0.0};
+        for (int j = s0; j < s1; ++j) {
+            int k = tet_data[j];
+            double g[3];
+            if (!tet_eta3_gradient(k, i, mask, g)) return false;
+            f_current += 1.0 / eta3[k];
+            double weight = 1.0 / (eta3[k] * eta3[k]);
+            for (int d = 0; d < 3; ++d) descent[d] += weight * g[d];
+        }
+        double descent_len = std::sqrt(dist_sq<3>(descent));
+        if (!(descent_len > 1e-12)) return false;
+        double direction[3];
+        for (int d = 0; d < 3; ++d) direction[d] = descent[d] / descent_len;
+
+        for (int s = 0; s < NUM_SMOOTH_STEPS_3D; ++s) {
+            Point<3> candidate;
+            if (!make_candidate(i, direction, SMOOTH_STEPS_3D[s], candidate)) continue;
+            double worst;
+            double f = star_f(i, candidate.c, current, f_current, worst);
+            if (f < f_current && worst > current) {
+                best_candidate = candidate;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Per point: its star's worst eta^3 and whether it is on a tetrahedron below the threshold of
+    // the pass (a candidate), recomputed when a point of its star has moved (stale); and, once
+    // evaluated, whether it has an allowed move (can_move) and the move
+    std::vector<char> stale(n, 1), candidate_point(n, 0), evaluated(n, 0), can_move(n, 0);
     std::vector<double> star_eta3(n, 2.0);
     std::vector<Point<3> > move_to(n);
-    std::vector<uint64_t> priority(n, 0);
     std::vector<int> moved, updated;
+    int round = 0;
 
-    for (int round = 0; round < SLIVER_REPAIR_ROUNDS_3D; ++round) {
-        for (int i = 0; i < n; ++i) {
-            if (stale[i]) {
-                stale[i] = 0;
-                can_move[i] = 0;
-                bool on_bad = false;
-                for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
-                    if (eta3[tet_data[j]] < SLIVER_REPAIR_ETA3_3D) { on_bad = true; break; }
-                }
-                if (on_bad && find_best_move(i, star_eta3[i], move_to[i])) can_move[i] = 1;
+    auto run_pass = [&](int num_rounds, double threshold, bool smooth) {
+        std::fill(stale.begin(), stale.end(), 1);
+        auto refresh = [&](int i) {
+            if (!stale[i]) return;
+            stale[i] = 0;
+            evaluated[i] = 0;
+            can_move[i] = 0;
+            double worst = 2.0;
+            bool on_bad = false;
+            for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
+                double e = eta3[tet_data[j]];
+                worst = std::min(worst, e);
+                if (e < threshold) on_bad = true;
             }
-            if (can_move[i]) {
-                // Pseudo-random tie break that changes every round. Distinct ids get distinct
-                // priorities, as splitmix64 is a bijection (and so is the xor with the round constant)
-                uint64_t h = points[i].unique_hash_id ^ (0x9e3779b97f4a7c15ULL * (uint64_t)(round + 1));
-                priority[i] = splitmix64(h);
+            star_eta3[i] = worst;
+            candidate_point[i] = on_bad;
+        };
+        // Whether candidate point i has a move. A function of the positions around i only, so
+        // it is only computed when a decision needs it, which gives the same result as computing
+        // it for every point
+        auto has_move = [&](int i) {
+            refresh(i);
+            if (!evaluated[i]) {
+                evaluated[i] = 1;
+                can_move[i] = candidate_point[i] &&
+                              (smooth ? find_smooth_move(i, move_to[i]) : find_sliver_move(i, move_to[i]));
             }
-        }
+            return can_move[i] != 0;
+        };
 
-        // A point this rank owns moves if it goes before every other point of its star that could
-        // move: the worst star first (then the random priority). No two points of a tetrahedron
-        // move in the same round, so each move was evaluated against the final positions of the
-        // rest of its star
-        moved.clear();
-        for (int i = 0; i < n; ++i) {
-            if (!can_move[i] || get_owner_rank(points[i], size) != rank) continue;
-            bool first = true;
-            for (int j = tet_offset[i]; j < tet_offset[i + 1] && first; ++j) {
-                const Simplex<3>& t = tets[tet_data[j]];
-                for (int a = 0; a < 4; ++a) {
-                    int w = t.v[a];
-                    if (w == i || !can_move[w]) continue;
-                    if (star_eta3[w] < star_eta3[i] || (star_eta3[w] == star_eta3[i] && priority[w] > priority[i])) {
-                        first = false;
-                        break;
+        for (int pass_round = 0; pass_round < num_rounds; ++pass_round, ++round) {
+            // Pseudo-random tie break that changes every round. Distinct ids get distinct
+            // priorities, as splitmix64 is a bijection (and so is the xor with the round constant)
+            uint64_t round_constant = 0x9e3779b97f4a7c15ULL * (uint64_t)(round + 1);
+            auto priority = [&](int i) {
+                uint64_t h = points[i].unique_hash_id ^ round_constant;
+                return splitmix64(h);
+            };
+
+            // A point this rank owns moves if it goes before every other point of its star that
+            // could move: the worst star first (then the random priority). No two points of a
+            // tetrahedron move in the same round, so each move was evaluated against the final
+            // positions of the rest of its star
+            moved.clear();
+            for (int i = 0; i < n; ++i) {
+                if (get_owner_rank(points[i], size) != rank) continue;
+                refresh(i);
+                if (!candidate_point[i]) continue;
+                bool first = true;
+                for (int j = tet_offset[i]; j < tet_offset[i + 1] && first; ++j) {
+                    const Simplex<3>& t = tets[tet_data[j]];
+                    for (int a = 0; a < 4; ++a) {
+                        int w = t.v[a];
+                        if (w == i) continue;
+                        refresh(w);
+                        if (!candidate_point[w]) continue;
+                        if (star_eta3[w] < star_eta3[i] || (star_eta3[w] == star_eta3[i] && priority(w) > priority(i))) {
+                            if (has_move(w)) {
+                                first = false;
+                                break;
+                            }
+                        }
                     }
                 }
+                if (first && has_move(i)) moved.push_back(i);
             }
-            if (first) moved.push_back(i);
-        }
 
-        // Move, send the new positions to the neighbours (and get theirs), then update the quality
-        // of every tetrahedron with a point that moved, and mark their points to be looked at again
-        for (size_t m = 0; m < moved.size(); ++m) points[moved[m]] = move_to[moved[m]];
-        SendMovedPoints3D(comm, points, moved, neighbours, id_to_index, pad, updated);
-        moved.insert(moved.end(), updated.begin(), updated.end());
-        for (size_t m = 0; m < moved.size(); ++m) {
-            int i = moved[m];
-            for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
-                int k = tet_data[j];
-                eta3[k] = tet_eta3(k, -1, NULL);
-                for (int a = 0; a < 4; ++a) stale[tets[k].v[a]] = 1;
+            // Move, send the new positions to the neighbours (and get theirs), then update the
+            // quality of every tetrahedron with a point that moved, and mark their points stale
+            for (size_t m = 0; m < moved.size(); ++m) points[moved[m]] = move_to[moved[m]];
+            SendMovedPoints3D(comm, points, moved, neighbours, id_to_index, pad, updated);
+            moved.insert(moved.end(), updated.begin(), updated.end());
+            for (size_t m = 0; m < moved.size(); ++m) {
+                int i = moved[m];
+                for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
+                    int k = tet_data[j];
+                    eta3[k] = tet_eta3(k, -1, NULL);
+                    for (int a = 0; a < 4; ++a) stale[tets[k].v[a]] = 1;
+                }
             }
         }
-    }
+    };
+
+    run_pass(SLIVER_REPAIR_ROUNDS_3D, SLIVER_REPAIR_ETA3_3D, false);
+    run_pass(SMOOTH_ROUNDS_3D, SMOOTH_ETA3_3D, true);
 }
 
 // ~~~~~~~~~~~~~~~~~
