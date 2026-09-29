@@ -34,6 +34,7 @@
 // 2. Interior Gen: Create random points inside small squares, REJECTING those near boundaries.
 // 3. Iterate: jitter -> triangulate -> smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
+// 5. 3D only: move the vertices of slivers on the final tetrahedralisation (RepairSlivers).
 //
 // Structure: the pipeline is written once as templates on the dimension DIM. Everything that
 // depends on the dimension (the Delaunay backend, the hash id layout, the simplex kernels, the
@@ -1240,6 +1241,384 @@ static void relax_points_spring(std::vector<Point<DIM> >& points, const std::vec
 
 // ~~~~~~~~~~~~~~~~~
 
+// Sliver repair (3D). The smoothing above works on a connectivity that is then thrown away: every
+// round re-triangulates, and the Delaunay tetrahedralisation of even well spaced points contains
+// slivers (four nearly coplanar, nearly cospherical points with good edge lengths but almost no
+// volume). Lloyd removes nearly all of them from the connectivity it is given, but the next
+// Delaunay tetrahedralisation brings them straight back. So in 3D the final tetrahedralisation is
+// kept, and the vertices of its bad tetrahedra are moved on that fixed connectivity to improve
+// the worst tetrahedron around them. The mesh is then no longer exactly Delaunay, but it stays
+// valid: in each round only an independent set of vertices moves (no two share a tetrahedron),
+// and a vertex only moves if that strictly improves the worst eta^3 of its star, evaluated with
+// every other vertex of the star where it will stay, so no tetrahedron can become inverted.
+//
+// Determinism: a vertex is only moved by the rank that owns it (get_owner_rank), whose
+// tetrahedralisation is exact around its own tile (at least pad inside its point cloud), and the
+// owner sends the new position to every neighbour that holds the point before the next round.
+// Every decision (which tetrahedra are bad, which vertices move, the candidate positions) is a
+// function of the unique hash ids and those synchronised positions only: eta^3 is evaluated in a
+// vertex order sorted by id, not in each rank's own storage order, so every rank holding a region
+// agrees on it. Nothing is re-triangulated, so the halo does not need to grow: a vertex moves at
+// most SLIVER_REPAIR_ROUNDS_3D times, each time by at most the largest of SLIVER_REPAIR_STEPS_3D
+// target edge lengths.
+
+// Number of repair rounds, and the eta^3 below which a tetrahedron's vertices try to move
+const int SLIVER_REPAIR_ROUNDS_3D = 24;
+const double SLIVER_REPAIR_ETA3_3D = 0.05;
+// Candidate steps along each direction tried, in target edge lengths (both signs are tried)
+const int NUM_SLIVER_REPAIR_STEPS_3D = 6;
+const double SLIVER_REPAIR_STEPS_3D[NUM_SLIVER_REPAIR_STEPS_3D] = {0.02, 0.05, 0.1, 0.2, 0.3, 0.4};
+
+// The canonical vertex order of a tetrahedron with unique hash ids ids (in stored, positive
+// order): sorted by id, with the first two swapped for an odd permutation so the orientation is
+// kept. Quantities evaluated in this order are the same on every rank, whatever order its
+// Delaunay backend stored the vertices in. Sets o to the stored positions in canonical order
+static void canonical_tet_order(const uint64_t *ids, int *o) {
+    for (int a = 0; a < 4; ++a) o[a] = a;
+    for (int a = 1; a < 4; ++a) {
+        for (int b = a; b > 0 && ids[o[b]] < ids[o[b - 1]]; --b) std::swap(o[b], o[b - 1]);
+    }
+    int inversions = 0;
+    for (int a = 0; a < 4; ++a) {
+        for (int b = a + 1; b < 4; ++b) {
+            if (o[a] > o[b]) inversions++;
+        }
+    }
+    if (inversions % 2 == 1) std::swap(o[0], o[1]);
+}
+
+// Send the new positions of the points this rank moved (and owns) to every neighbouring rank
+// whose point cloud (tile + pad, with the same 1.2 safety factor as ResolveBoundaryOwnership)
+// holds them, and apply the positions received. id_to_index maps a unique hash id to its index in
+// points; ids a rank does not hold are ignored. Sets updated to the indices of the points whose
+// position was received
+static void SendMovedPoints3D(MPI_Comm comm, std::vector<Point<3> >& points, const std::vector<int>& moved,
+                              const std::unordered_map<uint64_t, int>& id_to_index, double pad, std::vector<int>& updated) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+    updated.clear();
+    if (size == 1) return;
+
+    int t[3];
+    rank_to_tile<3>(rank, t);
+    double safe_pad = pad * 1.2;
+
+    std::vector<std::vector<uint64_t> > send_ids(size);
+    std::vector<std::vector<double> > send_coords(size);
+    int off_lo[3] = {-1, -1, -1}, off_hi[3] = {1, 1, 1};
+    for (size_t m = 0; m < moved.size(); ++m) {
+        const Point<3>& p = points[moved[m]];
+        int off[3] = {-1, -1, -1};
+        do {
+            if (off[0] == 0 && off[1] == 0 && off[2] == 0) continue;
+            int n[3];
+            bool in_grid = true, relevant = true;
+            for (int d = 0; d < 3; ++d) {
+                n[d] = t[d] + off[d];
+                if (!(n[d] >= 0 && n[d] < TILE_DIM[d])) in_grid = false;
+            }
+            if (!in_grid) continue;
+            for (int d = 0; d < 3; ++d) {
+                double tile_s = DOMAIN_SIZE[d] / TILE_DIM[d];
+                if (p.c[d] < n[d] * tile_s - safe_pad || p.c[d] > (n[d] + 1) * tile_s + safe_pad) relevant = false;
+            }
+            if (!relevant) continue;
+            int n_rank = tile_to_rank<3>(n);
+            send_ids[n_rank].push_back(p.unique_hash_id);
+            for (int d = 0; d < 3; ++d) send_coords[n_rank].push_back(p.c[d]);
+        } while (next_index<3>(off, off_lo, off_hi));
+    }
+
+    std::vector<int> send_counts(size), recv_counts(size);
+    for (int r = 0; r < size; ++r) send_counts[r] = send_ids[r].size();
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+
+    std::vector<std::vector<uint64_t> > recv_ids(size);
+    std::vector<std::vector<double> > recv_coords(size);
+    std::vector<MPI_Request> requests;
+    for (int r = 0; r < size; ++r) {
+        if (recv_counts[r] > 0) {
+            recv_ids[r].resize(recv_counts[r]);
+            recv_coords[r].resize(3 * (size_t)recv_counts[r]);
+            MPI_Request req;
+            MPI_Irecv(recv_ids[r].data(), recv_counts[r], MPI_UINT64_T, r, 104, comm, &req);
+            requests.push_back(req);
+            MPI_Irecv(recv_coords[r].data(), 3 * recv_counts[r], MPI_DOUBLE, r, 105, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    for (int r = 0; r < size; ++r) {
+        if (send_counts[r] > 0) {
+            MPI_Request req;
+            MPI_Isend(send_ids[r].data(), send_counts[r], MPI_UINT64_T, r, 104, comm, &req);
+            requests.push_back(req);
+            MPI_Isend(send_coords[r].data(), 3 * send_counts[r], MPI_DOUBLE, r, 105, comm, &req);
+            requests.push_back(req);
+        }
+    }
+    if (!requests.empty()) MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    // Explicitly delete memory
+    std::vector<std::vector<uint64_t> >().swap(send_ids);
+    std::vector<std::vector<double> >().swap(send_coords);
+
+    for (int r = 0; r < size; ++r) {
+        for (int k = 0; k < recv_counts[r]; ++k) {
+            std::unordered_map<uint64_t, int>::const_iterator it = id_to_index.find(recv_ids[r][k]);
+            if (it == id_to_index.end()) continue;
+            for (int d = 0; d < 3; ++d) points[it->second].c[d] = recv_coords[r][3 * (size_t)k + d];
+            updated.push_back(it->second);
+        }
+    }
+}
+
+// Move the vertices of badly shaped simplices on the final (fixed) connectivity, see above.
+// Called after the final triangulation and ResolveBoundaryOwnership, before the simplices are
+// filtered
+template <int DIM>
+static void RepairSlivers(MPI_Comm comm, std::vector<Point<DIM> >& points, const std::vector<Simplex<DIM> >& simplices, double pad);
+
+// 2D: nothing, the smoothed Delaunay triangulation is used as it is
+template <>
+inline void RepairSlivers<2>(MPI_Comm comm, std::vector<Point<2> >& points, const std::vector<Simplex<2> >& simplices, double pad) {
+    (void)comm; (void)points; (void)simplices; (void)pad;
+}
+
+template <>
+void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::vector<Simplex<3> >& tets, double pad) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+    int n = points.size();
+
+    // The tetrahedra with their vertices in canonical order, see canonical_tet_order
+    std::vector<Simplex<3> > canonical(tets.size());
+    for (size_t k = 0; k < tets.size(); ++k) {
+        uint64_t ids[4];
+        int o[4];
+        for (int a = 0; a < 4; ++a) ids[a] = points[tets[k].v[a]].unique_hash_id;
+        canonical_tet_order(ids, o);
+        for (int a = 0; a < 4; ++a) canonical[k].v[a] = tets[k].v[o[a]];
+    }
+
+    // CSR point-to-tetrahedron adjacency
+    std::vector<int> tet_offset(n + 1, 0);
+    for (const auto& t : tets) {
+        for (int a = 0; a < 4; ++a) tet_offset[t.v[a] + 1]++;
+    }
+    for (int i = 0; i < n; ++i) tet_offset[i + 1] += tet_offset[i];
+    std::vector<int> tet_data(tet_offset[n]);
+    {
+        std::vector<int> fill(tet_offset.begin(), tet_offset.end() - 1);
+        for (size_t k = 0; k < tets.size(); ++k) {
+            for (int a = 0; a < 4; ++a) tet_data[fill[tets[k].v[a]]++] = (int)k;
+        }
+    }
+
+    std::unordered_map<uint64_t, int> id_to_index;
+    if (size > 1) {
+        id_to_index.reserve(n);
+        for (int i = 0; i < n; ++i) id_to_index[points[i].unique_hash_id] = i;
+    }
+
+    // eta^3 of tetrahedron k in canonical order, with point i at position pi (i = -1: as it is)
+    auto tet_eta3 = [&](int k, int i, const double *pi) {
+        const double *q[4];
+        for (int a = 0; a < 4; ++a) {
+            int v = canonical[k].v[a];
+            q[a] = (v == i) ? pi : points[v].c;
+        }
+        double det;
+        return tet_quality_eta3(q, det);
+    };
+    // Rank-independent tie break between two tetrahedra of equal quality: their sorted vertex ids
+    // (the canonical order, with the first two back in order)
+    auto tet_before = [&](int k1, int k2) {
+        uint64_t a[4], b[4];
+        for (int v = 0; v < 4; ++v) {
+            a[v] = points[canonical[k1].v[v]].unique_hash_id;
+            b[v] = points[canonical[k2].v[v]].unique_hash_id;
+        }
+        if (a[0] > a[1]) std::swap(a[0], a[1]);
+        if (b[0] > b[1]) std::swap(b[0], b[1]);
+        return std::lexicographical_compare(a, a + 4, b, b + 4);
+    };
+
+    std::vector<double> eta3(tets.size());
+    for (size_t k = 0; k < tets.size(); ++k) eta3[k] = tet_eta3((int)k, -1, NULL);
+
+    // Best move of point i: a position with a strictly better worst eta^3 of its star than now.
+    // Returns false if there is none. Depends only on the positions of i and its neighbours
+    auto find_best_move = [&](int i, double& current, Point<3>& best_candidate) {
+        // Current worst tetrahedron of the star
+        current = 2.0;
+        int worst = -1;
+        for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
+            int k = tet_data[j];
+            if (worst < 0 || eta3[k] < current || (eta3[k] == current && tet_before(k, worst))) {
+                current = eta3[k];
+                worst = k;
+            }
+        }
+        best_candidate = points[i];
+        if (worst < 0) return false;
+
+        // The face of the worst tetrahedron opposite point i, vertices sorted by id
+        const Point<3> *f[3];
+        int m = 0;
+        for (int a = 0; a < 4; ++a) {
+            if (canonical[worst].v[a] != i) f[m++] = &points[canonical[worst].v[a]];
+        }
+        for (int a = 1; a < 3; ++a) {
+            for (int b = a; b > 0 && f[b]->unique_hash_id < f[b - 1]->unique_hash_id; --b) std::swap(f[b], f[b - 1]);
+        }
+
+        // Directions to try, in units of the target edge length: the normal of that face (moving
+        // along it changes the tetrahedron's height, the only way to fix a sliver) and the
+        // gradient of the tetrahedron's eta^3 with respect to point i, which also evens out its
+        // edge lengths. eta^3 = 15552 V^2 / S^3, so grad eta^3 / eta^3 = 2 grad V / V - 3 grad S / S,
+        // with S the sum of the squared edge lengths
+        double fx[3][3], w[3];
+        for (int a = 0; a < 3; ++a) {
+            for (int d = 0; d < 3; ++d) fx[a][d] = (f[a]->c[d] - f[0]->c[d]) / TARGET_EDGE_LENGTH;
+        }
+        for (int d = 0; d < 3; ++d) w[d] = (points[i].c[d] - f[0]->c[d]) / TARGET_EDGE_LENGTH;
+        double normal[3] = {fx[1][1] * fx[2][2] - fx[1][2] * fx[2][1],
+                            fx[1][2] * fx[2][0] - fx[1][0] * fx[2][2],
+                            fx[1][0] * fx[2][1] - fx[1][1] * fx[2][0]};
+        double normal_len = std::sqrt(dist_sq<3>(normal));
+        if (!(normal_len > 1e-12)) return false;
+
+        double directions[2][3];
+        int num_directions = 0;
+        for (int d = 0; d < 3; ++d) directions[num_directions][d] = normal[d] / normal_len;
+        num_directions++;
+
+        // 6V (signed by the face order) and S, and grad S = 2 * sum over the face of (w - f)
+        double six_volume = normal[0] * w[0] + normal[1] * w[1] + normal[2] * w[2];
+        double sum_l_sq = 0.0, grad_s[3] = {0.0, 0.0, 0.0};
+        for (int a = 0; a < 3; ++a) {
+            double e[3];
+            for (int d = 0; d < 3; ++d) {
+                e[d] = w[d] - fx[a][d];
+                grad_s[d] += 2.0 * e[d];
+            }
+            sum_l_sq += dist_sq<3>(e);
+            for (int b = a + 1; b < 3; ++b) {
+                for (int d = 0; d < 3; ++d) e[d] = fx[b][d] - fx[a][d];
+                sum_l_sq += dist_sq<3>(e);
+            }
+        }
+        if (std::abs(six_volume) > 1e-12 && sum_l_sq > 1e-12) {
+            // grad V = normal / 6 with the sign of the volume, so 2 grad V / V = 2 normal / (6V)
+            double grad[3];
+            for (int d = 0; d < 3; ++d) grad[d] = 2.0 * normal[d] / six_volume - 3.0 * grad_s[d] / sum_l_sq;
+            double grad_len = std::sqrt(dist_sq<3>(grad));
+            if (grad_len > 1e-12) {
+                for (int d = 0; d < 3; ++d) directions[num_directions][d] = grad[d] / grad_len;
+                num_directions++;
+            }
+        }
+
+        // Take the candidate with the best worst eta^3 of the star
+        double best_eta3 = current;
+        for (int k = 0; k < num_directions; ++k) {
+            for (int s = 0; s < 2 * NUM_SLIVER_REPAIR_STEPS_3D; ++s) {
+                double step = SLIVER_REPAIR_STEPS_3D[s / 2] * ((s % 2 == 0) ? 1.0 : -1.0);
+                double delta[3];
+                for (int d = 0; d < 3; ++d) delta[d] = directions[k][d] * step * TARGET_EDGE_LENGTH;
+
+                // Boundary points slide as in the smoothing
+                Point<3> temp_p = points[i];
+                bool was_boundary = apply_boundary_constraint(temp_p, delta);
+                Point<3> candidate = temp_p;
+                for (int d = 0; d < 3; ++d) candidate.c[d] += delta[d];
+                if (!was_boundary) {
+                    keep_interior_point_inside(candidate);
+                } else if (!boundary_move_valid(temp_p, candidate)) {
+                    continue;
+                }
+
+                double candidate_eta3 = 2.0;
+                for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
+                    candidate_eta3 = std::min(candidate_eta3, tet_eta3(tet_data[j], i, candidate.c));
+                }
+                if (candidate_eta3 > best_eta3) {
+                    best_eta3 = candidate_eta3;
+                    best_candidate = candidate;
+                }
+            }
+        }
+        return best_eta3 > current;
+    };
+
+    // Per point: whether it is on a bad tetrahedron and has an improving move, its star's worst
+    // eta^3 and the move. Found for every point this rank holds, not just its own, as its own
+    // points must defer to their neighbours; only recomputed when a point of the star has moved
+    std::vector<char> can_move(n, 0), stale(n, 1);
+    std::vector<double> star_eta3(n, 2.0);
+    std::vector<Point<3> > move_to(n);
+    std::vector<uint64_t> priority(n, 0);
+    std::vector<int> moved, updated;
+
+    for (int round = 0; round < SLIVER_REPAIR_ROUNDS_3D; ++round) {
+        for (int i = 0; i < n; ++i) {
+            if (stale[i]) {
+                stale[i] = 0;
+                can_move[i] = 0;
+                bool on_bad = false;
+                for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
+                    if (eta3[tet_data[j]] < SLIVER_REPAIR_ETA3_3D) { on_bad = true; break; }
+                }
+                if (on_bad && find_best_move(i, star_eta3[i], move_to[i])) can_move[i] = 1;
+            }
+            if (can_move[i]) {
+                // Pseudo-random tie break that changes every round
+                uint64_t h = points[i].unique_hash_id ^ (0x9e3779b97f4a7c15ULL * (uint64_t)(round + 1));
+                priority[i] = splitmix64(h);
+            }
+        }
+
+        // A point this rank owns moves if it goes before every other point of its star that could
+        // move: the worst star first (then the random priority). No two points of a tetrahedron
+        // move in the same round, so each move was evaluated against the final positions of the
+        // rest of its star
+        moved.clear();
+        for (int i = 0; i < n; ++i) {
+            if (!can_move[i] || get_owner_rank(points[i], size) != rank) continue;
+            bool first = true;
+            for (int j = tet_offset[i]; j < tet_offset[i + 1] && first; ++j) {
+                const Simplex<3>& t = tets[tet_data[j]];
+                for (int a = 0; a < 4; ++a) {
+                    int w = t.v[a];
+                    if (w == i || !can_move[w]) continue;
+                    if (star_eta3[w] < star_eta3[i] || (star_eta3[w] == star_eta3[i] && priority[w] > priority[i])) {
+                        first = false;
+                        break;
+                    }
+                }
+            }
+            if (first) moved.push_back(i);
+        }
+
+        // Move, send the new positions to the neighbours (and get theirs), then update the quality
+        // of every tetrahedron with a point that moved, and mark their points to be looked at again
+        for (size_t m = 0; m < moved.size(); ++m) points[moved[m]] = move_to[moved[m]];
+        SendMovedPoints3D(comm, points, moved, id_to_index, pad, updated);
+        moved.insert(moved.end(), updated.begin(), updated.end());
+        for (size_t m = 0; m < moved.size(); ++m) {
+            int i = moved[m];
+            for (int j = tet_offset[i]; j < tet_offset[i + 1]; ++j) {
+                int k = tet_data[j];
+                eta3[k] = tet_eta3(k, -1, NULL);
+                for (int a = 0; a < 4; ++a) stale[tets[k].v[a]] = 1;
+            }
+        }
+    }
+}
+
+// ~~~~~~~~~~~~~~~~~
+
 // Compute valence for each point and return sorted unique edge list
 // The edge list uses local indices into the points vector
 template <int DIM>
@@ -1608,6 +1987,9 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
 
     // Resolve ownership before filtering
     ResolveBoundaryOwnership(comm, points_with_halos, s_min, s_max, interior_min, interior_max, pad);
+
+    // 3D: move the vertices of badly shaped tetrahedra on this final connectivity (nothing in 2D)
+    RepairSlivers<DIM>(comm, points_with_halos, triangles_with_halos, pad);
 
     // Pre-allocate remapping array.
     // -1 indicates the point hasn't been added to the owned list yet.
