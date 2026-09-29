@@ -75,10 +75,12 @@ const int MAX_GRID_IDX = 2000000000;
 // Number of 10 degree bins in the edge orientation histogram of the stats
 const int NUM_ORIENTATION_BINS = 18;
 
-// 3D stats: number of 0.1 wide bins in the eta^3 histogram, and of 10 degree bins in the
-// histogram of the smallest dihedral angle of each tetrahedron (which is at most 70.53 degrees)
+// 3D stats: number of 0.1 wide bins in the eta^3 histogram, of 10 degree bins in the histogram
+// of the smallest dihedral angle of each tetrahedron (which is at most 70.53 degrees), and of
+// 10 degree bins from 70 degrees in the histogram of the largest (which is at least 70.53 degrees)
 const int NUM_QUALITY_BINS = 10;
 const int NUM_DIHEDRAL_BINS = 9;
+const int NUM_MAX_DIHEDRAL_BINS = 11;
 
 // ~~~~~~~~~~~~~~~~~
 
@@ -2793,6 +2795,9 @@ struct SimplexQuality {
     long quality_bins[NUM_QUALITY_BINS];   // 3D only: eta^3 histogram (all 0 in 2D)
     long dihedral_bins[NUM_DIHEDRAL_BINS]; // 3D only: histogram of each tetrahedron's smallest
                                            // dihedral angle (all 0 in 2D)
+    long max_dihedral_bins[NUM_MAX_DIHEDRAL_BINS]; // 3D only: histogram of each tetrahedron's
+                                                   // largest dihedral angle (all 0 in 2D)
+    long below_5_deg_count;        // 3D only: tetrahedra with a dihedral angle below 5 degrees
 };
 
 // Update q with one owned simplex (p in simplex order)
@@ -2854,6 +2859,14 @@ void stats_accumulate_simplex<3>(const Point<3> *const *p, SimplexQuality& q) {
         int dihedral_bin = static_cast<int>(min_angle / 10.0);
         if (dihedral_bin >= NUM_DIHEDRAL_BINS) dihedral_bin = NUM_DIHEDRAL_BINS - 1;
         q.dihedral_bins[dihedral_bin]++;
+        if (min_angle < 5.0) q.below_5_deg_count++;
+    }
+    // And of the largest, from 70 degrees
+    if (max_angle >= 0.0) {
+        int max_dihedral_bin = static_cast<int>((max_angle - 70.0) / 10.0);
+        if (max_dihedral_bin < 0) max_dihedral_bin = 0;
+        if (max_dihedral_bin >= NUM_MAX_DIHEDRAL_BINS) max_dihedral_bin = NUM_MAX_DIHEDRAL_BINS - 1;
+        q.max_dihedral_bins[max_dihedral_bin]++;
     }
 }
 
@@ -2957,6 +2970,15 @@ void print_simplex_stats<3>(long num_tris_owned_global, const SimplexQuality& gl
                   << std::setw(10) << global.dihedral_bins[i]
                   << " (" << std::fixed << std::setprecision(2) << pct << "%)\n";
     }
+    double below_5_pct = num_tris_owned_global > 0 ? 100.0 * global.below_5_deg_count / num_tris_owned_global : 0.0;
+    std::cout << "  of which below 5 deg: " << global.below_5_deg_count << " (" << std::fixed << std::setprecision(2) << below_5_pct << "%)\n";
+    std::cout << "Largest Dihedral Angle per Tetrahedron (10 deg bins):\n";
+    for (int i = 0; i < NUM_MAX_DIHEDRAL_BINS; ++i) {
+        double pct = num_tris_owned_global > 0 ? 100.0 * global.max_dihedral_bins[i] / num_tris_owned_global : 0.0;
+        std::cout << "  " << std::setw(3) << (70 + i * 10) << "-" << std::setw(3) << (80 + i * 10) << " deg: "
+                  << std::setw(10) << global.max_dihedral_bins[i]
+                  << " (" << std::fixed << std::setprecision(2) << pct << "%)\n";
+    }
 }
 
 // Print mesh statistics on rank 0
@@ -3007,6 +3029,8 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
     local.min_quality = 1e30;
     for (int i = 0; i < NUM_QUALITY_BINS; ++i) local.quality_bins[i] = 0;
     for (int i = 0; i < NUM_DIHEDRAL_BINS; ++i) local.dihedral_bins[i] = 0;
+    for (int i = 0; i < NUM_MAX_DIHEDRAL_BINS; ++i) local.max_dihedral_bins[i] = 0;
+    local.below_5_deg_count = 0;
 
     // 3. Edge Orientation Statistics - use the pre-computed edge list
     std::vector<long> local_bins(NUM_ORIENTATION_BINS, 0);
@@ -3070,6 +3094,8 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
     MPI_Reduce(&local.min_quality, &global.min_quality, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
     MPI_Reduce(local.quality_bins, global.quality_bins, NUM_QUALITY_BINS, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(local.dihedral_bins, global.dihedral_bins, NUM_DIHEDRAL_BINS, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(local.max_dihedral_bins, global.max_dihedral_bins, NUM_MAX_DIHEDRAL_BINS, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local.below_5_deg_count, &global.below_5_deg_count, 1, MPI_LONG, MPI_SUM, 0, comm);
 
     std::vector<long> global_bins(NUM_ORIENTATION_BINS);
     MPI_Reduce(local_bins.data(), global_bins.data(), NUM_ORIENTATION_BINS, MPI_LONG, MPI_SUM, 0, comm);
