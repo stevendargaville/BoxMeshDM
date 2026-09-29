@@ -440,11 +440,17 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point<DIM> >& po
 
 // ~~~~~~~~~~~~~~~~~
 
-// Kept out of line: the callers then add the (possibly zeroed) move to the point as a
-// separate multiply and add, as the original 2D code compiled. Inlined, the compiler can
-// contract "candidate += factor * full_move" into an FMA, which changes the mesh in FMA builds
+// Kept out of line on purpose. GCC called the original 2D version of apply_boundary_constraint
+// out of line at -O1/-O2/-Os, so the (possibly zeroed) move was added to the point as a separate
+// multiply and add. Inlined (as GCC -O3 inlines the original), the compiler may contract
+// "candidate += factor * move" into an FMA. With this attribute the mesh equals the original's
+// in every non-FMA build and at -O1/-O2/-Os with FMA; at -O3 with FMA it equals the original
+// compiled with this function not inlined (the original's own FMA output differed between -O2
+// and -O3)
 #if defined(__GNUC__)
 #define BOXMESHDM_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define BOXMESHDM_NOINLINE __declspec(noinline)
 #else
 #define BOXMESHDM_NOINLINE
 #endif
@@ -658,13 +664,15 @@ static void apply_jitter(std::vector<Point<DIM> >& points, double amount, int se
 
 // ~~~~~~~~~~~~~~~~~
 
-// Delaunay triangulation of the points, returned in the order the backend produces them
+// Delaunay triangulation of the points, returned in the order the backend produces them.
+// comm is the generator's communicator, which a backend failure stops
 template <int DIM>
-static std::vector<Simplex<DIM> > triangulation(const std::vector<Point<DIM> >& points);
+static std::vector<Simplex<DIM> > triangulation(MPI_Comm comm, const std::vector<Point<DIM> >& points);
 
 // Wrapper for Triangle library - https://www.cs.cmu.edu/~quake/triangle.html
 template <>
-std::vector<Simplex<2> > triangulation<2>(const std::vector<Point<2> >& points) {
+std::vector<Simplex<2> > triangulation<2>(MPI_Comm comm, const std::vector<Point<2> >& points) {
+    (void)comm;
     struct triangulateio in;
     struct triangulateio out;
 
@@ -711,7 +719,7 @@ std::vector<Simplex<2> > triangulation<2>(const std::vector<Point<2> >& points) 
 // (the Lloyd badness and the integrity check rely on it) until CreateDM, which permutes the
 // vertices into PETSc's orientation
 template <>
-std::vector<Simplex<3> > triangulation<3>(const std::vector<Point<3> >& points) {
+std::vector<Simplex<3> > triangulation<3>(MPI_Comm comm, const std::vector<Point<3> >& points) {
     std::vector<double> xyz(3 * points.size());
     for (size_t i = 0; i < points.size(); ++i) {
         xyz[3 * i] = points[i].c[0];
@@ -719,9 +727,8 @@ std::vector<Simplex<3> > triangulation<3>(const std::vector<Point<3> >& points) 
         xyz[3 * i + 2] = points[i].c[2];
     }
 
-    // The generator does not pass its communicator down here, stop every rank on failure
     std::vector<int> tet_list;
-    int num_tets = BoxMeshDM_Delaunay3D(MPI_COMM_WORLD, (int)points.size(), xyz.data(), tet_list);
+    int num_tets = BoxMeshDM_Delaunay3D(comm, (int)points.size(), xyz.data(), tet_list);
     std::vector<double>().swap(xyz);
 
     std::vector<Simplex<3> > tets;
@@ -1087,8 +1094,11 @@ static void relax_points_spring(std::vector<Point<DIM> >& points, const std::vec
             int idx1 = t.v[edges[i][0]];
             int idx2 = t.v[edges[i][1]];
 
+            // The per-axis loops below are StaticFor, not rolled loops, so they compile as the
+            // original x/y code did (and contract into the same FMAs in FMA builds)
             double d[DIM];
-            for (int a = 0; a < DIM; ++a) d[a] = points[idx2].c[a] - points[idx1].c[a];
+            auto edge_axis = [&](int a) { d[a] = points[idx2].c[a] - points[idx1].c[a]; };
+            StaticFor<DIM>::run(edge_axis);
             double dist = std::sqrt(dist_sq<DIM>(d));
 
             if (dist < 1e-14) continue;
@@ -1102,17 +1112,20 @@ static void relax_points_spring(std::vector<Point<DIM> >& points, const std::vec
 
             // Normalize direction
             double f[DIM];
-            for (int a = 0; a < DIM; ++a) {
+            auto force_axis = [&](int a) {
                 double na = d[a] / dist;
                 f[a] = force_mag * na;
-            }
+            };
+            StaticFor<DIM>::run(force_axis);
 
             // Apply to idx1
-            for (int a = 0; a < DIM; ++a) force[a][idx1] += f[a];
+            auto apply_idx1 = [&](int a) { force[a][idx1] += f[a]; };
+            StaticFor<DIM>::run(apply_idx1);
             valence[idx1]++;
 
             // Apply opposite to idx2
-            for (int a = 0; a < DIM; ++a) force[a][idx2] -= f[a];
+            auto apply_idx2 = [&](int a) { force[a][idx2] -= f[a]; };
+            StaticFor<DIM>::run(apply_idx2);
             valence[idx2]++;
         }
     }
@@ -1381,6 +1394,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
 
         // Range of wall point indices along the free axes, a single position on the fixed ones
         int lo[DIM], hi[DIM], idx[DIM];
+        bool wall_empty = false;
         for (int d = 0; d < DIM; ++d) {
             if (features[f][d] == AXIS_FREE) {
                 lo[d] = floor(search_min[d] / wall_d[d]);
@@ -1388,9 +1402,10 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
             } else {
                 lo[d] = 0; hi[d] = 0;
             }
+            if (lo[d] > hi[d]) wall_empty = true;
             idx[d] = lo[d];
         }
-        do {
+        if (!wall_empty) do {
             double x[DIM];
             int grid_idx[DIM];
             bool keep = true;
@@ -1506,7 +1521,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
     // Jitter + triangulate + smooth loop
     for (int iter = 0; iter < ANNEAL_ITERS; ++iter) {
         apply_jitter(points_with_halos, current_jitter, iter);
-        triangles_with_halos = triangulation<DIM>(points_with_halos);
+        triangles_with_halos = triangulation<DIM>(comm, points_with_halos);
         relax_points_lloyd(points_with_halos, triangles_with_halos, s_min, s_max);
         relax_points_spring(points_with_halos, triangles_with_halos, s_min, s_max);
 
@@ -1516,7 +1531,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
     }
     // Final smooth iterations without jitter
     for(int k=0; k<final_smooth_its; ++k) {
-        triangles_with_halos = triangulation<DIM>(points_with_halos);
+        triangles_with_halos = triangulation<DIM>(comm, points_with_halos);
         relax_points_lloyd(points_with_halos, triangles_with_halos, s_min, s_max);
         relax_points_spring(points_with_halos, triangles_with_halos, s_min, s_max);
 
@@ -1525,7 +1540,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
     }
 
     // Final mesh
-    triangles_with_halos = triangulation<DIM>(points_with_halos);
+    triangles_with_halos = triangulation<DIM>(comm, points_with_halos);
 
     // Resolve ownership before filtering
     ResolveBoundaryOwnership(comm, points_with_halos, s_min, s_max, interior_min, interior_max, pad);
