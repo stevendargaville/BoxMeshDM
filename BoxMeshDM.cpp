@@ -1,4 +1,5 @@
 #include "BoxMeshDM.h"
+#include "BoxMeshDM_tetgen.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -23,12 +24,12 @@
 #include <triangle.h>
 
 // =========================================================
-// Unstructured mesh generator for 2D box
-// Builds a PETSc DMPlex
+// Unstructured mesh generator for a 2D or 3D box
+// Builds a PETSc DMPlex of triangles (2D, Triangle) or tetrahedra (3D, TetGen)
 // =========================================================
 //
 // Strategy:
-// 1. Boundary Gen: Create points explicitly on [0,DOMAIN_SIZE[0]] x [0,DOMAIN_SIZE[1]] boundaries.
+// 1. Boundary Gen: Create points explicitly on the [0,DOMAIN_SIZE[0]] x [0,DOMAIN_SIZE[1]] (x [0,DOMAIN_SIZE[2]]) boundaries.
 // 2. Interior Gen: Create random points inside small squares, REJECTING those near boundaries.
 // 3. Iterate: jitter -> triangulate -> smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
@@ -36,10 +37,10 @@
 // Structure: the pipeline is written once as templates on the dimension DIM. Everything that
 // depends on the dimension (the Delaunay backend, the hash id layout, the simplex kernels, the
 // boundary feature and wall tables, the rank grid factorisation, the integrity/stats formulas)
-// is an explicit specialisation, never a branch on DIM inside a template body. Only DIM=2 is
-// reachable; the DIM=3 specialisations are stubs that abort, so the generic code is checked to
-// compile for 3D. For DIM=2 every floating-point expression is the same as the original 2D
-// code, token for token and in the same order, so the generated mesh is bit-identical.
+// is an explicit specialisation, never a branch on DIM inside a template body. For DIM=2 every
+// floating-point expression is the same as the original 2D code, token for token and in the
+// same order, so the generated mesh is bit-identical. The DIM=3 specialisations call TetGen
+// through BoxMeshDM_tetgen.cpp, the only file that includes tetgen.h.
 // =========================================================
 
 // Axis-indexed globals, [0]=x, [1]=y, [2]=z. Only the first DIM entries are used.
@@ -97,13 +98,6 @@ struct Edge {
 struct RngState { uint64_t s; };
 
 // ~~~~~~~~~~~~~~~~~
-
-// Stops the run in a DIM=3 specialisation that is not written yet. None of these are
-// reachable: GenerateBoxMeshDMImpl<3> is only instantiated, never called
-static void AbortNotImplemented3D(const char *what) {
-    std::cerr << "ERROR: " << what << " is not implemented in 3D yet.\n";
-    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-}
 
 // Steps idx through the box [lo, hi] (inclusive) with axis 0 fastest. Returns false once
 // every index has been visited, so "do { ... } while (next_index<DIM>(idx, lo, hi))" visits
@@ -566,6 +560,27 @@ Point<2> create_point_with_unique_hash_id<2>(const double *x, const int *idx, in
     return Point<2>(x, id);
 }
 
+// 3D: [type:1 @63][ix:21 @42][iy:21 @21][iz:21 @0]. The far (right/back/top) walls use index
+// FAR_GRID_IDX_3D = 2^21-1, and validate_inputs<3> keeps every other index below it.
+// Negative indices (halo cells below the domain) would alias large positive ones under the
+// 21-bit mask, but no point with a negative index is ever kept: an interior candidate in a cell
+// with a negative index lies below 0 on that axis and always fails the wall exclusion test, and
+// a boundary lattice point with a free-axis index <= 0 lies on or below the low wall and fails
+// the "> EPSILON" test. So every kept point has indices in [0, 2^21-1] and the id is unique
+// within a type. Boundary points (type 1) are all lattice points of the wall spacing, so their id
+// is a function of position: a corner, edge or face point is found at the same indices by every
+// rank that generates it.
+const int FAR_GRID_IDX_3D = 2097151;
+
+template <>
+Point<3> create_point_with_unique_hash_id<3>(const double *x, const int *idx, int type) {
+    uint64_t id = ((uint64_t)(type & 0x1) << 63) |
+                  ((uint64_t)(idx[0] & 0x1FFFFF) << 42) |
+                  ((uint64_t)(idx[1] & 0x1FFFFF) << 21) |
+                  ((uint64_t)(idx[2] & 0x1FFFFF));
+    return Point<3>(x, id);
+}
+
 // Grid index used for the far (right/top) walls in the unique hash id
 template <int DIM>
 static int far_wall_grid_index();
@@ -573,6 +588,11 @@ static int far_wall_grid_index();
 template <>
 int far_wall_grid_index<2>() {
     return MAX_GRID_IDX;
+}
+
+template <>
+int far_wall_grid_index<3>() {
+    return FAR_GRID_IDX_3D;
 }
 
 // Seed for the placement of the interior point of grid cell idx
@@ -585,6 +605,16 @@ uint64_t interior_seed<2>(const int *idx) {
     // FIX: Use bit-packing to guarantee unique seed for every (ix, iy) pair.
     // Previous hash_combine method had collisions for certain integer pairs.
     uint64_t h = ((uint64_t)(uint32_t)ix << 32) | (uint32_t)iy;
+    h = splitmix64(h);
+    return h;
+}
+
+template <>
+uint64_t interior_seed<3>(const int *idx) {
+    // The three 21-bit indices packed as in an interior (type 0) hash id, unique per cell
+    uint64_t h = ((uint64_t)(idx[0] & 0x1FFFFF) << 42) |
+                 ((uint64_t)(idx[1] & 0x1FFFFF) << 21) |
+                 ((uint64_t)(idx[2] & 0x1FFFFF));
     h = splitmix64(h);
     return h;
 }
@@ -675,6 +705,60 @@ std::vector<Simplex<2> > triangulation<2>(const std::vector<Point<2> >& points) 
     return triangles;
 }
 
+// TetGen, through BoxMeshDM_tetgen.cpp. The tetrahedra keep TetGen's vertex order, in which
+// every tetrahedron is positively oriented in the right-hand sense ((p1-p0).((p2-p0)x(p3-p0)) > 0,
+// checked with an exact predicate in the backend). The rest of the pipeline keeps that order
+// (the Lloyd badness and the integrity check rely on it) until CreateDM, which permutes the
+// vertices into PETSc's orientation
+template <>
+std::vector<Simplex<3> > triangulation<3>(const std::vector<Point<3> >& points) {
+    std::vector<double> xyz(3 * points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+        xyz[3 * i] = points[i].c[0];
+        xyz[3 * i + 1] = points[i].c[1];
+        xyz[3 * i + 2] = points[i].c[2];
+    }
+
+    // The generator does not pass its communicator down here, stop every rank on failure
+    std::vector<int> tet_list;
+    int num_tets = BoxMeshDM_Delaunay3D(MPI_COMM_WORLD, (int)points.size(), xyz.data(), tet_list);
+    std::vector<double>().swap(xyz);
+
+    std::vector<Simplex<3> > tets;
+    tets.reserve(num_tets);
+    for (int i = 0; i < num_tets; ++i) {
+        Simplex<3> t;
+        for (int a = 0; a < 4; ++a) t.v[a] = tet_list[4 * (size_t)i + a];
+        tets.push_back(t);
+    }
+    return tets;
+}
+
+// ~~~~~~~~~~~~~~~~~
+
+// Put the generated points into the order they are handed to the Delaunay backend (and
+// smoothed in). Called once, straight after the points are generated.
+template <int DIM>
+static void order_points_for_delaunay(std::vector<Point<DIM> >& points);
+
+// 2D: generation order, unchanged
+template <>
+inline void order_points_for_delaunay<2>(std::vector<Point<2> >& points) {
+    (void)points;
+}
+
+// 3D: sort by unique hash id (ids are unique, so the order is total). When the points are
+// cospherical TetGen resolves the tie by input index, and each rank generates a different set
+// of points in a different order. Sorting by id gives the points a rank-independent relative
+// order, so any such tie is resolved the same way on every rank holding the neighbourhood.
+// (TetGen's own randomised insertion order still differs per rank, but the Delaunay
+// tetrahedralisation of points in general position does not depend on it.)
+template <>
+void order_points_for_delaunay<3>(std::vector<Point<3> >& points) {
+    std::sort(points.begin(), points.end(),
+              [](const Point<3>& a, const Point<3>& b) { return a.unique_hash_id < b.unique_hash_id; });
+}
+
 // ~~~~~~~~~~~~~~~~~
 
 // Helper: Calculate minimum angle (degrees) of a triangle
@@ -716,6 +800,25 @@ double simplex_volume<2>(const Point<2> *const *p) {
     return 0.5 * std::abs((p1.c[0] - p0.c[0])*(p2.c[1] - p0.c[1]) - (p1.c[1] - p0.c[1])*(p2.c[0] - p0.c[0]));
 }
 
+// Signed 6x volume of the tetrahedron (a, b, c, d): (b-a).((c-a)x(d-a)), positive for the
+// right-hand orientation TetGen produces
+static inline double tet_det(const double *a, const double *b, const double *c, const double *d) {
+    double e1[3], e2[3], e3[3];
+    for (int k = 0; k < 3; ++k) {
+        e1[k] = b[k] - a[k];
+        e2[k] = c[k] - a[k];
+        e3[k] = d[k] - a[k];
+    }
+    return e1[0] * (e2[1] * e3[2] - e2[2] * e3[1])
+         - e1[1] * (e2[0] * e3[2] - e2[2] * e3[0])
+         + e1[2] * (e2[0] * e3[1] - e2[1] * e3[0]);
+}
+
+template <>
+double simplex_volume<3>(const Point<3> *const *p) {
+    return std::abs(tet_det(p[0]->c, p[1]->c, p[2]->c, p[3]->c)) / 6.0;
+}
+
 // Centroid
 template <int DIM>
 static void simplex_centroid(const Point<DIM> *const *p, double *centroid);
@@ -729,6 +832,13 @@ void simplex_centroid<2>(const Point<2> *const *p, double *centroid) {
     centroid[1] = (p0.c[1] + p1.c[1] + p2.c[1]) / 3.0;
 }
 
+template <>
+void simplex_centroid<3>(const Point<3> *const *p, double *centroid) {
+    for (int d = 0; d < 3; ++d) {
+        centroid[d] = (p[0]->c[d] + p[1]->c[d] + p[2]->c[d] + p[3]->c[d]) / 4.0;
+    }
+}
+
 // Squared length of the vector d
 template <int DIM>
 static double dist_sq(const double *d);
@@ -737,6 +847,12 @@ template <>
 double dist_sq<2>(const double *d) {
     double dx = d[0], dy = d[1];
     return dx*dx + dy*dy;
+}
+
+template <>
+double dist_sq<3>(const double *d) {
+    double dx = d[0], dy = d[1], dz = d[2];
+    return dx*dx + dy*dy + dz*dz;
 }
 
 // Lloyd's quality measure of simplex tri of the star of point i, lower is better, with p
@@ -755,6 +871,47 @@ inline double star_simplex_badness<2>(const Point<2>& p, int i, const Simplex<2>
     return get_max_cosine_tri(p, p1, p2);
 }
 
+// Mean-ratio quality of a tetrahedron cubed, eta^3 = 15552 V^2 / (sum of squared edge lengths)^3,
+// which is 1 for a regular tetrahedron and tends to 0 for a flat one (root free). q holds the
+// four vertices in stored (positive) order. Coordinate differences are divided by
+// TARGET_EDGE_LENGTH first, so (sum l^2)^3 can neither underflow nor overflow at any scale.
+// Sets det to the signed normalised 6x volume and returns -1 (and det <= 1e-12) for an inverted,
+// flat or collapsed tetrahedron
+static double tet_quality_eta3(const double *const *q, double& det) {
+    double e[4][3];
+    for (int a = 0; a < 4; ++a) {
+        for (int k = 0; k < 3; ++k) e[a][k] = (q[a][k] - q[0][k]) / TARGET_EDGE_LENGTH;
+    }
+    det = tet_det(e[0], e[1], e[2], e[3]);
+
+    double sum_l_sq = 0.0;
+    for (int a = 0; a < 4; ++a) {
+        for (int b = a + 1; b < 4; ++b) {
+            double d[3] = {e[b][0] - e[a][0], e[b][1] - e[a][1], e[b][2] - e[a][2]};
+            sum_l_sq += dist_sq<3>(d);
+        }
+    }
+    if (sum_l_sq < 1e-16 || det <= 1e-12) return -1.0;
+
+    double volume = det / 6.0;
+    return 15552.0 * volume * volume / (sum_l_sq * sum_l_sq * sum_l_sq);
+}
+
+// 3D: -eta^3 of the tetrahedron with vertex i replaced by p, keeping the stored (positive)
+// vertex order so an inversion shows up as a non-positive determinant. An inverted or flat
+// tetrahedron gets the finite sentinel 1e300 (worse than any real value, and never inf so it is
+// -fp_trap clean). This is only a quality heuristic for choosing the Lloyd step: inversions never
+// reach the output, because every iteration re-triangulates the moved points
+template <>
+double star_simplex_badness<3>(const Point<3>& p, int i, const Simplex<3>& tri, const std::vector<Point<3> >& points) {
+    const double *q[4];
+    for (int a = 0; a < 4; ++a) q[a] = (tri.v[a] == i) ? p.c : points[tri.v[a]].c;
+    double det;
+    double eta3 = tet_quality_eta3(q, det);
+    if (eta3 < 0.0) return 1e300;
+    return -eta3;
+}
+
 // The edges of a simplex as pairs of local vertex numbers, in the order the spring
 // relaxation visits them. Returns the number of edges
 template <int DIM>
@@ -765,6 +922,13 @@ int get_simplex_edges<2>(const int (*&edges)[2]) {
     static const int table[3][2] = {{0, 1}, {1, 2}, {2, 0}};
     edges = table;
     return 3;
+}
+
+template <>
+int get_simplex_edges<3>(const int (*&edges)[2]) {
+    static const int table[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
+    edges = table;
+    return 6;
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -1098,6 +1262,33 @@ int get_boundary_features<2>(const int (*&features)[2]) {
     return 8;
 }
 
+// 3D: the 8 corners, then the 12 edges, then the 6 faces. Along a free axis the generator only
+// keeps lattice points strictly inside (EPSILON, SIZE - EPSILON), so an edge never repeats its
+// corners and a face never repeats its edges or corners: every boundary lattice point is
+// generated by exactly one feature
+template <>
+int get_boundary_features<3>(const int (*&features)[3]) {
+    static const int table[26][3] = {
+        // 1. Corners, x fastest
+        {AXIS_LOW, AXIS_LOW, AXIS_LOW}, {AXIS_HIGH, AXIS_LOW, AXIS_LOW},
+        {AXIS_LOW, AXIS_HIGH, AXIS_LOW}, {AXIS_HIGH, AXIS_HIGH, AXIS_LOW},
+        {AXIS_LOW, AXIS_LOW, AXIS_HIGH}, {AXIS_HIGH, AXIS_LOW, AXIS_HIGH},
+        {AXIS_LOW, AXIS_HIGH, AXIS_HIGH}, {AXIS_HIGH, AXIS_HIGH, AXIS_HIGH},
+        // 2. Edges along x, then along y, then along z
+        {AXIS_FREE, AXIS_LOW, AXIS_LOW}, {AXIS_FREE, AXIS_HIGH, AXIS_LOW},
+        {AXIS_FREE, AXIS_LOW, AXIS_HIGH}, {AXIS_FREE, AXIS_HIGH, AXIS_HIGH},
+        {AXIS_LOW, AXIS_FREE, AXIS_LOW}, {AXIS_HIGH, AXIS_FREE, AXIS_LOW},
+        {AXIS_LOW, AXIS_FREE, AXIS_HIGH}, {AXIS_HIGH, AXIS_FREE, AXIS_HIGH},
+        {AXIS_LOW, AXIS_LOW, AXIS_FREE}, {AXIS_HIGH, AXIS_LOW, AXIS_FREE},
+        {AXIS_LOW, AXIS_HIGH, AXIS_FREE}, {AXIS_HIGH, AXIS_HIGH, AXIS_FREE},
+        // 3. Faces: x=0, x=DOMAIN_SIZE[0], y=0, y=DOMAIN_SIZE[1], z=0, z=DOMAIN_SIZE[2]
+        {AXIS_LOW, AXIS_FREE, AXIS_FREE}, {AXIS_HIGH, AXIS_FREE, AXIS_FREE},
+        {AXIS_FREE, AXIS_LOW, AXIS_FREE}, {AXIS_FREE, AXIS_HIGH, AXIS_FREE},
+        {AXIS_FREE, AXIS_FREE, AXIS_LOW}, {AXIS_FREE, AXIS_FREE, AXIS_HIGH}};
+    features = table;
+    return 26;
+}
+
 // Builds a tile, creates points and triangulates
 template <int DIM>
 static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
@@ -1283,6 +1474,9 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
     // Remove any accidental duplicates (e.g. from corner/edge overlaps or precision issues)
     // remove_duplicates(points_with_halos);
 
+    // The order the points go to the Delaunay backend in (a no-op in 2D)
+    order_points_for_delaunay<DIM>(points_with_halos);
+
     // 4. ITERATIONS
     // We relax all points that are strictly inside the generated cloud.
     // The outer hull acts as a fixed boundary condition.
@@ -1396,6 +1590,27 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
 }
 
 // ~~~~~~~~~~~~~~~~~
+
+// The order the vertices of a simplex are passed to PETSc in: cell vertex k is simplex vertex
+// order[k]. Returns an array of DIM+1 local vertex numbers
+template <int DIM>
+static const int *dm_cell_vertex_order();
+
+// 2D: Triangle's counter-clockwise triangles already match PETSc's reference triangle
+template <>
+inline const int *dm_cell_vertex_order<2>() {
+    static const int order[3] = {0, 1, 2};
+    return order;
+}
+
+// 3D: PETSc's reference tetrahedron is the mirror image of TetGen's (its (p1-p0).((p2-p0)x(p3-p0))
+// is negative), so swap vertices 0 and 1 of every tetrahedron, unconditionally, exactly as
+// PETSc's own TetGen interface does (DMPlexInvertCells_Tetgen in tetgenerate.cxx)
+template <>
+const int *dm_cell_vertex_order<3>() {
+    static const int order[4] = {1, 0, 2, 3};
+    return order;
+}
 
 // Return a PETSc DM for the points and triangles passed in
 template <int DIM>
@@ -1575,10 +1790,11 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point<DIM> >& points_on_owne
     // 5. Build DMPlex
     PetscInt num_tris_owned = triangles_owned.size();
     std::vector<PetscInt> cells(num_tris_owned * (DIM + 1));
-    // Global ids for all points on owned triangles
+    // Global ids for all points on owned triangles, in PETSc's orientation
+    const int *cell_vertex_order = dm_cell_vertex_order<DIM>();
     for(int i=0; i<num_tris_owned; ++i) {
         for (int k = 0; k <= DIM; ++k) {
-            cells[i*(DIM + 1) + k] = global_ids[triangles_owned[i].v[k]];
+            cells[i*(DIM + 1) + k] = global_ids[triangles_owned[i].v[cell_vertex_order[k]]];
         }
     }
     global_ids.clear();
@@ -1649,8 +1865,13 @@ PetscInt num_walls<2>() {
     return 4;
 }
 
+template <>
+PetscInt num_walls<3>() {
+    return 6;
+}
+
 // Label value of the wall a point lies on (0 if none)
-// Values: 1=Bottom, 2=Right, 3=Top, 4=Left
+// Values in 2D: 1=Bottom, 2=Right, 3=Top, 4=Left (3D: see on_wall_3d)
 template <int DIM>
 static PetscInt classify_point_wall(const double *xy, const double *domain_size);
 
@@ -1668,6 +1889,29 @@ PetscInt classify_point_wall<2>(const double *xy, const double *domain_size) {
     else if (std::abs(y - domain_height) < EPSILON) val = 3; // Top
     else if (std::abs(x) < EPSILON) val = 4;         // Left
     return val;
+}
+
+// 3D walls, in priority order, with PETSc's DMPlexCreateBoxMesh label values:
+// 1=Bottom (z=0), 2=Top (z=D), 3=Front (y=0), 4=Back (y=H), 5=Right (x=W), 6=Left (x=0)
+static bool on_wall_3d(const double *xyz, const double *domain_size, PetscInt wall) {
+    switch (wall) {
+        case 1: return std::abs(xyz[2]) < EPSILON;
+        case 2: return std::abs(xyz[2] - domain_size[2]) < EPSILON;
+        case 3: return std::abs(xyz[1]) < EPSILON;
+        case 4: return std::abs(xyz[1] - domain_size[1]) < EPSILON;
+        case 5: return std::abs(xyz[0] - domain_size[0]) < EPSILON;
+        case 6: return std::abs(xyz[0]) < EPSILON;
+        default: return false;
+    }
+}
+
+// Priority for edges/corners: Bottom > Top > Front > Back > Right > Left
+template <>
+PetscInt classify_point_wall<3>(const double *xyz, const double *domain_size) {
+    for (PetscInt w = 1; w <= 6; ++w) {
+        if (on_wall_3d(xyz, domain_size, w)) return w;
+    }
+    return 0;
 }
 
 // Label value of the wall a facet (height 1 point) lies on (0 if none)
@@ -1711,12 +1955,48 @@ PetscErrorCode facet_wall_value<2>(DM dm, PetscInt e, PetscSection coordSection,
     PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+// 3D: a face's cone is its edges, which carry no coordinates, so take the vertices from the
+// face's transitive closure. The face is on wall w if every one of its vertices is (walls tried
+// in priority order). Boundary vertices are snapped exactly onto their walls, so this is exact;
+// a centroid test would not be, as (W+W+W)/3 need not round back to W
+template <>
+PetscErrorCode facet_wall_value<3>(DM dm, PetscInt e, PetscSection coordSection, const PetscScalar *coords,
+                                   const double *domain_size, PetscInt *val) {
+    PetscInt vStart, vEnd, closure_size;
+    PetscInt *closure = NULL;
+    double xyz[3][3];
+    int count = 0;
+    PetscFunctionBeginUser;
+    PetscCall(DMPlexGetDepthStratum(dm, 0, &vStart, &vEnd));
+    PetscCall(DMPlexGetTransitiveClosure(dm, e, PETSC_TRUE, &closure_size, &closure));
+    for (PetscInt i = 0; i < closure_size; ++i) {
+        PetscInt v = closure[2 * i];
+        if (v < vStart || v >= vEnd) continue;
+        PetscInt off, dof;
+        PetscCall(PetscSectionGetDof(coordSection, v, &dof));
+        if (dof > 0 && count < 3) {
+            PetscCall(PetscSectionGetOffset(coordSection, v, &off));
+            for (int d = 0; d < 3; ++d) xyz[count][d] = PetscRealPart(coords[off + d]);
+            count++;
+        }
+    }
+    PetscCall(DMPlexRestoreTransitiveClosure(dm, e, PETSC_TRUE, &closure_size, &closure));
+
+    *val = 0;
+    if (count == 3) {
+        for (PetscInt w = 1; w <= 6 && *val == 0; ++w) {
+            if (on_wall_3d(xyz[0], domain_size, w) && on_wall_3d(xyz[1], domain_size, w) && on_wall_3d(xyz[2], domain_size, w)) *val = w;
+        }
+    }
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 // Label boundary faces and vertices based on geometric location
 template <int DIM>
 static void LabelBoundaries(DM dm, const double *domain_size) {
 
     // Create or get "Face Sets" label (standard name for boundary markers)
-    // Values: 1=Bottom, 2=Right, 3=Top, 4=Left
+    // Values: 1..num_walls, see classify_point_wall
     DMLabel label;
     PetscCallVoid(DMGetLabel(dm, "Face Sets", &label));
     if (!label) {
@@ -1961,12 +2241,14 @@ static long CheckGhostCoordinates(MPI_Comm comm, const std::vector<Point<DIM> >&
 
 // Local (and then global) sums/maxima gathered by CheckMeshIntegrity
 struct IntegrityAccum {
-    double total_volume;        // area in 2D
-    double boundary_measure;    // boundary length in 2D
-    long boundary_facet_count;  // boundary edges in 2D
+    double total_volume;        // area in 2D, signed volume in 3D
+    double boundary_measure;    // boundary length in 2D, boundary surface area in 3D
+    long boundary_facet_count;  // boundary edges in 2D, boundary faces in 3D
     long bad_edge_count;
     double max_edge_len;
-    double max_badness;         // largest cosine of any triangle angle in 2D, i.e. the smallest angle
+    double max_badness;         // largest cosine of any triangle angle in 2D, i.e. the smallest angle;
+                                // -(smallest eta^3) in 3D
+    long nonpositive_count;     // 3D only: tetrahedra with signed volume <= 0 (always 0 in 2D)
     int bad_print_count;
 };
 
@@ -2036,6 +2318,76 @@ void integrity_accumulate_simplex<2>(const Point<2> *const *p, int rank, int siz
     }
 }
 
+// 3D: signed volume in the stored (TetGen, positive) order, boundary faces (all three vertices on
+// one wall) and their area, edges longer than MAX_EDGE_RATIO x target and the smallest eta^3
+template <>
+void integrity_accumulate_simplex<3>(const Point<3> *const *p, int rank, int size, IntegrityAccum& acc) {
+    const double THRESHOLD_LEN = TARGET_EDGE_LENGTH * MAX_EDGE_RATIO;
+
+    // Edge lengths
+    const int (*edges)[2];
+    const int num_edges = get_simplex_edges<3>(edges);
+    double max_len = 0.0;
+    for (int k = 0; k < num_edges; ++k) {
+        double d[3];
+        for (int a = 0; a < 3; ++a) d[a] = p[edges[k][1]]->c[a] - p[edges[k][0]]->c[a];
+        max_len = std::max(max_len, std::sqrt(dist_sq<3>(d)));
+    }
+    acc.max_edge_len = std::max(acc.max_edge_len, max_len);
+
+    if (max_len > THRESHOLD_LEN) {
+        acc.bad_edge_count++;
+        if (acc.bad_print_count < MAX_BAD_PRINTS) {
+            std::cout << "[Rank " << rank << "] BAD TETRAHEDRON: Edge len "
+                      << max_len << " vs target " << TARGET_EDGE_LENGTH << "\n";
+            for (int a = 0; a < 4; ++a) {
+                std::cout << "   P" << a << ": (";
+                print_coords<3>(std::cout, p[a]->c);
+                std::cout << ") Owner: " << get_owner_rank(*p[a], size) << " ID: " << p[a]->unique_hash_id << "\n";
+            }
+            acc.bad_print_count++;
+        }
+    }
+
+    // Signed volume and quality
+    double det = tet_det(p[0]->c, p[1]->c, p[2]->c, p[3]->c);
+    acc.total_volume += det / 6.0;
+    const double *q[4] = {p[0]->c, p[1]->c, p[2]->c, p[3]->c};
+    double det_normalised;
+    double eta3 = tet_quality_eta3(q, det_normalised);
+    if (!(det > 0.0)) {
+        acc.nonpositive_count++;
+        eta3 = 0.0;
+    } else if (eta3 < 0.0) {
+        // Positive but below the normalised flatness threshold
+        eta3 = 0.0;
+    }
+    acc.max_badness = std::max(acc.max_badness, -eta3);
+
+    // Boundary faces: the face opposite vertex k is on a wall if all three of its vertices are
+    for (int k = 0; k < 4; ++k) {
+        const Point<3> *f[3];
+        int n = 0;
+        for (int a = 0; a < 4; ++a) {
+            if (a != k) f[n++] = p[a];
+        }
+        bool is_bdy = false;
+        for (PetscInt w = 1; w <= 6 && !is_bdy; ++w) {
+            if (on_wall_3d(f[0]->c, DOMAIN_SIZE, w) && on_wall_3d(f[1]->c, DOMAIN_SIZE, w) && on_wall_3d(f[2]->c, DOMAIN_SIZE, w)) is_bdy = true;
+        }
+        if (is_bdy) {
+            double u[3], v[3];
+            for (int a = 0; a < 3; ++a) {
+                u[a] = f[1]->c[a] - f[0]->c[a];
+                v[a] = f[2]->c[a] - f[0]->c[a];
+            }
+            double n_vec[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+            acc.boundary_measure += 0.5 * std::sqrt(dist_sq<3>(n_vec));
+            acc.boundary_facet_count++;
+        }
+    }
+}
+
 // On rank 0: test the reduced integrity measures (Euler characteristic, area, perimeter,
 // edge lengths, angles, ghost coordinates) and print any failures. Returns true on success
 template <int DIM>
@@ -2085,6 +2437,42 @@ bool evaluate_integrity<2>(long num_tris_owned_global, long num_points_owned_glo
             std::cout << "         Max Edge: " << global_max_edge_len << "\n";
         }
         if (!angle_pass) std::cout << "  [FAIL] Min Angle: " << global_min_angle << " deg (Expected >= " << MIN_ANGLE_DEG << " deg)\n";
+        if (!ghost_pass) std::cout << "  [FAIL] Ghost coordinates: " << global_ghost_mismatch_count << " mismatches\n";
+        std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+    }
+    return success;
+}
+
+// 3D: total signed volume, boundary surface area, no inverted or flat tetrahedra, edge lengths
+// and ghost coordinates. The minimum quality is not tested yet (a threshold is to be set from
+// measurements)
+// TODO: the Euler characteristic, V - E + F - C = 1, counted from the created DM (the 2D
+// pre-DM formula from boundary edge counts does not carry over to 3D)
+template <>
+bool evaluate_integrity<3>(long num_tris_owned_global, long num_points_owned_global,
+                           const IntegrityAccum& global, long global_ghost_mismatch_count) {
+    (void)num_tris_owned_global; (void)num_points_owned_global;
+    double expected_volume = DOMAIN_SIZE[0] * DOMAIN_SIZE[1] * DOMAIN_SIZE[2];
+    double expected_area = 2.0 * (DOMAIN_SIZE[0] * DOMAIN_SIZE[1] + DOMAIN_SIZE[0] * DOMAIN_SIZE[2] + DOMAIN_SIZE[1] * DOMAIN_SIZE[2]);
+
+    // Same relative tolerances as the 2D area and perimeter
+    bool volume_pass = std::abs(global.total_volume - expected_volume) < 1e-6 * expected_volume;
+    bool area_pass = std::abs(global.boundary_measure - expected_area) < 2.5e-5 * expected_area;
+    bool orientation_pass = (global.nonpositive_count == 0);
+    bool edge_pass = (global.bad_edge_count == 0);
+    bool ghost_pass = (global_ghost_mismatch_count == 0);
+
+    bool success = true;
+    if (!volume_pass || !area_pass || !orientation_pass || !edge_pass || !ghost_pass) {
+        success = false;
+        std::cout << "\n!!! MESH INTEGRITY CHECK FAILED !!!\n";
+        if (!volume_pass) std::cout << "  [FAIL] Total Volume: " << std::fixed << std::setprecision(6) << global.total_volume << " (Expected " << expected_volume << ")\n";
+        if (!area_pass) std::cout << "  [FAIL] Boundary Surface Area: " << global.boundary_measure << " (Expected " << expected_area << ")\n";
+        if (!orientation_pass) std::cout << "  [FAIL] Non-positive Tetrahedra: " << global.nonpositive_count << " (Expected 0)\n";
+        if (!edge_pass) {
+            std::cout << "  [FAIL] Bad Edges: " << global.bad_edge_count << " tetrahedra with edges > " << MAX_EDGE_RATIO << "x target.\n";
+            std::cout << "         Max Edge: " << global.max_edge_len << "\n";
+        }
         if (!ghost_pass) std::cout << "  [FAIL] Ghost coordinates: " << global_ghost_mismatch_count << " mismatches\n";
         std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
     }
@@ -2147,6 +2535,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     local.bad_edge_count = 0;
     local.max_edge_len = 0.0;
     local.max_badness = -1.0;
+    local.nonpositive_count = 0;
     local.bad_print_count = 0;
 
     for (const auto& t : triangles_owned) {
@@ -2171,6 +2560,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     MPI_Reduce(&local.boundary_measure, &global.boundary_measure, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
     MPI_Reduce(&local.boundary_facet_count, &global.boundary_facet_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local.bad_edge_count, &global.bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local.nonpositive_count, &global.nonpositive_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_ghost_mismatch_count, &global_ghost_mismatch_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local.max_edge_len, &global.max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     MPI_Reduce(&local.max_badness, &global.max_badness, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
@@ -2191,7 +2581,8 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
 // Local (and then global) minima/maxima of the simplex quality printed in the stats
 struct SimplexQuality {
     double min_volume, max_volume;
-    double min_angle, max_angle;   // degrees
+    double min_angle, max_angle;   // degrees; the dihedral angles in 3D
+    double min_quality;            // 3D only: smallest eta^3 (unused in 2D)
 };
 
 // Update q with one owned simplex (p in simplex order)
@@ -2228,6 +2619,60 @@ void stats_accumulate_simplex<2>(const Point<2> *const *p, SimplexQuality& q) {
     }
 }
 
+// 3D: volume, the six dihedral angles and eta^3
+template <>
+void stats_accumulate_simplex<3>(const Point<3> *const *p, SimplexQuality& q) {
+    double volume = simplex_volume<3>(p);
+    if (volume < q.min_volume) q.min_volume = volume;
+    if (volume > q.max_volume) q.max_volume = volume;
+
+    const double *c[4] = {p[0]->c, p[1]->c, p[2]->c, p[3]->c};
+    double det;
+    double eta3 = tet_quality_eta3(c, det);
+    if (eta3 < 0.0) eta3 = 0.0;
+    if (eta3 < q.min_quality) q.min_quality = eta3;
+
+    // Outward normal of the face opposite each vertex, in units of the target edge length
+    double e[4][3];
+    for (int a = 0; a < 4; ++a) {
+        for (int k = 0; k < 3; ++k) e[a][k] = (c[a][k] - c[0][k]) / TARGET_EDGE_LENGTH;
+    }
+    double n[4][3], n_sq[4];
+    for (int k = 0; k < 4; ++k) {
+        int f[3], m = 0;
+        for (int a = 0; a < 4; ++a) {
+            if (a != k) f[m++] = a;
+        }
+        double u[3], v[3], w[3];
+        for (int d = 0; d < 3; ++d) {
+            u[d] = e[f[1]][d] - e[f[0]][d];
+            v[d] = e[f[2]][d] - e[f[0]][d];
+            w[d] = e[k][d] - e[f[0]][d];
+        }
+        n[k][0] = u[1] * v[2] - u[2] * v[1];
+        n[k][1] = u[2] * v[0] - u[0] * v[2];
+        n[k][2] = u[0] * v[1] - u[1] * v[0];
+        // Point it away from the opposite vertex
+        if (n[k][0] * w[0] + n[k][1] * w[1] + n[k][2] * w[2] > 0.0) {
+            for (int d = 0; d < 3; ++d) n[k][d] = -n[k][d];
+        }
+        n_sq[k] = dist_sq<3>(n[k]);
+    }
+
+    // The dihedral angle along the edge shared by the faces opposite k and l is pi minus the
+    // angle between their outward normals
+    for (int k = 0; k < 4; ++k) {
+        for (int l = k + 1; l < 4; ++l) {
+            double norm_sq = n_sq[k] * n_sq[l];
+            if (!(norm_sq > 1e-60)) continue;
+            double cos_angle = -(n[k][0] * n[l][0] + n[k][1] * n[l][1] + n[k][2] * n[l][2]) / std::sqrt(norm_sq);
+            double angle = std::acos(clamp_val(cos_angle)) * 180.0 / 3.14159265358979323846;
+            q.min_angle = std::min(q.min_angle, angle);
+            q.max_angle = std::max(q.max_angle, angle);
+        }
+    }
+}
+
 // Orientation histogram bin (of NUM_ORIENTATION_BINS) of the edge vector d
 template <int DIM>
 static int edge_orientation_bin(const double *d);
@@ -2246,6 +2691,13 @@ int edge_orientation_bin<2>(const double *d) {
     if (bin < 0) bin = 0;
     if (bin >= 18) bin = 17;
     return bin;
+}
+
+// 3D: no orientation histogram
+template <>
+int edge_orientation_bin<3>(const double *d) {
+    (void)d;
+    return -1;
 }
 
 // On rank 0: print the simplex, edge length and edge orientation part of the stats
@@ -2285,6 +2737,26 @@ void print_simplex_stats<2>(long num_tris_owned_global, const SimplexQuality& gl
                       << " deg: " << std::fixed << std::setprecision(2) << pct << "%\n";
         }
     }
+}
+
+template <>
+void print_simplex_stats<3>(long num_tris_owned_global, const SimplexQuality& global,
+                            double global_total_edge_len, long global_edge_count,
+                            const std::vector<long>& global_bins) {
+    (void)global_bins;
+    std::cout << "Tetrahedra:\n";
+    std::cout << "  Total: " << num_tris_owned_global << "\n";
+    std::cout << "  Volume Min: " << std::scientific << global.min_volume << "\n";
+    std::cout << "  Volume Max: " << std::scientific << global.max_volume << "\n";
+
+    std::cout << std::defaultfloat << std::setprecision(16);
+    std::cout << "  Volume Ratio: " << (global.min_volume > 0 ? global.max_volume / global.min_volume : -1.0) << "\n";
+    std::cout << "  Dihedral Angle Min: " << global.min_angle << " deg\n";
+    std::cout << "  Dihedral Angle Max: " << global.max_angle << " deg\n";
+    std::cout << "  Mean Ratio^3 (eta^3) Min: " << global.min_quality << "\n";
+
+    // Print average edge length
+    std::cout << "  Avg Edge Len: " << (global_edge_count > 0 ? global_total_edge_len / global_edge_count : 0.0) << "\n";
 }
 
 // Print mesh statistics on rank 0
@@ -2332,6 +2804,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
     SimplexQuality local;
     local.min_volume = 1e30; local.max_volume = -1.0;
     local.min_angle = 360.0; local.max_angle = -1.0;
+    local.min_quality = 1e30;
 
     // 3. Edge Orientation Statistics - use the pre-computed edge list
     std::vector<long> local_bins(NUM_ORIENTATION_BINS, 0);
@@ -2368,13 +2841,16 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
             local_total_edge_len += len;
             local_edge_count++;
 
-            local_bins[edge_orientation_bin<DIM>(delta)]++;
+            // A negative bin means no orientation histogram (3D)
+            int bin = edge_orientation_bin<DIM>(delta);
+            if (bin >= 0) local_bins[bin]++;
         }
     }
 
     if (triangles_owned.empty()) {
         local.min_volume = 1e30; local.max_volume = -1.0;
         local.min_angle = 360.0; local.max_angle = -1.0;
+        local.min_quality = 1e30;
     }
 
     SimplexQuality global;
@@ -2389,6 +2865,7 @@ static void ComputeAndPrintStats(MPI_Comm comm, int final_smooth_its,
     MPI_Reduce(&local.max_volume, &global.max_volume, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     MPI_Reduce(&local.min_angle, &global.min_angle, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
     MPI_Reduce(&local.max_angle, &global.max_angle, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    MPI_Reduce(&local.min_quality, &global.min_quality, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
 
     std::vector<long> global_bins(NUM_ORIENTATION_BINS);
     MPI_Reduce(local_bins.data(), global_bins.data(), NUM_ORIENTATION_BINS, MPI_LONG, MPI_SUM, 0, comm);
@@ -2474,6 +2951,33 @@ void factorize_min_cut<2>(int n, const double *size, int *dims) {
     dims[1] = best_n;
 }
 
+// 3D: every mx x my x mz = n, minimising the total internal interface area
+// (mx-1) H D + (my-1) W D + (mz-1) W H. Ties go to the first found, with mx then my ascending
+template <>
+void factorize_min_cut<3>(int n, const double *size, int *dims) {
+    double W = size[0];
+    double H = size[1];
+    double D = size[2];
+
+    bool found = false;
+    double best_area = 0.0;
+    dims[0] = 1; dims[1] = 1; dims[2] = n;
+    for (int mx = 1; mx <= n; ++mx) {
+        if (n % mx != 0) continue;
+        int n_yz = n / mx;
+        for (int my = 1; my <= n_yz; ++my) {
+            if (n_yz % my != 0) continue;
+            int mz = n_yz / my;
+            double area = (mx - 1) * H * D + (my - 1) * W * D + (mz - 1) * W * H;
+            if (!found || area < best_area) {
+                found = true;
+                best_area = area;
+                dims[0] = mx; dims[1] = my; dims[2] = mz;
+            }
+        }
+    }
+}
+
 // ~~~~~~~~~~~~~~~~~
 
 // Check the target edge length, domain size and smoothing count, aborting on bad input
@@ -2516,6 +3020,53 @@ void validate_inputs<2>(MPI_Comm comm, double target_edge_length, const double *
     }
 }
 
+template <>
+void validate_inputs<3>(MPI_Comm comm, double target_edge_length, const double *size, int final_smooth_its) {
+    int comm_rank;
+    MPI_Comm_rank(comm, &comm_rank);
+    double domain_width = size[0];
+    double domain_height = size[1];
+    double domain_depth = size[2];
+
+    // Validate the inputs
+    if (!(target_edge_length > 0.0) || !std::isfinite(target_edge_length) ||
+        !(domain_width > 0.0) || !std::isfinite(domain_width) ||
+        !(domain_height > 0.0) || !std::isfinite(domain_height) ||
+        !(domain_depth > 0.0) || !std::isfinite(domain_depth) || final_smooth_its < 0) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Target edge length (" << target_edge_length << "), domain width (" << domain_width
+                      << "), domain height (" << domain_height << ") and domain depth (" << domain_depth
+                      << ") must be positive and finite, "
+                      << "and final smooth iterations (" << final_smooth_its << ") must be non-negative.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
+    // Every side must be at least 3 target edge lengths, or the interior points are all rejected
+    // by the wall exclusion zone and the box is only faces
+    if (domain_width < 3.0 * target_edge_length || domain_height < 3.0 * target_edge_length ||
+        domain_depth < 3.0 * target_edge_length) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Domain width (" << domain_width << "), height (" << domain_height << ") and depth ("
+                      << domain_depth << ") must each be at least 3 times the target edge length (" << target_edge_length << ").\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
+    // Ensure the grid indices fit in the 21 bits per axis of the 3D unique hash id, as in 2D
+    double max_grid_idx = std::max(domain_width, std::max(domain_height, domain_depth)) / target_edge_length
+                          + (ANNEAL_ITERS + final_smooth_its + 8) + 2;
+    if (max_grid_idx >= FAR_GRID_IDX_3D) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Target edge length " << target_edge_length
+                      << " is too small for the domain size, it needs grid indices up to " << max_grid_idx
+                      << ", beyond the limit of " << FAR_GRID_IDX_3D << " in the 21-bit index hashing scheme of 3D meshes.\n"
+                      << "Rewrite create_point_with_unique_hash_id to go further.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+}
+
 // Tolerance below which a point's star volume counts as degenerate
 template <int DIM>
 static double volume_tolerance();
@@ -2523,6 +3074,11 @@ static double volume_tolerance();
 template <>
 double volume_tolerance<2>() {
     return TOL_LEN_SQ * 1e-2;
+}
+
+template <>
+double volume_tolerance<3>() {
+    return TOL_LEN_SQ * TOL_LEN * 1e-2;
 }
 
 // On rank 0: the first lines of the stats header, describing the domain
@@ -2536,158 +3092,12 @@ void print_domain_header<2>() {
     std::cout << "Domain Width: " << DOMAIN_SIZE[0] << ", Domain Height: " << DOMAIN_SIZE[1] << "\n";
 }
 
-// ~~~~~~~~~~~~~~~~~
-
-// DIM=3 stubs. They fix the interfaces the 3D implementation has to fill in, and let the
-// generic pipeline be compiled for DIM=3, but none of them is reachable yet
-
-template <>
-Point<3> create_point_with_unique_hash_id<3>(const double *x, const int *idx, int type) {
-    (void)idx; (void)type;
-    AbortNotImplemented3D("create_point_with_unique_hash_id");
-    return Point<3>(x, 0);
-}
-
-template <>
-int far_wall_grid_index<3>() {
-    AbortNotImplemented3D("far_wall_grid_index");
-    return 0;
-}
-
-template <>
-uint64_t interior_seed<3>(const int *idx) {
-    (void)idx;
-    AbortNotImplemented3D("interior_seed");
-    return 0;
-}
-
-template <>
-std::vector<Simplex<3> > triangulation<3>(const std::vector<Point<3> >& points) {
-    (void)points;
-    AbortNotImplemented3D("The Delaunay backend");
-    return std::vector<Simplex<3> >();
-}
-
-template <>
-double simplex_volume<3>(const Point<3> *const *p) {
-    (void)p;
-    AbortNotImplemented3D("simplex_volume");
-    return 0.0;
-}
-
-template <>
-void simplex_centroid<3>(const Point<3> *const *p, double *centroid) {
-    (void)p; (void)centroid;
-    AbortNotImplemented3D("simplex_centroid");
-}
-
-template <>
-double dist_sq<3>(const double *d) {
-    (void)d;
-    AbortNotImplemented3D("dist_sq");
-    return 0.0;
-}
-
-template <>
-double star_simplex_badness<3>(const Point<3>& p, int i, const Simplex<3>& tri, const std::vector<Point<3> >& points) {
-    (void)p; (void)i; (void)tri; (void)points;
-    AbortNotImplemented3D("star_simplex_badness");
-    return 0.0;
-}
-
-template <>
-int get_simplex_edges<3>(const int (*&edges)[2]) {
-    edges = NULL;
-    AbortNotImplemented3D("get_simplex_edges");
-    return 0;
-}
-
-template <>
-int get_boundary_features<3>(const int (*&features)[3]) {
-    features = NULL;
-    AbortNotImplemented3D("get_boundary_features");
-    return 0;
-}
-
-template <>
-PetscInt num_walls<3>() {
-    AbortNotImplemented3D("num_walls");
-    return 0;
-}
-
-template <>
-PetscInt classify_point_wall<3>(const double *xyz, const double *domain_size) {
-    (void)xyz; (void)domain_size;
-    AbortNotImplemented3D("classify_point_wall");
-    return 0;
-}
-
-template <>
-PetscErrorCode facet_wall_value<3>(DM dm, PetscInt e, PetscSection coordSection, const PetscScalar *coords,
-                                   const double *domain_size, PetscInt *val) {
-    (void)dm; (void)e; (void)coordSection; (void)coords; (void)domain_size;
-    *val = 0;
-    AbortNotImplemented3D("facet_wall_value");
-    return PETSC_SUCCESS;
-}
-
-template <>
-void integrity_accumulate_simplex<3>(const Point<3> *const *p, int rank, int size, IntegrityAccum& acc) {
-    (void)p; (void)rank; (void)size; (void)acc;
-    AbortNotImplemented3D("integrity_accumulate_simplex");
-}
-
-template <>
-bool evaluate_integrity<3>(long num_tris_owned_global, long num_points_owned_global,
-                           const IntegrityAccum& global, long global_ghost_mismatch_count) {
-    (void)num_tris_owned_global; (void)num_points_owned_global; (void)global; (void)global_ghost_mismatch_count;
-    AbortNotImplemented3D("evaluate_integrity");
-    return false;
-}
-
-template <>
-void stats_accumulate_simplex<3>(const Point<3> *const *p, SimplexQuality& q) {
-    (void)p; (void)q;
-    AbortNotImplemented3D("stats_accumulate_simplex");
-}
-
-template <>
-int edge_orientation_bin<3>(const double *d) {
-    (void)d;
-    AbortNotImplemented3D("edge_orientation_bin");
-    return 0;
-}
-
-template <>
-void print_simplex_stats<3>(long num_tris_owned_global, const SimplexQuality& global,
-                            double global_total_edge_len, long global_edge_count,
-                            const std::vector<long>& global_bins) {
-    (void)num_tris_owned_global; (void)global; (void)global_total_edge_len; (void)global_edge_count; (void)global_bins;
-    AbortNotImplemented3D("print_simplex_stats");
-}
-
-template <>
-void factorize_min_cut<3>(int n, const double *size, int *dims) {
-    (void)n; (void)size;
-    dims[0] = dims[1] = dims[2] = 1;
-    AbortNotImplemented3D("factorize_min_cut");
-}
-
-template <>
-void validate_inputs<3>(MPI_Comm comm, double target_edge_length, const double *size, int final_smooth_its) {
-    (void)comm; (void)target_edge_length; (void)size; (void)final_smooth_its;
-    AbortNotImplemented3D("GenerateBoxMeshDM");
-}
-
-template <>
-double volume_tolerance<3>() {
-    AbortNotImplemented3D("volume_tolerance");
-    return 0.0;
-}
-
 template <>
 void print_domain_header<3>() {
-    AbortNotImplemented3D("print_domain_header");
+    std::cout << "Generating Unstructured Mesh of 3D box...\n";
+    std::cout << "Target Edge Length: " << TARGET_EDGE_LENGTH << "\n";
+    std::cout << "Domain Width: " << DOMAIN_SIZE[0] << ", Domain Height: " << DOMAIN_SIZE[1]
+              << ", Domain Depth: " << DOMAIN_SIZE[2] << "\n";
 }
 
 // ~~~~~~~~~~~~~~~~~
@@ -2818,10 +3228,6 @@ static DM GenerateBoxMeshDMImpl(MPI_Comm comm, double target_edge_length, const 
     return dm;
 }
 
-// Compile the whole pipeline for DIM=3 against the stubs above, so the generic code is
-// kept 3D-clean. Nothing calls it yet
-template DM GenerateBoxMeshDMImpl<3>(MPI_Comm, double, const double *, int, PetscBool, PetscBool, int);
-
 // ~~~~~~~~~~~~~~~~~
 
 PETSC_EXTERN DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats, int agglomeration_factor) {
@@ -2834,4 +3240,18 @@ PETSC_EXTERN DM GenerateBoxMeshDMAgglom(MPI_Comm comm, double target_edge_length
 // Original entry point - equivalent to an agglomeration factor of 1
 PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
     return GenerateBoxMeshDMAgglom(comm, target_edge_length, domain_width, domain_height, final_smooth_its, integrity_check, print_stats, 1);
+}
+
+// ~~~~~~~~~~~~~~~~~
+
+PETSC_EXTERN DM GenerateBoxMeshDM3DAgglom(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, double domain_depth, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats, int agglomeration_factor) {
+    double size[3] = {domain_width, domain_height, domain_depth};
+    return GenerateBoxMeshDMImpl<3>(comm, target_edge_length, size, final_smooth_its, integrity_check, print_stats, agglomeration_factor);
+}
+
+// ~~~~~~~~~~~~~~~~~
+
+// 3D entry point - equivalent to an agglomeration factor of 1
+PETSC_EXTERN DM GenerateBoxMeshDM3D(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, double domain_depth, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats) {
+    return GenerateBoxMeshDM3DAgglom(comm, target_edge_length, domain_width, domain_height, domain_depth, final_smooth_its, integrity_check, print_stats, 1);
 }
