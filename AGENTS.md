@@ -19,7 +19,8 @@ Files:
 - [BoxMeshDM_tetgen.cpp](BoxMeshDM_tetgen.cpp) / [.h](BoxMeshDM_tetgen.h): the TetGen Delaunay
   backend (`BoxMeshDM_Delaunay3D`), in its own translation unit so `tetgen.h` (its `REAL` macro,
   lowercase macros, global `orient3d`, C++ exceptions) never meets the 2D code. The TetGen code
-  sits behind `#if defined(PETSC_HAVE_TETGEN)`; without it the function aborts with a message.
+  sits behind `#if defined(PETSC_HAVE_TETGEN)`; without it the 3D entry points stop up front with
+  one message on rank 0 (and the backend still aborts if it is ever reached).
 - [BoxMeshDM.h](BoxMeshDM.h): the C-linkage API, `GenerateBoxMeshDM`/`GenerateBoxMeshDMAgglom`
   and `GenerateBoxMeshDM3D`/`GenerateBoxMeshDM3DAgglom`. Deliberately no C++ overloads; the 2D
   signatures must not change.
@@ -54,7 +55,8 @@ CI ([ci_build.yml](.github/workflows/ci_build.yml)) runs `make tests` in the ima
 PETSc with TetGen, so only it runs the 3D tests until the Docker base images are rebuilt with
 `--download-tetgen`. Debug CI uses `PETSC_OPTIONS="-on_error_abort -fp_trap on"`, so new
 floating-point operations must not generate NaN/Inf even transiently. TetGen is compiled at
-`-O0` in debug PETSc builds, which is why the 3D test sizes are small and use no final smoothing.
+`-O0` in debug PETSc builds, which is why the 3D test sizes are small and mostly use no final
+smoothing.
 
 ## Changing the mesh is high risk
 
@@ -116,6 +118,10 @@ and `Simplex<DIM>` (`int v[DIM + 1]`), and instantiated through `GenerateBoxMesh
   interleaved `[n*DIM]` array. Keep these, and re-run the full checksum comparison, including
   the `-march=native` build, after **any** change to generic code. Other compilers (clang, Cray,
   Intel) are not verified.
+- **Optimisation level.** The protocol is at PETSc's -O2. The 2D mesh equals main's at
+  -O1/-O2/-Os with FMA and in every non-FMA build. At -O3 with FMA it equals main compiled with
+  apply_boundary_constraint out of line, not main as compiled (main's own FMA output differs
+  between -O2 and -O3).
 
 ## Algorithm
 
@@ -132,7 +138,10 @@ then runs `process_tile` → optional `CheckMeshIntegrity` / `ComputeAndPrintSta
   data), which is why few elements per rank fails. An axis with a single tile has no
   neighbours, so it isn't checked. So every split axis needs a tile of at least
   `2 * (11 + final_smooth_its)` edge lengths: 30 at the default smoothing, which in 3D is about
-  27k points and 160k tets per rank, with up to 8x as many halo points as owned points.
+  27k points and 170k tets per rank (about 6.2 tets per point), with up to 8x as many halo
+  points as owned points. In 3D every side of the box must also be at least 3 target edge
+  lengths (`validate_inputs<3>`), split or not, or the wall exclusion zone rejects every
+  interior point.
 - **Points.** Boundary points from the feature table (2D: 4 corners then walls L,R,B,T; 3D: 8
   corners, 12 edges, 6 faces), evenly spaced at `length / round(length / TARGET_EDGE_LENGTH)`
   (stepping by the edge length could strand a point next to a corner as a sliver); one jittered
@@ -244,6 +253,13 @@ mpiexec -n 8 ./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0   
 
 ```bash
 make clean && make tests
+```
+
+PETSc compiles with `-std=gnu++20`, so nothing in the build enforces the C++11 target. Check it
+by hand:
+
+```bash
+mpicxx -std=c++11 -Wall -Wextra -fsyntax-only -I$PETSC_DIR/include -I$PETSC_DIR/$PETSC_ARCH/include BoxMeshDM.cpp BoxMeshDM_tetgen.cpp BoxMeshDM_main.cpp
 ```
 
 For 2D changes, add the `mesh_checksum` comparison above. 3D runs are slow in a debug build

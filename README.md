@@ -41,11 +41,11 @@ Check that these terms suit you before distributing anything built against them.
 
 To build an executable which can be called from the command line for small scale testing, ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
-There are eight input variables that can be changed from the command line, as well as the domain size:   
+The options that can be changed from the command line are below, along with ``-domain_width`` and ``-domain_height`` (see [Domain Size](#domain-size)):
    | Command line argument  | Default value | Details |
    | --- | -- | -- |
    | ``-dim`` | 2 | 2 for a triangular mesh of a rectangle, 3 for a tetrahedral mesh of a box (needs TetGen). |
-   | ``-target_edge_length`` | 0.0025 | Target edge length for elements. Resulting mesh will have edges close to this value. |
+   | ``-target_edge_length`` | 0.0025 | Target edge length for elements. Resulting mesh will have edges close to this value. The default is a 2D size: in 3D it means about 64M points on one rank, so pass a larger value there, e.g. 0.02. |
    | ``-final_smooth_its`` | 4 | How many iterations of smoothing (LLoyds + springs) to do. More iterations will increase mesh quality and runtime. |
    | ``-domain_depth`` | 1.0 | Extent of the domain in z, used only when ``-dim 3``. |
    | ``-write_mesh`` | false | Output the PETSc DM to disk in HDF5 format. |
@@ -71,7 +71,7 @@ To visualise the mesh, from the command line run ``${PETSC_DIR}/lib/petsc/bin/pe
 
 ### Building the code as a library
 
-For large scale use, the code can be compiled as a library. Hence instead of writing out the mesh, the routine ``GenerateBoxMeshDM`` (or ``GenerateBoxMeshDM3D``) can be called directly from existing code. This returns a parallel, load balanced PETSc DMPlex object that can be used without I/O. 
+For large scale use, the code can be compiled as a library. Hence instead of writing out the mesh, the routine ``GenerateBoxMeshDM`` (or ``GenerateBoxMeshDM3D``) can be called directly from existing code. This returns a parallel, load balanced PETSc DMPlex object that can be used without I/O.
 
 Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make lib``. You then need to include the ``.h`` file in your code and link to the output library ``libboxmeshdm``. 
 
@@ -135,7 +135,7 @@ In 3D, with the same values as PETSc's ``DMPlexCreateBoxMesh``:
 
 ### Agglomeration
 
-The domain is decomposed into one tile per MPI rank, with the decomposition chosen to minimise the total interface length (area in 3D). By default decompositions aren't nested, which can be inconvenient in some cases. For example, consider a node on a HPC system with one CPU (with 64 cores) and 4 GPUs and we want to run a simulation where we have one MPI rank per GPU. BoxMeshDM runs on the CPU - given this we would like to use the full 64 CPU cores to generate the mesh, assemble a matrix and then redistribute the matrix onto a sub-communicator with 4 ranks ready to run on the GPUs, but without having to call a repartitioner like ParMETIS. 
+The domain is decomposed into one tile per MPI rank, with the decomposition chosen to minimise the total interface length (area in 3D). By default decompositions aren't nested, which can be inconvenient in some cases. For example, consider a node on a HPC system with one CPU (with 64 cores) and 4 GPUs and we want to run a simulation where we have one MPI rank per GPU. BoxMeshDM runs on the CPU - given this we would like to use the full 64 CPU cores to generate the mesh, assemble a matrix and then redistribute the matrix onto a sub-communicator with 4 ranks ready to run on the GPUs, but without having to call a repartitioner like ParMETIS.
 
 BoxMeshDM allows you to specify an "agglomeration factor" such that the decomposition contains nested ranks. That way it is easy to redistribute the matrix on a sub-communicator, while still ensuring low total interface length. In the example above, if we run BoxMeshDM with ``n = 64`` ranks and we specify an agglomeration factor ``k = 16``, the decomposition is built as a coarse grid of ``n/k = 4`` tiles, with each split into ``k = 16`` fine tiles. The rank numbering of the ``k`` fine tiles is contiguous, and if the unknown ordering in the matrix is contiguous in rank order, that means a contiguous range of rows can be merged to reproduce a matrix that would have been produced by a plain 4 rank decomposition. 
 
@@ -155,9 +155,11 @@ Setting ``agglom_factor = 1`` produces exactly the same mesh as ``GenerateBoxMes
 
 The 3D generator uses the same approach as the 2D one (jittered points, Delaunay with TetGen, Lloyd and spring smoothing, one tile per rank with a halo), so the same compromises apply, plus:
    - **Quality is not yet tuned.** The meshes contain slivers: the minimum dihedral angle is often well under 5 degrees, and can be under 1 degree. The integrity check tests the volume, surface area, orientation and edge lengths, the Euler characteristic of the mesh and of its boundary surface, and that shared vertices agree between ranks. It prints the minimum element quality (mean ratio and dihedral angle) but its quality threshold is currently disabled, pending tuning, and ``-print_stats`` adds histograms of both. Check that the elements are good enough for your discretisation.
-   - **A larger minimum size per rank.** Each rank generates its tile plus a halo of ``(11 + final_smooth_its)`` target edge lengths, and the halo can be at most half the tile along any axis that is split between ranks. So along every split axis the tile must be at least ``2 * (11 + final_smooth_its)`` target edge lengths long, i.e. 30 at the default smoothing. For a cubic tile that is about 27k points and 160k tetrahedra per rank. Below this the code stops with an error. Axes that are not split (e.g. a thin domain on few ranks) are not limited.
-   - **Halo overhead and memory.** In 3D the halo is a large fraction of the work: a cubic tile at the minimum size generates up to 8 times as many points as it owns, falling to about 2.2 times at 100 target edge lengths per side. TetGen needs about 120 bytes per tetrahedron (about 770 bytes per point, at roughly 6.5 tetrahedra per point) during each triangulation, on top of the halo points themselves.
+   - **A larger minimum size per rank.** Each rank generates its tile plus a halo of ``(11 + final_smooth_its)`` target edge lengths, and the halo can be at most half the tile along any axis that is split between ranks. So along every split axis the tile must be at least ``2 * (11 + final_smooth_its)`` target edge lengths long, i.e. 30 at the default smoothing. For a cubic tile that is about 27k points and 170k tetrahedra per rank. Below this the code stops with an error. Axes that are not split (e.g. a thin domain on few ranks) are not limited by the halo, but every side of the box, split or not, must be at least 3 target edge lengths.
+   - **Halo overhead and memory.** In 3D the halo is a large fraction of the work: a cubic tile at the minimum size generates up to 8 times as many points as it owns, falling to about 2.2 times at 100 target edge lengths per side. TetGen needs about 120 bytes per tetrahedron (about 740 bytes per point, at about 6.2 tetrahedra per point) during each triangulation, on top of the halo points themselves.
    - **Not run at scale.** The 3D generator has only been run on a handful of ranks; the weak scaling results below are for 2D.
+
+### Checking a change does not alter the mesh
 
 To compare two builds of the library bit for bit (e.g. before and after a change to the code), build ``make mesh_checksum`` and run it with the same options against each build: it prints per-rank hashes of the topology, coordinates, point SF and labels of a generated mesh (and of the mesh after one refinement). It takes the same ``-dim``, ``-target_edge_length``, ``-domain_width``, ``-domain_height``, ``-domain_depth``, ``-final_smooth_its`` and ``-agglomeration_factor`` options as the executable, so it works for 3D meshes too.
 
@@ -173,4 +175,4 @@ Weak scaling results on ARCHER2 show the code is reasonably performant when gene
    | 4 | 512 | 6.25e-5 | 512M | 21.5 | 13.6 | 1.00125 | 92 |   
    | 1 | 128 | 1.25e-4 | 128M | 16.7 | 11.4 | 1.00111 | 82 |   
 
-To improve the mesh quality increase the number of final smoothing iterations. To improve the runtime, disable both the integrity check and statistics printing.       
+To improve the mesh quality increase the number of final smoothing iterations. To improve the runtime, disable both the integrity check and statistics printing.

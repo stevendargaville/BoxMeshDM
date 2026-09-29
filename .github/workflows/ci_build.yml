@@ -181,6 +181,9 @@ jobs:
           make -j3
       - name: Build box mesh (debug, CPU)
         shell: bash
+        # The only job that runs the 3D tests, so trap floating-point errors as the debug Docker job does
+        env:
+          PETSC_OPTIONS: "-on_error_abort -fp_trap on"
         run: |
           set -e
           export PETSC_DIR="${GITHUB_WORKSPACE}/petsc"

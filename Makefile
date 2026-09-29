@@ -177,6 +177,8 @@ ifeq ($(PETSC_HAVE_TETGEN),1)
 	$(MPIEXEC) -n 8 ./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0
 endif
 	$(MAKE) lib
+# Build (not run) the checksum harness so it keeps compiling
+	$(MAKE) mesh_checksum
 	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"
 

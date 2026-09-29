@@ -169,6 +169,7 @@ int main(int argc, char** argv) {
     // one-off PETSc allocations (class registration etc), so only the second is
     // checked. Current usage is only tracked in debug builds (or with -malloc_debug),
     // otherwise both readings are zero and this passes trivially.
+    // PetscMallocGetCurrentUsage only sees PETSc allocations, not TetGen's or the STL's (valgrind was clean at review).
     PetscLogDouble mem_before, mem_after;
     for (int i = 0; i < 2; ++i) {
         PetscCall(PetscMallocGetCurrentUsage(&mem_before));
