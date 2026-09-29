@@ -58,6 +58,11 @@ int BoxMeshDM_Delaunay3D(MPI_Comm comm, int num_points, const double *xyz, std::
         std::cerr << "ERROR: [Rank " << comm_rank << "] TetGen failed with error code " << err
                   << " tetrahedralising " << num_points << " points.\n";
         MPI_Abort(comm, EXIT_FAILURE);
+    } catch (...) {
+        // Anything else, e.g. std::bad_alloc
+        std::cerr << "ERROR: [Rank " << comm_rank << "] TetGen failed with an exception"
+                  << " tetrahedralising " << num_points << " points.\n";
+        MPI_Abort(comm, EXIT_FAILURE);
     }
 
     if (out.numberofpoints != num_points || out.numberofcorners != 4) {
@@ -67,6 +72,10 @@ int BoxMeshDM_Delaunay3D(MPI_Comm comm, int num_points, const double *xyz, std::
     }
 
     int num_tets = out.numberoftetrahedra;
+    if (num_tets < 0) {
+        std::cerr << "ERROR: [Rank " << comm_rank << "] TetGen returned " << num_tets << " tetrahedra.\n";
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
     tets.assign(out.tetrahedronlist, out.tetrahedronlist + 4 * (size_t)num_tets);
 
     // Every input point has to be a vertex of some tetrahedron. With J an exact (or

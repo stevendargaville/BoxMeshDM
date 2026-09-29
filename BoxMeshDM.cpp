@@ -5,6 +5,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <climits>
 #include <iomanip>
 #include <fstream>
 #include <string>
@@ -398,7 +399,7 @@ static void ResolveBoundaryOwnership(MPI_Comm comm, std::vector<Point<DIM> >& po
     struct ResolutionData {
         int best_rank;
         double best_c[DIM];
-        ResolutionData() : best_rank(999999) { for (int d = 0; d < DIM; ++d) best_c[d] = 0; }
+        ResolutionData() : best_rank(INT_MAX) { for (int d = 0; d < DIM; ++d) best_c[d] = 0; }
     };
     std::unordered_map<uint64_t, ResolutionData> resolution_map;
 
@@ -725,6 +726,15 @@ std::vector<Simplex<2> > triangulation<2>(MPI_Comm comm, const std::vector<Point
 // vertices into PETSc's orientation
 template <>
 std::vector<Simplex<3> > triangulation<3>(MPI_Comm comm, const std::vector<Point<3> >& points) {
+    // TetGen and the backend's index lists are int, with several entries per point (about 6.2
+    // tetrahedra per point, 4 indices each), so leave a wide margin below INT_MAX
+    if (points.size() > (size_t)(INT_MAX / 32)) {
+        int comm_rank;
+        MPI_Comm_rank(comm, &comm_rank);
+        std::cerr << "ERROR: [Rank " << comm_rank << "] " << points.size()
+                  << " points (tile plus halo) is too many for TetGen on one rank, use more ranks.\n";
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
     std::vector<double> xyz(3 * points.size());
     for (size_t i = 0; i < points.size(); ++i) {
         xyz[3 * i] = points[i].c[0];
@@ -1698,9 +1708,26 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point<DIM> >& points_on_owne
         }
     }
 
+    // The global vertex and cell counts have to fit in a PetscInt. Sum them in 64 bits so a
+    // 32-bit PetscInt build stops with a clear message rather than overflowing the numbering
+    int64_t counts_owned[2] = {(int64_t)num_points_owned, (int64_t)triangles_owned.size()};
+    int64_t counts_global[2] = {0, 0};
+    MPI_Allreduce(counts_owned, counts_global, 2, MPI_INT64_T, MPI_SUM, comm);
+    if (sizeof(PetscInt) < sizeof(int64_t) &&
+        (counts_global[0] > (int64_t)PETSC_INT_MAX || counts_global[1] > (int64_t)PETSC_INT_MAX)) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: The mesh has " << counts_global[0] << " vertices and " << counts_global[1]
+                      << " cells, more than the largest PetscInt (" << PETSC_INT_MAX
+                      << "). Reconfigure PETSc with --with-64-bit-indices.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
     // 2. Calculate Global Offsets - petscint to ensure large counts work
     PetscInt start_id = 0;
     MPI_Exscan(&num_points_owned, &start_id, 1, MPIU_INT, MPI_SUM, comm);
+    // MPI leaves the result on rank 0 undefined
+    if (comm_rank == 0) start_id = 0;
 
     // 3. Assign Global IDs to Owned points
     PetscInt current_id = start_id;
@@ -1883,19 +1910,26 @@ static DM CreateDM(MPI_Comm comm, const std::vector<Point<DIM> >& points_on_owne
 
     // Build the DM - DMPlexCreateFromCellListParallelPetsc creates it, so we
     // must not DMCreate one ourselves first or it leaks
-    DM dm;
+    DM dm = NULL;
     PetscErrorCode ierr;
 
     PetscInt dim = DIM;
     PetscInt num_corners = DIM + 1;
     ierr = DMPlexCreateFromCellListParallelPetsc(comm, dim, num_tris_owned, num_points_owned, PETSC_DECIDE, \
          num_corners, PETSC_TRUE, cells.data(), dim, coords_points_owned.data(), NULL, NULL, &dm);
+    if (ierr) {
+        std::cerr << "Error: [Rank " << comm_rank << "] DMPlexCreateFromCellListParallelPetsc failed with error code "
+                  << ierr << ".\n";
+        if (dm) {
+            ierr = DMDestroy(&dm);
+            (void)ierr;
+        }
+        return NULL;
+    }
 
     // The DM is already distributed, we don't want to call parmetis (or equivalent)
     // by default as it's very memory heavy
     ierr = DMPlexDistributeSetDefault(dm, PETSC_FALSE);
-    // Have to include or -dm_view doesn't work on command line
-    ierr = DMViewFromOptions(dm, NULL, "-dm_view");
     (void)ierr;
 
     return dm;
@@ -2111,9 +2145,17 @@ static void LabelBoundaries(DM dm, const double *domain_size) {
     PetscInt eStart, eEnd;
     PetscCallVoid(DMPlexGetHeightStratum(dm, 1, &eStart, &eEnd));
 
-    PetscCallVoid(DMCreateLabel(dm, "markers"));
     DMLabel markersLabel;
     PetscCallVoid(DMGetLabel(dm, "markers", &markersLabel));
+    if (!markersLabel) {
+        PetscCallVoid(DMCreateLabel(dm, "markers"));
+        PetscCallVoid(DMGetLabel(dm, "markers", &markersLabel));
+    } else {
+        // Clear existing strata to avoid stale labels, as for "Face Sets"
+        for (PetscInt w = 1; w <= num_walls<DIM>(); ++w) {
+            PetscCallVoid(DMLabelClearStratum(markersLabel, w));
+        }
+    }
 
     for (PetscInt e = eStart; e < eEnd; ++e) {
         PetscInt val = 0;
@@ -3376,6 +3418,9 @@ static DM GenerateBoxMeshDMImpl(MPI_Comm comm, double target_edge_length, const 
     std::vector<Point<DIM> >().swap(points_on_owned_triangles_and_orphans);
     std::vector<Simplex<DIM> >().swap(triangles_owned);
 
+    // CreateDM has already said why
+    if (!dm) return NULL;
+
     // Check the topology of the DM itself (3D only)
     if (integrity_check && !CheckDMIntegrity<DIM>(comm, dm)) {
         PetscErrorCode ierr = DMDestroy(&dm);
@@ -3392,6 +3437,10 @@ static DM GenerateBoxMeshDMImpl(MPI_Comm comm, double target_edge_length, const 
 
     // 7. Add refinement hook so labels are applied after any refinement
     ierr = DMRefineHookAdd(dm, RefineHook_LabelBoundaries, NULL, NULL);
+
+    // Have to include or -dm_view doesn't work on command line. Last, so it shows the
+    // finished DM, name and labels included
+    ierr = DMViewFromOptions(dm, NULL, "-dm_view");
     (void)ierr;
 
     return dm;
@@ -3414,6 +3463,16 @@ PETSC_EXTERN DM GenerateBoxMeshDM(MPI_Comm comm, double target_edge_length, doub
 // ~~~~~~~~~~~~~~~~~
 
 PETSC_EXTERN DM GenerateBoxMeshDM3DAgglom(MPI_Comm comm, double target_edge_length, double domain_width, double domain_height, double domain_depth, int final_smooth_its, PetscBool integrity_check, PetscBool print_stats, int agglomeration_factor) {
+#if !defined(PETSC_HAVE_TETGEN)
+    // Stop up front with one message, rather than on every rank at the first tetrahedralisation
+    // (the backend still aborts if it is ever reached)
+    int comm_rank;
+    MPI_Comm_rank(comm, &comm_rank);
+    if (comm_rank == 0) {
+        std::cerr << "ERROR: BoxMeshDM was built without TetGen, which 3D needs (reconfigure PETSc with --download-tetgen).\n";
+    }
+    MPI_Abort(comm, EXIT_FAILURE);
+#endif
     double size[3] = {domain_width, domain_height, domain_depth};
     return GenerateBoxMeshDMImpl<3>(comm, target_edge_length, size, final_smooth_its, integrity_check, print_stats, agglomeration_factor);
 }
