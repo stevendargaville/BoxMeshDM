@@ -12,8 +12,10 @@ piece directly in the right place. The price is the restrictions in [README.md](
 (box domain, uniform resolution, a minimum size per rank, result depends on rank count).
 
 The 2D generator is validated at scale and is the thing to protect. The 3D generator is new and
-not run at scale; after the sliver repair its minimum dihedral angle is about 10 degrees at the
-default smoothing (about 5.6 with no final smoothing), see [Known limitations](#known-limitations-and-ideas).
+not run at scale; after the sliver repair and guarded smoothing its minimum dihedral angle is about
+11.5 degrees at the default smoothing (about 9 with no final smoothing, 6.4 in the worst case
+measured), see
+[Known limitations](#known-limitations-and-ideas).
 
 Files:
 - [BoxMeshDM.cpp](BoxMeshDM.cpp): the whole generator, templated on the dimension (below).
@@ -157,23 +159,32 @@ then runs `process_tile` → optional `CheckMeshIntegrity` / `ComputeAndPrintSta
   `ResolveBoundaryOwnership`, then `final_smooth_its` rounds without jitter, then a final
   triangulation and `ResolveBoundaryOwnership`. Only points inside tile ± `sync_margin` move;
   the outer halo rim is frozen so it doesn't collapse inward.
-- **Sliver repair (3D only).** `RepairSlivers<3>` (a no-op `<2>`) keeps the final
-  tetrahedralisation and, for up to 24 rounds, moves vertices of tets with `eta^3 < 0.05`
-  (`SLIVER_REPAIR_ETA3_3D`) along the normal of the opposite face and the `eta^3` gradient of the
-  worst tet in their star, accepting a move only if the star's worst `eta^3` strictly improves.
-  Each round only an independent set moves (a point goes only if its star is worse than that of
-  every other movable point in it, ties by a hash priority), so no two vertices of a tet move
-  together and nothing inverts. It exists because Lloyd removes slivers from the connectivity
-  it is given but every re-triangulation brings them back. Nothing is re-triangulated, so the
-  output is no longer exactly Delaunay (every cell stays positively oriented) and the halo does
-  not grow (a point moves at most 24 x 0.4 edge lengths). Only the **owner** of a point moves it
+- **Sliver repair and guarded smoothing (3D only).** `RepairSlivers<3>` (a no-op `<2>`) keeps
+  the final tetrahedralisation and moves vertices on it in two passes. First, for 24 rounds,
+  vertices of tets with `eta^3 < 0.05` (`SLIVER_REPAIR_ETA3_3D`) try steps along the normal of the
+  opposite face and the `eta^3` gradient of the worst tet in their star, keeping the one that
+  most improves the star's worst `eta^3`. Then, for 16 rounds (`SMOOTH_ROUNDS_3D`), vertices of
+  tets with `eta^3 < 0.2` (`SMOOTH_ETA3_3D`) step down the gradient of `F = sum 1/eta^3` over their
+  star (0.3, 0.15, 0.075 edge lengths, the first that lowers `F` and strictly raises the star's
+  worst `eta^3`). In both, a move is accepted only if the star's worst `eta^3` strictly improves,
+  and each round only an independent set moves (a point goes only if its star is worse than that
+  of every other movable point in it, ties by a hash priority), so no two vertices of a tet move
+  together and nothing inverts. Whether a point has a move is only computed when an owned point's
+  test needs it (the same result as computing it for all). It exists because Lloyd removes
+  slivers from the connectivity it is given but every re-triangulation brings them back. Nothing
+  is re-triangulated, so the output is no longer exactly Delaunay (every cell stays positively
+  oriented), and no move may take a point more than 1 edge length
+  (`REPAIR_MAX_DISPLACEMENT_3D`) from its position in the final tetrahedralisation, so the halo
+  does not grow. Only the **owner** of a point moves it
   (its tetrahedralisation is exact at least `pad` inside its cloud) and sends the new position to
   the neighbours using it (`SendMovedPoints3D`, point to point over the fixed list of <= 26
   neighbouring ranks: counts on tag 106, then data on tags 104/105). It is deliberately not
   `ResolveBoundaryOwnership`: there the lowest claiming rank wins, which need not be the owner,
-  and that threw away most repairs within `sync_margin` of an interface. `eta^3` is evaluated in
-  a vertex order sorted by hash id (`canonical_tet_order`) so ranks storing a tet differently
-  agree. Cost: about 4% of `process_tile` at the default smoothing, more at 0.
+  and that threw away most repairs within `sync_margin` of an interface. `eta^3` and its gradient
+  are evaluated in a vertex order sorted by hash id (`canonical_tet_order`), and `F` and its
+  gradient are summed over the star sorted by the tets' ids (`tet_before`), so ranks storing a tet
+  or a star differently agree. Cost: about 17% of `process_tile` at the default smoothing (TEL
+  0.02, 1 rank: 3.8 of 22.7 s), 45% at 0 (7.4 of 16.2 s).
 - **Filtering.** A simplex belongs to the rank owning its vertex with the **smallest
   `unique_hash_id`**. Points owned spatially but in no owned simplex are kept as **orphans** so
   the rank can still hand out their global ids.
@@ -233,25 +244,30 @@ boundary surface being a sphere (`Vb - Fb/2 == 2`), and element quality: it fail
 with `eta^3 < MIN_ETA3_3D` (5e-4) or a dihedral angle below `MIN_DIHEDRAL_DEG_3D` (1 degree),
 printing the first few (`LOW QUALITY TETRAHEDRON`). `eta` is the mean ratio (1 for a regular
 tet), so `eta^3` goes to 0 for slivers and also catches needles whose angles look fine. The
-thresholds come from measured meshes: about 12x (`eta^3`) and 4x (angle) below the worst
-repaired mesh (6.3e-3 / 3.78 degrees: 6 ranks, agglomerated, no final smoothing) and 16x / 3x
-above the best unrepaired one, so the pre-repair code fails them. If you change the smoothing or
-the repair, re-measure before touching them. The 3D stats print three histograms: `eta^3`,
+thresholds come from measured meshes: they were set about 12x (`eta^3`) and 4x (angle) below
+the worst mesh with the sliver repair alone (6.3e-3 / 3.78 degrees: 6 ranks, agglomerated, no
+final smoothing) and 16x / 3x above the best unrepaired one, so the pre-repair code fails them.
+With the guarded smoothing the same case gives 1.96e-2 / 6.44 degrees, the worst measured; the
+thresholds were left alone, as raising them would still not catch a mesh with the repair alone.
+If you change the smoothing or the repair, re-measure before touching them. The 3D stats print three histograms: `eta^3`,
 the smallest dihedral angle per tet (with the count below 5 degrees) and the largest.
 
 ## Known limitations and ideas
 
-- **Bulk quality** (3D): the repair only fixes the worst tets. About 2.3% of tets have a
-  dihedral angle below 20 degrees at the default smoothing (7.4% at 0; the repair raises this a
-  little as slivers become 10-20 degree tets); mean `eta^3` is about 0.61. More final smoothing
-  helps but widens the halo.
+- **Bulk quality** (3D): smoothing on fixed connectivity plateaus. At TEL 0.02 about 0.12% of
+  tets have a dihedral angle below 20 degrees at the default smoothing (3.2% at 0, 0.03% at 8)
+  and 9.2% below 30 (20.6% at 0); mean `eta^3` is about 0.60 (0.49 at 0), slightly lower than
+  with the sliver repair alone (0.61), because lifting a vertex's worst tets lowers some of its
+  good ones. More final smoothing helps but widens the halo. A few tets whose vertices the
+  boundary constraints hold (e.g. 6.5 degrees on the fs 0 2x1x0.5 box) are not improved.
 - **Not Delaunay** (3D): the repaired mesh is valid and positively oriented, not Delaunay.
 - **Not run at scale** (3D), including the repair.
 - Ideas not yet pursued: sliver exudation via a weighted Delaunay with hash-derived weights
-  (TetGen supports weights); a repair threshold of 0.1 instead of 0.05 (about 6x the cost);
-  quality-guarded moves for the 10-20 degree band. Already measured and rejected (see the
-  commit "Repair slivers on the final 3D tetrahedralisation"): an ODT target, sliver-normal
-  candidates inside Lloyd, less or no spring.
+  (TetGen supports weights); edge/face flips after the smoothing. Already measured and rejected
+  (see the commits "Repair slivers on the final 3D tetrahedralisation" and "Add a
+  quality-guarded smoothing pass after the 3D sliver repair"): an ODT target, sliver-normal
+  candidates inside Lloyd, less or no spring, a max-min (active-set) smoothing step, which
+  equalises a star and lowers its good tets, and `F = sum 1/(eta^3)^2`.
 
 ## Agglomeration
 

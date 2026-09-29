@@ -34,7 +34,8 @@
 // 2. Interior Gen: Create random points inside small squares, REJECTING those near boundaries.
 // 3. Iterate: jitter -> triangulate -> smooth loop.
 // 4. Constraint: Boundary nodes only move tangentially.
-// 5. 3D only: move the vertices of slivers on the final tetrahedralisation (RepairSlivers).
+// 5. 3D only: move the vertices of slivers, then of the wider low-quality band, on the final
+//    tetrahedralisation (RepairSlivers).
 //
 // Structure: the pipeline is written once as templates on the dimension DIM. Everything that
 // depends on the dimension (the Delaunay backend, the hash id layout, the simplex kernels, the
