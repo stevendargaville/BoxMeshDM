@@ -107,6 +107,18 @@ else
 endif
 endif
 
+# Print per-rank hashes of a generated mesh, to compare two builds of the library bit for bit
+mesh_checksum: mesh_checksum.o $(LIB_OUT)
+ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)
+	$(LINK.cc) -o mesh_checksum mesh_checksum.o $(LIB_OUT) $(PETSC_LIB)
+else
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
+	$(LINK.cc) -o mesh_checksum mesh_checksum.o -L. -lboxmeshdm $(PETSC_LIB) -Wl,-rpath,@loader_path
+else
+	$(LINK.cc) -o mesh_checksum mesh_checksum.o -L. -lboxmeshdm $(PETSC_LIB) -Wl,-rpath,'$$ORIGIN'
+endif
+endif
+
 tests_lib: test_lib
 	@echo "Running tests on library..."
 	./test_lib
@@ -145,4 +157,4 @@ tests: BoxMeshDM
 
 # Cleanup
 clean::
-	$(RM) $(OUT) $(LIB_OUT) $(OBJS) BoxMeshDM_main.o test_lib test_lib.o *.dat
+	$(RM) $(OUT) $(LIB_OUT) $(OBJS) BoxMeshDM_main.o test_lib test_lib.o mesh_checksum mesh_checksum.o *.dat
