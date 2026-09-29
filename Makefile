@@ -156,6 +156,26 @@ tests: BoxMeshDM
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5 -agglomeration_factor 2
 # Thin domain - the halo is wider than half the tile height, but y is not split between ranks
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.1
+# Explicit -dim 2 is the default
+	./BoxMeshDM -dim 2 -target_edge_length 0.01
+# 3D (tetrahedral) meshes, only when PETSc has TetGen. TetGen is compiled at -O0 in debug builds,
+# so these are small and mostly without final smoothing. On every axis split between ranks the
+# tile must be at least 2 * (11 + final_smooth_its) target edge lengths, or the halo check stops
+ifeq ($(PETSC_HAVE_TETGEN),1)
+	@echo "Running 3D tests on executable..."
+# Default smoothing on one rank
+	./BoxMeshDM -dim 3 -target_edge_length 0.033
+# Non-cubic box on one rank, the halo is cut off by the walls on every axis
+	./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0 -domain_width 2.0 -domain_depth 0.5
+# Two ranks, one interface
+	$(MPIEXEC) -n 2 ./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0
+# 3x1x1 tiles on a 3 x 1 x 1 box - ranks 0 and 2 are not neighbours
+	$(MPIEXEC) -n 3 ./BoxMeshDM -dim 3 -target_edge_length 0.03 -final_smooth_its 0 -domain_width 3.0
+# Agglomeration, with a final smoothing iteration across the interfaces
+	$(MPIEXEC) -n 4 ./BoxMeshDM -dim 3 -target_edge_length 0.02 -final_smooth_its 1 -agglomeration_factor 2
+# 2x2x2 tiles - face, edge and corner neighbours
+	$(MPIEXEC) -n 8 ./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0
+endif
 	$(MAKE) lib
 	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"
