@@ -30,6 +30,12 @@ export PETSC_HAVE_TRIANGLE := $(if $(call _have_conf,PETSC_HAVE_TRIANGLE),1,0)
 ifeq ($(PETSC_HAVE_TRIANGLE),0)
 $(error PETSc has not been configured with Triangle support. Reconfigure PETSc with --download-triangle)
 endif
+# Check for TetGen support - optional, only the 3D generator needs it. Without it BoxMeshDM
+# still builds, and asking for a 3D mesh stops with an error
+export PETSC_HAVE_TETGEN := $(if $(call _have_conf,PETSC_HAVE_TETGEN),1,0)
+ifeq ($(PETSC_HAVE_TETGEN),0)
+$(warning PETSc has not been configured with TetGen support, 3D meshes are not available. Reconfigure PETSc with --download-tetgen to enable them)
+endif
 export PETSC_USE_SHARED_LIBRARIES := $(if $(call _have_conf,PETSC_USE_SHARED_LIBRARIES),1,0)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -58,8 +64,9 @@ endif
 endif
 
 # All the files required by BoxMeshDM - the library is built from these, the
-# executable also links in BoxMeshDM_main.o, which is the only object with main
-OBJS := BoxMeshDM.o
+# executable also links in BoxMeshDM_main.o, which is the only object with main.
+# BoxMeshDM_tetgen.o is the 3D Delaunay backend (TetGen), kept in its own object
+OBJS := BoxMeshDM.o BoxMeshDM_tetgen.o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Rules
