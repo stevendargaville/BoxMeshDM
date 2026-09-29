@@ -165,7 +165,8 @@ then runs `process_tile` → optional `CheckMeshIntegrity` / `ComputeAndPrintSta
   output is no longer exactly Delaunay (every cell stays positively oriented) and the halo does
   not grow (a point moves at most 24 x 0.4 edge lengths). Only the **owner** of a point moves it
   (its tetrahedralisation is exact at least `pad` inside its cloud) and sends the new position to
-  the neighbours holding it (`SendMovedPoints3D`, tags 104/105). It is deliberately not
+  the neighbours using it (`SendMovedPoints3D`, point to point over the fixed list of <= 26
+  neighbouring ranks: counts on tag 106, then data on tags 104/105). It is deliberately not
   `ResolveBoundaryOwnership`: there the lowest claiming rank wins, which need not be the owner,
   and that threw away most repairs within `sync_margin` of an interface. `eta^3` is evaluated in
   a vertex order sorted by hash id (`canonical_tet_order`) so ranks storing a tet differently
@@ -208,7 +209,7 @@ There is no global consensus step for geometry: ranks that generate the same poi
   and from `unique_hash_id ^ iteration` for jitter. No shared state, no rank dependence.
 - **`ResolveBoundaryOwnership`**: after each smoothing round, neighbouring ranks (8 in 2D, 26 in
   3D) exchange claims (tag 999) and all adopt the coordinates of the **lowest-numbered claiming
-  rank**. The 3D sliver repair is the exception: owner wins (tags 104/105), see above. So the 3D
+  rank**. The 3D sliver repair is the exception: owner wins (tags 104-106), see above. So the 3D
   mesh is not bitwise invariant to `pad` (a different pad changes what the lowest rank sees
   within `sync_margin`); its quality statistics agree across rank counts to about 0.02%.
 - **Boundary constraints**: boundary points only slide within their wall, edge or (fixed)

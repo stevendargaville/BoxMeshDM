@@ -1254,7 +1254,8 @@ static void relax_points_spring(std::vector<Point<DIM> >& points, const std::vec
 //
 // Determinism: a vertex is only moved by the rank that owns it (get_owner_rank), whose
 // tetrahedralisation is exact around its own tile (at least pad inside its point cloud), and the
-// owner sends the new position to every neighbour that holds the point before the next round.
+// owner sends the new position to every neighbour that uses the point (any copy within a few
+// edge lengths of its tile; far-rim copies may go stale harmlessly) before the next round.
 // Every decision (which tetrahedra are bad, which vertices move, the candidate positions) is a
 // function of the unique hash ids and those synchronised positions only: eta^3 is evaluated in a
 // vertex order sorted by id, not in each rank's own storage order, so every rank holding a region
@@ -1287,73 +1288,108 @@ static void canonical_tet_order(const uint64_t *ids, int *o) {
     if (inversions % 2 == 1) std::swap(o[0], o[1]);
 }
 
-// Send the new positions of the points this rank moved (and owns) to every neighbouring rank
-// whose point cloud (tile + pad, with the same 1.2 safety factor as ResolveBoundaryOwnership)
-// holds them, and apply the positions received. id_to_index maps a unique hash id to its index in
-// points; ids a rank does not hold are ignored. Sets updated to the indices of the points whose
-// position was received
-static void SendMovedPoints3D(MPI_Comm comm, std::vector<Point<3> >& points, const std::vector<int>& moved,
-                              const std::unordered_map<uint64_t, int>& id_to_index, double pad, std::vector<int>& updated) {
-    int rank, size;
-    MPI_Comm_rank(comm, &rank);
-    MPI_Comm_size(comm, &size);
-    updated.clear();
-    if (size == 1) return;
+// A tile next to this rank's tile (sharing a face, edge or corner) and the rank that owns it
+struct TileNeighbour3D {
+    int rank;
+    int tile[3];
+};
 
+// The (up to 26) tiles next to this rank's tile, from the same enumeration of offsets in
+// {-1,0,1}^3 as ResolveBoundaryOwnership, sorted by rank. The relation is symmetric: every tile in
+// the list has this rank's tile in its own list
+static void GetTileNeighbours3D(int rank, std::vector<TileNeighbour3D>& neighbours) {
+    neighbours.clear();
     int t[3];
     rank_to_tile<3>(rank, t);
+    int off_lo[3] = {-1, -1, -1}, off_hi[3] = {1, 1, 1};
+    int off[3] = {-1, -1, -1};
+    do {
+        if (off[0] == 0 && off[1] == 0 && off[2] == 0) continue;
+        TileNeighbour3D nb;
+        bool in_grid = true;
+        for (int d = 0; d < 3; ++d) {
+            nb.tile[d] = t[d] + off[d];
+            if (!(nb.tile[d] >= 0 && nb.tile[d] < TILE_DIM[d])) in_grid = false;
+        }
+        if (!in_grid) continue;
+        nb.rank = tile_to_rank<3>(nb.tile);
+        neighbours.push_back(nb);
+    } while (next_index<3>(off, off_lo, off_hi));
+    std::sort(neighbours.begin(), neighbours.end(),
+              [](const TileNeighbour3D& a, const TileNeighbour3D& b) { return a.rank < b.rank; });
+}
+
+// Send the new positions of the points this rank moved (and owns) to every neighbouring rank
+// that uses the point (any copy within a few edge lengths of its tile: its tile + pad, with the
+// same 1.2 safety factor as ResolveBoundaryOwnership; far-rim copies may go stale harmlessly),
+// and apply the positions received. neighbours is the list from GetTileNeighbours3D: only those
+// ranks exchange, point to point, and every pair exchanges a count (possibly 0) on every call.
+// id_to_index maps a unique hash id to its index in points; ids a rank does not hold are ignored.
+// Sets updated to the indices of the points whose position was received
+static void SendMovedPoints3D(MPI_Comm comm, std::vector<Point<3> >& points, const std::vector<int>& moved,
+                              const std::vector<TileNeighbour3D>& neighbours,
+                              const std::unordered_map<uint64_t, int>& id_to_index, double pad, std::vector<int>& updated) {
+    updated.clear();
+    int num_neighbours = neighbours.size();
+    if (num_neighbours == 0) return;
+
     double safe_pad = pad * 1.2;
 
-    std::vector<std::vector<uint64_t> > send_ids(size);
-    std::vector<std::vector<double> > send_coords(size);
-    int off_lo[3] = {-1, -1, -1}, off_hi[3] = {1, 1, 1};
+    std::vector<std::vector<uint64_t> > send_ids(num_neighbours);
+    std::vector<std::vector<double> > send_coords(num_neighbours);
     for (size_t m = 0; m < moved.size(); ++m) {
         const Point<3>& p = points[moved[m]];
-        int off[3] = {-1, -1, -1};
-        do {
-            if (off[0] == 0 && off[1] == 0 && off[2] == 0) continue;
-            int n[3];
-            bool in_grid = true, relevant = true;
-            for (int d = 0; d < 3; ++d) {
-                n[d] = t[d] + off[d];
-                if (!(n[d] >= 0 && n[d] < TILE_DIM[d])) in_grid = false;
-            }
-            if (!in_grid) continue;
+        for (int k = 0; k < num_neighbours; ++k) {
+            const int *n = neighbours[k].tile;
+            bool relevant = true;
             for (int d = 0; d < 3; ++d) {
                 double tile_s = DOMAIN_SIZE[d] / TILE_DIM[d];
                 if (p.c[d] < n[d] * tile_s - safe_pad || p.c[d] > (n[d] + 1) * tile_s + safe_pad) relevant = false;
             }
             if (!relevant) continue;
-            int n_rank = tile_to_rank<3>(n);
-            send_ids[n_rank].push_back(p.unique_hash_id);
-            for (int d = 0; d < 3; ++d) send_coords[n_rank].push_back(p.c[d]);
-        } while (next_index<3>(off, off_lo, off_hi));
+            send_ids[k].push_back(p.unique_hash_id);
+            for (int d = 0; d < 3; ++d) send_coords[k].push_back(p.c[d]);
+        }
     }
 
-    std::vector<int> send_counts(size), recv_counts(size);
-    for (int r = 0; r < size; ++r) send_counts[r] = send_ids[r].size();
-    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
-
-    std::vector<std::vector<uint64_t> > recv_ids(size);
-    std::vector<std::vector<double> > recv_coords(size);
+    // The counts first, to and from every neighbour
+    std::vector<int> send_counts(num_neighbours), recv_counts(num_neighbours, 0);
     std::vector<MPI_Request> requests;
-    for (int r = 0; r < size; ++r) {
-        if (recv_counts[r] > 0) {
-            recv_ids[r].resize(recv_counts[r]);
-            recv_coords[r].resize(3 * (size_t)recv_counts[r]);
+    for (int k = 0; k < num_neighbours; ++k) {
+        send_counts[k] = send_ids[k].size();
+        MPI_Request req;
+        MPI_Irecv(&recv_counts[k], 1, MPI_INT, neighbours[k].rank, 106, comm, &req);
+        requests.push_back(req);
+    }
+    for (int k = 0; k < num_neighbours; ++k) {
+        MPI_Request req;
+        MPI_Isend(&send_counts[k], 1, MPI_INT, neighbours[k].rank, 106, comm, &req);
+        requests.push_back(req);
+    }
+    MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    requests.clear();
+
+    std::vector<std::vector<uint64_t> > recv_ids(num_neighbours);
+    std::vector<std::vector<double> > recv_coords(num_neighbours);
+    for (int k = 0; k < num_neighbours; ++k) {
+        if (recv_counts[k] > 0) {
+            int r = neighbours[k].rank;
+            recv_ids[k].resize(recv_counts[k]);
+            recv_coords[k].resize(3 * (size_t)recv_counts[k]);
             MPI_Request req;
-            MPI_Irecv(recv_ids[r].data(), recv_counts[r], MPI_UINT64_T, r, 104, comm, &req);
+            MPI_Irecv(recv_ids[k].data(), recv_counts[k], MPI_UINT64_T, r, 104, comm, &req);
             requests.push_back(req);
-            MPI_Irecv(recv_coords[r].data(), 3 * recv_counts[r], MPI_DOUBLE, r, 105, comm, &req);
+            MPI_Irecv(recv_coords[k].data(), 3 * recv_counts[k], MPI_DOUBLE, r, 105, comm, &req);
             requests.push_back(req);
         }
     }
-    for (int r = 0; r < size; ++r) {
-        if (send_counts[r] > 0) {
+    for (int k = 0; k < num_neighbours; ++k) {
+        if (send_counts[k] > 0) {
+            int r = neighbours[k].rank;
             MPI_Request req;
-            MPI_Isend(send_ids[r].data(), send_counts[r], MPI_UINT64_T, r, 104, comm, &req);
+            MPI_Isend(send_ids[k].data(), send_counts[k], MPI_UINT64_T, r, 104, comm, &req);
             requests.push_back(req);
-            MPI_Isend(send_coords[r].data(), 3 * send_counts[r], MPI_DOUBLE, r, 105, comm, &req);
+            MPI_Isend(send_coords[k].data(), 3 * send_counts[k], MPI_DOUBLE, r, 105, comm, &req);
             requests.push_back(req);
         }
     }
@@ -1362,11 +1398,12 @@ static void SendMovedPoints3D(MPI_Comm comm, std::vector<Point<3> >& points, con
     std::vector<std::vector<uint64_t> >().swap(send_ids);
     std::vector<std::vector<double> >().swap(send_coords);
 
-    for (int r = 0; r < size; ++r) {
-        for (int k = 0; k < recv_counts[r]; ++k) {
-            std::unordered_map<uint64_t, int>::const_iterator it = id_to_index.find(recv_ids[r][k]);
+    // Applied in rank order, as the neighbours are sorted by rank
+    for (int k = 0; k < num_neighbours; ++k) {
+        for (int j = 0; j < recv_counts[k]; ++j) {
+            std::unordered_map<uint64_t, int>::const_iterator it = id_to_index.find(recv_ids[k][j]);
             if (it == id_to_index.end()) continue;
-            for (int d = 0; d < 3; ++d) points[it->second].c[d] = recv_coords[r][3 * (size_t)k + d];
+            for (int d = 0; d < 3; ++d) points[it->second].c[d] = recv_coords[k][3 * (size_t)j + d];
             updated.push_back(it->second);
         }
     }
@@ -1415,8 +1452,11 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
         }
     }
 
+    // The neighbouring ranks the moves are exchanged with (none on one rank)
+    std::vector<TileNeighbour3D> neighbours;
     std::unordered_map<uint64_t, int> id_to_index;
     if (size > 1) {
+        GetTileNeighbours3D(rank, neighbours);
         id_to_index.reserve(n);
         for (int i = 0; i < n; ++i) id_to_index[points[i].unique_hash_id] = i;
     }
@@ -1573,7 +1613,8 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
                 if (on_bad && find_best_move(i, star_eta3[i], move_to[i])) can_move[i] = 1;
             }
             if (can_move[i]) {
-                // Pseudo-random tie break that changes every round
+                // Pseudo-random tie break that changes every round. Distinct ids get distinct
+                // priorities, as splitmix64 is a bijection (and so is the xor with the round constant)
                 uint64_t h = points[i].unique_hash_id ^ (0x9e3779b97f4a7c15ULL * (uint64_t)(round + 1));
                 priority[i] = splitmix64(h);
             }
@@ -1604,7 +1645,7 @@ void RepairSlivers<3>(MPI_Comm comm, std::vector<Point<3> >& points, const std::
         // Move, send the new positions to the neighbours (and get theirs), then update the quality
         // of every tetrahedron with a point that moved, and mark their points to be looked at again
         for (size_t m = 0; m < moved.size(); ++m) points[moved[m]] = move_to[moved[m]];
-        SendMovedPoints3D(comm, points, moved, id_to_index, pad, updated);
+        SendMovedPoints3D(comm, points, moved, neighbours, id_to_index, pad, updated);
         moved.insert(moved.end(), updated.begin(), updated.end());
         for (size_t m = 0; m < moved.size(); ++m) {
             int i = moved[m];
@@ -1985,7 +2026,9 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
     // Final mesh
     triangles_with_halos = triangulation<DIM>(comm, points_with_halos);
 
-    // Resolve ownership before filtering
+    // Resolve ownership before filtering. Nothing has moved since the last call, so this is a
+    // no-op wherever simplices are emitted; it is not idempotent only in the far rim of the halo,
+    // which no owned simplex reaches (harmless)
     ResolveBoundaryOwnership(comm, points_with_halos, s_min, s_max, interior_min, interior_max, pad);
 
     // 3D: move the vertices of badly shaped tetrahedra on this final connectivity (nothing in 2D)
@@ -3260,9 +3303,11 @@ void stats_accumulate_simplex<3>(const Point<3> *const *p, SimplexQuality& q) {
     const double *c[4] = {p[0]->c, p[1]->c, p[2]->c, p[3]->c};
     double det;
     double eta3 = tet_quality_eta3(c, det);
-    if (eta3 < 0.0) eta3 = 0.0;
+    // Negative (inverted) and NaN both count as 0, and the bin is taken from at most 1, so the
+    // index is always in range
+    if (!(eta3 >= 0.0)) eta3 = 0.0;
     if (eta3 < q.min_quality) q.min_quality = eta3;
-    int quality_bin = static_cast<int>(eta3 * NUM_QUALITY_BINS);
+    int quality_bin = static_cast<int>(std::min(eta3, 1.0) * NUM_QUALITY_BINS);
     if (quality_bin >= NUM_QUALITY_BINS) quality_bin = NUM_QUALITY_BINS - 1;
     q.quality_bins[quality_bin]++;
 
@@ -3674,16 +3719,44 @@ void validate_inputs<3>(MPI_Comm comm, double target_edge_length, const double *
     double domain_height = size[1];
     double domain_depth = size[2];
 
-    // Validate the inputs
-    if (!(target_edge_length > 0.0) || !std::isfinite(target_edge_length) ||
-        !(domain_width > 0.0) || !std::isfinite(domain_width) ||
-        !(domain_height > 0.0) || !std::isfinite(domain_height) ||
-        !(domain_depth > 0.0) || !std::isfinite(domain_depth) || final_smooth_its < 0) {
+    // Validate the inputs. Finiteness is tested before any ordered comparison, so a NaN input
+    // prints this error instead of raising a floating-point exception under -fp_trap
+    if (!std::isfinite(target_edge_length) || !(target_edge_length > 0.0) ||
+        !std::isfinite(domain_width) || !(domain_width > 0.0) ||
+        !std::isfinite(domain_height) || !(domain_height > 0.0) ||
+        !std::isfinite(domain_depth) || !(domain_depth > 0.0) || final_smooth_its < 0) {
         if (comm_rank == 0) {
             std::cerr << "ERROR: Target edge length (" << target_edge_length << "), domain width (" << domain_width
                       << "), domain height (" << domain_height << ") and domain depth (" << domain_depth
                       << ") must be positive and finite, "
                       << "and final smooth iterations (" << final_smooth_its << ") must be non-negative.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
+    // Absolute scale limits. The absolute tolerance EPSILON (1e-13) must stay at most 1e-4 of the
+    // target edge length, and TetGen's exact arithmetic set-up overflows for coordinates above
+    // about 1e60
+    if (target_edge_length < 1e-9) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Target edge length (" << target_edge_length << ") must be at least 1e-9 in 3D, "
+                      << "the absolute tolerance of " << EPSILON << " must stay at most 1e-4 of it. Scale the domain up.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+    if (std::max(domain_width, std::max(domain_height, domain_depth)) > 1e50) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Domain width (" << domain_width << "), height (" << domain_height << ") and depth ("
+                      << domain_depth << ") must each be at most 1e50 in 3D, TetGen's exact arithmetic overflows "
+                      << "beyond that. Scale the domain down.\n";
+        }
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+
+    // The smoothing count sets the halo width (and would overflow the integer arithmetic of pad)
+    if (final_smooth_its > 10000) {
+        if (comm_rank == 0) {
+            std::cerr << "ERROR: Final smooth iterations (" << final_smooth_its << ") must be at most 10000.\n";
         }
         MPI_Abort(comm, EXIT_FAILURE);
     }
