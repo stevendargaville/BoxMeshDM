@@ -1,6 +1,6 @@
 This code builds unstructured meshes of a box in parallel with MPI, designed for use with PETSc: triangles on a 2D rectangle, or tetrahedra on a 3D box. It returns a parallel DMPlex object which stores the unstructured mesh. It depends on PETSc configured with Triangle (``--download-triangle``), and 3D meshes also need TetGen (``--download-tetgen``, see [Dependencies and licences](#dependencies-and-licences)). To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
 
-The 2D generator has been validated at scale (see [Weak scaling](#weak-scaling)). The 3D generator is new: it passes the same kinds of checks, but its elements are not as good as the 2D ones and it has not been run at scale, see [3D meshes](#3d-meshes).
+The 2D generator has been validated at scale (see [Weak scaling](#weak-scaling)). The 3D generator is new and has not yet been run at scale.
 
 ### Domain Size
 
@@ -21,10 +21,10 @@ This code instead:
 To enable this several compromises were made, namely:   
    - Can only produce meshes on a simple rectangular (2D) or box (3D) domain.
    - Uniform resolution throughout the domain.
-   - Produces good elements (e.g., with reasonable angles and volume ratios) but not necessarily optimal. In 3D the minimum dihedral angle is about 21 degrees at the default smoothing, see [3D meshes](#3d-meshes).
+   - Produces good elements (e.g., with reasonable angles and volume ratios) but not necessarily optimal.
    - The mesh has reasonably low communication volume, but is not necessarily communication minimising. A mesh partitioner like ParMETIS can be explicitly called by using ``DMPlexDistribute`` on the returned DM to further minimise the communication volume.
    - Not fully optimised for speed/memory.
-   - Not robust when the number of elements per MPI rank is small (say <100k in 2D, see [3D meshes](#3d-meshes) for the 3D minimum).
+   - Not robust when the number of elements per MPI rank is small (say <100k in 2D or <200k in 3D).
    - If differing numbers of MPI ranks are used, the mesh produced is not identical.
 
 ### Dependencies and licences
@@ -150,19 +150,6 @@ For the example case, if we have an MPI program run on 64 ranks, in C/C++ you ca
      // ... merge contiguous rows in blocks of 250 onto a sub-communicator with 4 ranks
 
 Setting ``agglom_factor = 1`` produces exactly the same mesh as ``GenerateBoxMeshDM``. ``GenerateBoxMeshDM3DAgglom`` does the same in 3D.
-
-### 3D meshes
-
-The 3D generator uses the same approach as the 2D one (jittered points, Delaunay with TetGen, Lloyd and spring smoothing, one tile per rank with a halo), so the same compromises apply, plus:
-   - **Element quality.** A Delaunay tetrahedralisation of well spaced points still contains slivers (four nearly coplanar points with good edge lengths but almost no volume), and smoothing does not remove them because every re-triangulation brings them back. So in 3D the final tetrahedralisation is kept and improved: a sliver repair pass moves the vertices of the worst tetrahedra, then quality-driven flips (2-3 flips and edge removals, as in Klingner and Shewchuk's "Aggressive tetrahedral mesh improvement") change the connectivity around tetrahedra with a dihedral angle below 30 degrees, then a quality-guarded smoothing pass moves the vertices of the wider low-quality band. The flips are decided consistently across ranks, including at the interfaces between tiles, so the result hardly depends on the number of ranks. Every tetrahedron stays positively oriented, but the output is no longer exactly Delaunay. Measured on the unit cube at a target edge length of 0.02, the minimum dihedral angle is about 19 degrees with no final smoothing and 21 degrees at the default 4 iterations (it is under 0.2 degrees without these steps, and was 9 and 11.5 degrees without the flips), and no tetrahedron has a dihedral angle above about 148 degrees. No tetrahedron has a dihedral angle below 17 degrees in any case measured; about 1.2% have one below 30 degrees at the default smoothing and 5.6% with no final smoothing (0.6% at 8 iterations). At the default smoothing these steps take about 12% of the time spent generating a rank's tile (less than before the flips were added, as the smoothing pass then has less to do); with no final smoothing about 50%. Check that the elements are good enough for your discretisation.
-   - **Integrity check.** In 3D it tests the volume, surface area, orientation and edge lengths, the Euler characteristic of the mesh and of its boundary surface, that shared vertices agree between ranks, and the element quality: it fails on any tetrahedron with ``eta^3 < 5e-4`` or a dihedral angle below 1 degree. Here ``eta`` is the mean ratio, so ``eta^3`` is 1 for a regular tetrahedron and 0 for a flat one. These thresholds sit well below the worst meshes measured (``eta^3`` about 0.1, 17 degrees) and well above the unrepaired ones, so they catch slivers rather than ordinary variation. ``-print_stats`` prints histograms of ``eta^3`` and of the smallest and largest dihedral angle of each tetrahedron.
-   - **A larger minimum size per rank.** Each rank generates its tile plus a halo of ``(11 + final_smooth_its)`` target edge lengths, and the halo can be at most half the tile along any axis that is split between ranks. So along every split axis the tile must be at least ``2 * (11 + final_smooth_its)`` target edge lengths long, i.e. 30 at the default smoothing. For a cubic tile that is about 27k points and 170k tetrahedra per rank. Below this the code stops with an error. Axes that are not split (e.g. a thin domain on few ranks) are not limited by the halo, but every side of the box, split or not, must be at least 3 target edge lengths.
-   - **Halo overhead and memory.** In 3D the halo is a large fraction of the work: a cubic tile at the minimum size generates up to 8 times as many points as it owns, falling to about 2.2 times at 100 target edge lengths per side. TetGen needs about 120 bytes per tetrahedron (about 740 bytes per point, at about 6.2 tetrahedra per point) during each triangulation, on top of the halo points themselves. The peak memory of a whole run is much higher: about 3.7 GB on one rank for 1.03M points and 6.3M tetrahedra (the unit cube at a target edge length of 0.01, opt build), i.e. roughly 3.5 KB per point, mostly PETSc's 3D interpolation of the mesh (building its faces and edges) when the DMPlex is created. The default ``-target_edge_length`` of 0.0025 (about 64M points) would need far more than that on one rank.
-   - **Not run at scale.** The 3D generator, including the sliver repair and the flips, has only been run on a handful of ranks; the weak scaling results below are for 2D.
-
-### Checking a change does not alter the mesh
-
-To compare two builds of the library bit for bit (e.g. before and after a change to the code), build ``make mesh_checksum`` and run it with the same options against each build: it prints per-rank hashes of the topology, coordinates, point SF and labels of a generated mesh (and of the mesh after one refinement). It takes the same ``-dim``, ``-target_edge_length``, ``-domain_width``, ``-domain_height``, ``-domain_depth``, ``-final_smooth_its`` and ``-agglomeration_factor`` options as the executable, so it works for 3D meshes too.
 
 ### Weak scaling   
 
