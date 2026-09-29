@@ -108,9 +108,6 @@ A 3D tetrahedral mesh of the box [0,width] x [0,height] x [0,depth] is generated
      // Tetrahedral mesh of a 2.0 x 1.5 x 0.75 box
      dm = GenerateBoxMeshDM3D(PETSC_COMM_WORLD, 0.02, 2.0, 1.5, 0.75, final_smooth_its, integrity_check, print_stats);
 
-     // With agglomeration, see below
-     dm = GenerateBoxMeshDM3DAgglom(PETSC_COMM_WORLD, 0.02, 2.0, 1.5, 0.75, final_smooth_its, integrity_check, print_stats, agglom_factor);
-
 ### Boundary labels
 
 The boundary faces (edges in 2D) are labelled in both the ``"Face Sets"`` and ``"markers"`` labels. The labels are reapplied when the DM is refined, e.g., with ``-dm_refine``.
