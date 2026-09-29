@@ -2737,6 +2737,7 @@ struct IntegrityAccum {
     long nonpositive_count;     // 3D only: tetrahedra with signed volume <= 0 (always 0 in 2D)
     long boundary_vertex_count; // 3D only: owned vertices on a wall (always 0 in 2D)
     double min_dihedral;        // 3D only: smallest dihedral angle in degrees (unused in 2D)
+    long low_quality_count;     // 3D only: tetrahedra below MIN_ETA3_3D or MIN_DIHEDRAL_DEG_3D (always 0 in 2D)
     int bad_print_count;
 };
 
@@ -2746,10 +2747,21 @@ const double MAX_EDGE_RATIO = 3.0;
 // only catches slivers (e.g. a wall point stuck next to a corner)
 const double MIN_ANGLE_DEG = 5.0;
 const int MAX_BAD_PRINTS = 5;
-// Smallest acceptable eta^3 of a tetrahedron in the 3D integrity check. 0 disables the test
-// (eta^3 is never negative) until a threshold is set from measurements of generated meshes;
-// the check prints the measured minimum either way
-const double MIN_ETA3_3D = 0.0;
+// Smallest acceptable eta^3 and dihedral angle of a tetrahedron in the 3D integrity check, set
+// from measured meshes (unit cube, 2x1x0.5, 3x1x1, 1.5x1x1, 2x2x0.5 and thin boxes, target edge
+// lengths 0.01-0.05 and scaled domains, 1-12 ranks, agglomerated, 0-8 final smoothing
+// iterations). With the sliver repair (RepairSlivers) the worst tetrahedron of any of them had
+// eta^3 6.3e-3 and a smallest dihedral angle of 3.8 degrees (6 ranks, agglomerated, no final
+// smoothing); with the default 4 final smoothing iterations every one had eta^3 >= 3.8e-2 and
+// dihedral angles >= 9.8 degrees. Without the repair the same meshes have slivers with eta^3
+// 4e-7 to 3e-5 and dihedral angles of 0.03 to 0.3 degrees. The thresholds sit about 4x (angle)
+// and 12x (eta^3) below the worst repaired mesh, so ordinary variation in the point cloud
+// passes, and about 3x and 16x above the best unrepaired one, so a regression of the repair (or
+// any nearly flat tetrahedron) fails.
+// The dihedral angle is the bound users read; eta^3 also catches needle-like tetrahedra whose
+// dihedral angles can stay reasonable
+const double MIN_ETA3_3D = 5e-4;
+const double MIN_DIHEDRAL_DEG_3D = 1.0;
 
 // Accumulate the integrity measures of one point owned by this rank (orphans included)
 template <int DIM>
@@ -2875,6 +2887,20 @@ void integrity_accumulate_simplex<3>(const Point<3> *const *p, int rank, int siz
     tet_dihedral_range(q, min_angle, max_angle);
     acc.min_dihedral = std::min(acc.min_dihedral, min_angle);
 
+    if (eta3 < MIN_ETA3_3D || min_angle < MIN_DIHEDRAL_DEG_3D) {
+        acc.low_quality_count++;
+        if (acc.bad_print_count < MAX_BAD_PRINTS) {
+            std::cout << "[Rank " << rank << "] LOW QUALITY TETRAHEDRON: eta^3 " << eta3 << ", smallest dihedral angle "
+                      << min_angle << " deg, largest " << max_angle << " deg\n";
+            for (int a = 0; a < 4; ++a) {
+                std::cout << "   P" << a << ": (";
+                print_coords<3>(std::cout, p[a]->c);
+                std::cout << ") Owner: " << get_owner_rank(*p[a], size) << " ID: " << p[a]->unique_hash_id << "\n";
+            }
+            acc.bad_print_count++;
+        }
+    }
+
     // Boundary faces: the face opposite vertex k is on a wall if all three of its vertices are
     for (int k = 0; k < 4; ++k) {
         const Point<3> *f[3];
@@ -2956,7 +2982,7 @@ bool evaluate_integrity<2>(long num_tris_owned_global, long num_points_owned_glo
 
 // 3D: total signed volume, boundary surface area, no inverted or flat tetrahedra, the boundary
 // surface is a sphere (V - E + F = 2 on it, with 3F = 2E), edge lengths, minimum eta^3 (disabled
-// by default, see MIN_ETA3_3D) and ghost coordinates. The Euler characteristic of the whole mesh
+// see MIN_ETA3_3D and MIN_DIHEDRAL_DEG_3D) and ghost coordinates. The Euler characteristic of the whole mesh
 // is checked on the created DM instead, by CheckDMIntegrity, as the 2D formula from boundary edge
 // counts does not carry over to 3D. Also prints the measured minimum quality
 template <>
@@ -2978,7 +3004,7 @@ bool evaluate_integrity<3>(long num_tris_owned_global, long num_points_owned_glo
     bool orientation_pass = (global.nonpositive_count == 0);
     bool sphere_pass = (boundary_faces % 2 == 0 && boundary_euler == 2);
     bool edge_pass = (global.bad_edge_count == 0);
-    bool quality_pass = (min_eta3 >= MIN_ETA3_3D);
+    bool quality_pass = (global.low_quality_count == 0);
     bool ghost_pass = (global_ghost_mismatch_count == 0);
 
     // Restore the stream format afterwards, the stats that follow use the default
@@ -3000,7 +3026,13 @@ bool evaluate_integrity<3>(long num_tris_owned_global, long num_points_owned_glo
             std::cout << "  [FAIL] Bad Edges: " << global.bad_edge_count << " tetrahedra with edges > " << MAX_EDGE_RATIO << "x target.\n";
             std::cout << "         Max Edge: " << global.max_edge_len << "\n";
         }
-        if (!quality_pass) std::cout << "  [FAIL] Min eta^3: " << min_eta3 << " (Expected >= " << MIN_ETA3_3D << ")\n";
+        if (!quality_pass) {
+            std::cout << std::defaultfloat << std::setprecision(6);
+            std::cout << "  [FAIL] Tetrahedron quality: " << global.low_quality_count << " tetrahedra with eta^3 < " << MIN_ETA3_3D
+                      << " or a dihedral angle < " << MIN_DIHEDRAL_DEG_3D << " deg\n";
+            std::cout << "         Min eta^3: " << min_eta3 << ", Min Dihedral Angle: " << global.min_dihedral << " deg"
+                      << " (slivers the sliver repair did not remove, see RepairSlivers)\n";
+        }
         if (!ghost_pass) std::cout << "  [FAIL] Ghost coordinates: " << global_ghost_mismatch_count << " mismatches\n";
         std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
     }
@@ -3061,6 +3093,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     local.nonpositive_count = 0;
     local.boundary_vertex_count = 0;
     local.min_dihedral = 360.0;
+    local.low_quality_count = 0;
     local.bad_print_count = 0;
 
     // 1. Count Owned Points (needed for Euler)
@@ -3098,6 +3131,7 @@ static bool CheckMeshIntegrity(MPI_Comm comm,
     MPI_Reduce(&local.bad_edge_count, &global.bad_edge_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local.nonpositive_count, &global.nonpositive_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local.boundary_vertex_count, &global.boundary_vertex_count, 1, MPI_LONG, MPI_SUM, 0, comm);
+    MPI_Reduce(&local.low_quality_count, &global.low_quality_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local_ghost_mismatch_count, &global_ghost_mismatch_count, 1, MPI_LONG, MPI_SUM, 0, comm);
     MPI_Reduce(&local.max_edge_len, &global.max_edge_len, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     MPI_Reduce(&local.max_badness, &global.max_badness, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
