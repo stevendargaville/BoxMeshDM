@@ -12,9 +12,9 @@ piece directly in the right place. The price is the restrictions in [README.md](
 (box domain, uniform resolution, a minimum size per rank, result depends on rank count).
 
 The 2D generator is validated at scale and is the thing to protect. The 3D generator is new and
-not run at scale; after the sliver repair and guarded smoothing its minimum dihedral angle is about
-11.5 degrees at the default smoothing (about 9 with no final smoothing, 6.4 in the worst case
-measured), see
+not run at scale; after the sliver repair, the flips and the guarded smoothing its minimum
+dihedral angle is about 21 degrees at the default smoothing (about 19 with no final smoothing,
+17.4 in the worst case measured), see
 [Known limitations](#known-limitations-and-ideas).
 
 Files:
@@ -101,7 +101,8 @@ and `Simplex<DIM>` (`int v[DIM + 1]`), and instantiated through `GenerateBoxMesh
   `facet_wall_value`, `integrity_accumulate_simplex`, `integrity_accumulate_owned_point`,
   `RepairSlivers`, `evaluate_integrity`, `CheckDMIntegrity`,
   `stats_accumulate_simplex`, `edge_orientation_bin`, `print_simplex_stats`,
-  `factorize_min_cut`, `validate_inputs`, `volume_tolerance`, `print_domain_header`. A 3D retune
+  `factorize_min_cut`, `validate_inputs`, `volume_tolerance`, `print_domain_header`. The flips
+  (`FlipTetrahedra3D`) are plain 3D functions called only from `RepairSlivers<3>`. A 3D retune
   of anything shared becomes a `<3>` specialisation, not a branch.
 - **Token-for-token rule for the 2D path.** Every floating-point expression the 2D build
   executes keeps the old code's exact form: parenthesisation, association, divide vs multiply
@@ -159,13 +160,16 @@ then runs `process_tile` → optional `CheckMeshIntegrity` / `ComputeAndPrintSta
   `ResolveBoundaryOwnership`, then `final_smooth_its` rounds without jitter, then a final
   triangulation and `ResolveBoundaryOwnership`. Only points inside tile ± `sync_margin` move;
   the outer halo rim is frozen so it doesn't collapse inward.
-- **Sliver repair and guarded smoothing (3D only).** `RepairSlivers<3>` (a no-op `<2>`) keeps
-  the final tetrahedralisation and moves vertices on it in two passes. First, for 24 rounds,
+- **Sliver repair, flips and guarded smoothing (3D only).** `RepairSlivers<3>` (a no-op `<2>`)
+  keeps the final tetrahedralisation and improves it in three steps: a vertex pass, flips that
+  change the connectivity (next item), and a second vertex pass on the new connectivity. It takes
+  the tet list by (non-const) reference and returns only the rank's *maintained* tets (next item),
+  a superset of the ones it owns. First, for 24 rounds,
   vertices of tets with `eta^3 < 0.05` (`SLIVER_REPAIR_ETA3_3D`) try steps along the normal of the
   opposite face and the `eta^3` gradient of the worst tet in their star, keeping the one that
-  most improves the star's worst `eta^3`. Then, for 16 rounds (`SMOOTH_ROUNDS_3D`), vertices of
-  tets with `eta^3 < 0.2` (`SMOOTH_ETA3_3D`) step down the gradient of `F = sum 1/eta^3` over their
-  star (0.3, 0.15, 0.075 edge lengths, the first that lowers `F` and strictly raises the star's
+  most improves the star's worst `eta^3`. Then the flips. Then, for 16 rounds
+  (`SMOOTH_ROUNDS_3D`), vertices of tets with `eta^3 < 0.2` (`SMOOTH_ETA3_3D`) step down the
+  gradient of `F = sum 1/eta^3` over their star (0.3, 0.15, 0.075 edge lengths, the first that lowers `F` and strictly raises the star's
   worst `eta^3`). In both, a move is accepted only if the star's worst `eta^3` strictly improves,
   and each round only an independent set moves (a point goes only if its star is worse than that
   of every other movable point in it, ties by a hash priority), so no two vertices of a tet move
@@ -183,8 +187,37 @@ then runs `process_tile` → optional `CheckMeshIntegrity` / `ComputeAndPrintSta
   and that threw away most repairs within `sync_margin` of an interface. `eta^3` and its gradient
   are evaluated in a vertex order sorted by hash id (`canonical_tet_order`), and `F` and its
   gradient are summed over the star sorted by the tets' ids (`tet_before`), so ranks storing a tet
-  or a star differently agree. Cost: about 17% of `process_tile` at the default smoothing (TEL
-  0.02, 1 rank: 3.8 of 22.7 s), 45% at 0 (7.4 of 16.2 s).
+  or a star differently agree. Every star a vertex pass reads (an owned point's and its
+  neighbours') must be of a maintained point; `refresh` aborts otherwise. Cost of the whole of
+  `RepairSlivers` (TEL 0.02, 1 rank, medians of 3 on a loaded machine): 2.6 of 21.7 s of
+  `process_tile` at the default smoothing (before the flips: 3.8 of 23.0 s, the smoothing pass
+  after the flips has much less to do), 9.6 of 18.7 s at 0 (before: 7.4 of 16.5 s).
+- **Flips (3D only).** `FlipTetrahedra3D`, between the two vertex passes: the 2-3 flip of an
+  interior face and the removal of an interior edge with a closed ring of up to 7 tets
+  (`FLIP_MAX_RING_3D`; 3-2 and 4-4 are rings of 3 and 4), replaced by the max-min triangulation of
+  the ring (dynamic programming). Candidates are tets whose smallest dihedral-angle sine
+  (`tet_min_sine`, `6V|e|/(|n_k||n_l|)`, no `acos`) is below 0.5 (`FLIP_SINE_3D`, 30 degrees); a
+  flip is made only if the smallest sine of its new tets strictly beats that of its old ones
+  (which also keeps every new tet positive with a margin, and the boundary surface is never
+  touched). Up to 8 rounds (`FLIP_ROUNDS_3D`, stops early when no rank flips); each round
+  re-evaluates only candidates with a vertex whose star changed or whose proposal lost (exactly
+  the same result as re-evaluating all). **Consistency by construction:** every flip has a *key*
+  vertex in all its old tets (the smaller id of the removed edge, the smallest id of the removed
+  face); only the key's owner proposes it (it holds all the old tets). Proposals go to the
+  neighbours that may maintain one of its vertices (tags 107/108) and a proposal wins if it beats
+  (larger new smallest sine, then a hash of the ids) every proposal sharing an old tet with it:
+  both owners of two such proposals have both, so at most one wins. Winners go to the same ranks
+  (tags 109/110) and every rank applies all of them in hash order. A rank *maintains* exactly the
+  tets with a vertex that started within `FLIP_MAINTAINED_MARGIN_3D` = 4.5 edge lengths of its
+  tile (fixed set); all other tets are dropped at the start of `RepairSlivers<3>`, and applying a
+  flip removes the old tets it holds and adds the new tets with a maintained vertex, so the
+  maintained set stays exact round after round (checked: a missing old tet or a missing vertex
+  aborts). Measured on 2 ranks at fs 0 (pad 11 edge lengths): the maintained set is exact up to a
+  margin of 9 edge lengths (10 fails), and a margin of 1.5 is too small for the vertex passes (2.5
+  works). The result does not depend on the rank count beyond what the vertex passes already
+  did: minimum tiles (TEL 0.0166, fs 4) give a minimum dihedral angle of 20.26 degrees on 1, 2, 4
+  and 8 ranks. Flipping only away from the interfaces (no communication) left 14.3 degrees and
+  2.6-3.3% below 30 degrees on 4-8 ranks.
 - **Filtering.** A simplex belongs to the rank owning its vertex with the **smallest
   `unique_hash_id`**. Points owned spatially but in no owned simplex are kept as **orphans** so
   the rank can still hand out their global ids.
@@ -223,7 +256,8 @@ There is no global consensus step for geometry: ranks that generate the same poi
   and from `unique_hash_id ^ iteration` for jitter. No shared state, no rank dependence.
 - **`ResolveBoundaryOwnership`**: after each smoothing round, neighbouring ranks (8 in 2D, 26 in
   3D) exchange claims (tag 999) and all adopt the coordinates of the **lowest-numbered claiming
-  rank**. The 3D sliver repair is the exception: owner wins (tags 104-106), see above. So the 3D
+  rank**. The 3D sliver repair is the exception: owner wins (tags 104-106), and the flips are
+  decided by the owner of their key vertex (tags 107-110), see above. So the 3D
   mesh is not bitwise invariant to `pad` (a different pad changes what the lowest rank sees
   within `sync_margin`); its quality statistics agree across rank counts to about 0.02%.
 - **Boundary constraints**: boundary points only slide within their wall, edge or (fixed)
@@ -247,27 +281,43 @@ tet), so `eta^3` goes to 0 for slivers and also catches needles whose angles loo
 thresholds come from measured meshes: they were set about 12x (`eta^3`) and 4x (angle) below
 the worst mesh with the sliver repair alone (6.3e-3 / 3.78 degrees: 6 ranks, agglomerated, no
 final smoothing) and 16x / 3x above the best unrepaired one, so the pre-repair code fails them.
-With the guarded smoothing the same case gives 1.96e-2 / 6.44 degrees, the worst measured; the
-thresholds were left alone, as raising them would still not catch a mesh with the repair alone.
-If you change the smoothing or the repair, re-measure before touching them. The 3D stats print three histograms: `eta^3`,
-the smallest dihedral angle per tet (with the count below 5 degrees) and the largest.
+With the guarded smoothing the same case gives 1.96e-2 / 6.44 degrees, and with the flips
+0.106 / 18.2 degrees (the smallest angle measured anywhere is 17.4 degrees, 3 ranks on a 3x1x1
+box at fs 0). The thresholds were left alone: they could now be raised several-fold, but would
+then no longer describe a mesh with the repair alone, the case they were set for. If you change
+the smoothing, the flips or the repair, re-measure before touching them. The 3D stats print three
+histograms: `eta^3`, the smallest dihedral angle per tet (with the count below 5 degrees) and the
+largest.
 
 ## Known limitations and ideas
 
-- **Bulk quality** (3D): smoothing on fixed connectivity plateaus. At TEL 0.02 about 0.12% of
-  tets have a dihedral angle below 20 degrees at the default smoothing (3.2% at 0, 0.03% at 8)
-  and 9.2% below 30 (20.6% at 0); mean `eta^3` is about 0.60 (0.49 at 0), slightly lower than
-  with the sliver repair alone (0.61), because lifting a vertex's worst tets lowers some of its
-  good ones. More final smoothing helps but widens the halo. A few tets whose vertices the
-  boundary constraints hold (e.g. 6.5 degrees on the fs 0 2x1x0.5 box) are not improved.
+- **Bulk quality** (3D): at TEL 0.02 on the unit cube no tet has a dihedral angle below 20
+  degrees and about 1.2% are below 30 at the default smoothing (5.6% at fs 0, 0.6% at fs 8);
+  the largest dihedral angle is about 143 degrees (146 at fs 0) and mean `eta^3` about 0.65
+  (0.55 at fs 0, 0.68 at fs 8). The share below 30 at fs 0 is what the flips cannot reach with
+  30 degree candidates in 8 rounds; more final smoothing helps but widens the halo. The flips
+  remove about 5% of the tets (3-2 flips dominate). Boundary faces are never flipped.
+- **Cost at fs 0** (3D): the flips cost about +13% of `process_tile` at fs 0 (many candidates,
+  about 180k in the first round at TEL 0.02) while at the default smoothing the whole of
+  `RepairSlivers` got cheaper.
 - **Not Delaunay** (3D): the repaired mesh is valid and positively oriented, not Delaunay.
-- **Not run at scale** (3D), including the repair.
+- **Not run at scale** (3D), including the repair and the flips.
 - Ideas not yet pursued: sliver exudation via a weighted Delaunay with hash-derived weights
-  (TetGen supports weights); edge/face flips after the smoothing. Already measured and rejected
-  (see the commits "Repair slivers on the final 3D tetrahedralisation" and "Add a
-  quality-guarded smoothing pass after the 3D sliver repair"): an ODT target, sliver-normal
+  (TetGen supports weights); multi-face removal; flips that change the boundary surface
+  triangulation within a wall. Already measured and rejected (see the commits "Repair slivers on
+  the final 3D tetrahedralisation", "Add a quality-guarded smoothing pass after the 3D sliver
+  repair" and "Flip tetrahedra between the 3D vertex passes"): an ODT target, sliver-normal
   candidates inside Lloyd, less or no spring, a max-min (active-set) smoothing step, which
-  equalises a star and lowers its good tets, and `F = sum 1/(eta^3)^2`.
+  equalises a star and lowers its good tets, and `F = sum 1/(eta^3)^2`. For the flips: `eta^3` as
+  the flip measure (3.7% below 30 degrees at fs 4 with candidates below 0.2; 1.5% with candidates
+  below 0.4, but a repair time of 9.6 s against 5.3 s for the sine measure before it was made
+  cheaper), flipping after the smoothing pass instead of before it (minimum 14.6 vs 20.8 degrees
+  at fs 4; smoothing again afterwards recovers it at a higher cost), a sine threshold of 0.4 or
+  0.6 instead of 0.5 (4.1% below 30 degrees, or no gain at a much higher cost), only 2-3/3-2
+  flips (fs 0 minimum 10.3 degrees), rings of at most 4 (fs 0 minimum `eta^3` lower), an extra
+  flip pass after the smoothing (a little better, costlier), flips before the sliver repair (a
+  little better at fs 4, much costlier at fs 0), and flipping only away from the interfaces (see
+  above).
 
 ## Agglomeration
 
