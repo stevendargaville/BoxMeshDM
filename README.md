@@ -148,7 +148,7 @@ Setting ``agglom_factor = 1`` produces exactly the same mesh as ``GenerateBoxMes
 
 ### Weak scaling   
 
-Weak scaling results on ARCHER2 show the code is reasonably performant when generating large meshes in parallel:
+Weak scaling results in 2D on ARCHER2 show the code is reasonably performant when generating large meshes in parallel:
 
    | Compute nodes  | MPI ranks | Target edge length | Elements | Min angle (degrees) | Min/max volume ratio | Load imbalance | Time (s) |
    | --- | -- | -- | --- | --- | --- | --- |  --- |
