@@ -145,7 +145,10 @@ then runs `process_tile` → optional `CheckMeshIntegrity` / `ComputeAndPrintSta
   interior point.
 - **Points.** Boundary points from the feature table (2D: 4 corners then walls L,R,B,T; 3D: 8
   corners, 12 edges, 6 faces), evenly spaced at `length / round(length / TARGET_EDGE_LENGTH)`
-  (stepping by the edge length could strand a point next to a corner as a sliver); one jittered
+  (stepping by the edge length could strand a point next to a corner as a sliver), and kept by
+  index along each free axis (1..n-1 for n = round(length / TARGET_EDGE_LENGTH)), not by
+  coordinate: from a side of 1024 up `SIZE - EPSILON` rounds to `SIZE`, so a coordinate test kept
+  index n when it landed 1 ulp inside the far edge, next to the explicit point there; one jittered
   interior point per grid cell, rejected near the walls. In 3D the points are then sorted by
   `unique_hash_id` so any cospherical tie in TetGen is broken the same way on every rank, and
   face points are jittered in-plane from the first iteration so the boundary lattice is not

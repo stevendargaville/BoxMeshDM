@@ -158,6 +158,9 @@ tests: BoxMeshDM
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.1
 # Explicit -dim 2 is the default
 	./BoxMeshDM -dim 2 -target_edge_length 0.01
+# 1e5/2702.7... = 37 wall pieces per side; the last wall point used to land 1 ulp inside the far
+# corner (a side of 1024 or more is too long for the EPSILON test) and make a flat triangle
+	./BoxMeshDM -target_edge_length 2702.7027027027025 -domain_width 1e5 -domain_height 1e5
 # 3D (tetrahedral) meshes, only when PETSc has TetGen. TetGen is compiled at -O0 in debug builds,
 # so these are small and mostly without final smoothing. On every axis split between ranks the
 # tile must be at least 2 * (11 + final_smooth_its) target edge lengths, or the halo check stops
@@ -175,6 +178,9 @@ ifeq ($(PETSC_HAVE_TETGEN),1)
 	$(MPIEXEC) -n 4 ./BoxMeshDM -dim 3 -target_edge_length 0.02 -final_smooth_its 1 -agglomeration_factor 2
 # 2x2x2 tiles - face, edge and corner neighbours
 	$(MPIEXEC) -n 8 ./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0
+# 1e5/9090.9... = 11 wall pieces per side; the last wall point used to land 1 ulp inside the far
+# edges and make flat tetrahedra
+	./BoxMeshDM -dim 3 -target_edge_length 9090.90909090909 -domain_width 1e5 -domain_height 1e5 -domain_depth 1e5
 endif
 	$(MAKE) lib
 # Build (not run) the checksum harness so it keeps compiling

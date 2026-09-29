@@ -1849,7 +1849,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
     // (1,0) -> Max,0
     // (0,1) -> 0,Max
     // (1,1) -> Max,Max
-    // Wall points exclude corners (EPSILON checks) to avoid duplication with explicit corners.
+    // Wall points exclude corners (by index, see below) to avoid duplication with explicit corners.
     int max_idx = far_wall_grid_index<DIM>(); // Just a large number for the "1.0" side
 
     // Wall points are spaced evenly, round(length / TARGET_EDGE_LENGTH) pieces per wall, so the
@@ -1857,9 +1857,16 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
     // wall point arbitrarily close to that corner (0.01 L for L = 0.0099), where
     // boundary_move_valid won't let it move out, leaving a sliver triangle. When the wall length
     // is a whole multiple of TARGET_EDGE_LENGTH the spacing (and so the mesh) is unchanged.
+    // A wall point is kept by its index along each free axis, 1 to wall_n - 1 (0 and wall_n are
+    // the edges and corners, which are added explicitly), not by its coordinate: from a side of
+    // 1024 up, DOMAIN_SIZE - EPSILON rounds to DOMAIN_SIZE, and index wall_n can land 1 ulp inside
+    // the far edge, which a coordinate test would keep, next to the explicit point there
     double wall_d[DIM];
+    int wall_n[DIM];
     for (int d = 0; d < DIM; ++d) {
-        wall_d[d] = DOMAIN_SIZE[d] / std::max(1.0, std::round(DOMAIN_SIZE[d] / TARGET_EDGE_LENGTH));
+        double wall_pieces = std::max(1.0, std::round(DOMAIN_SIZE[d] / TARGET_EDGE_LENGTH));
+        wall_d[d] = DOMAIN_SIZE[d] / wall_pieces;
+        wall_n[d] = static_cast<int>(wall_pieces);
     }
 
     const int (*features)[DIM];
@@ -1901,7 +1908,7 @@ static void process_tile(MPI_Comm comm, int final_smooth_its, const int *tile,
                 } else {
                     x[d] = idx[d] * wall_d[d];
                     grid_idx[d] = idx[d];
-                    if (!(x[d] > EPSILON && x[d] < DOMAIN_SIZE[d] - EPSILON)) keep = false;
+                    if (!(idx[d] >= 1 && idx[d] <= wall_n[d] - 1)) keep = false;
                 }
             }
             if (keep) {
