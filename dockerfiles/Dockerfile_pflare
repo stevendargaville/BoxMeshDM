@@ -37,7 +37,9 @@ ENV CFLAGS="${CFLAGS} -I${BOX_PREFIX}" \
 
 # Use the branch supg_box_mesh in PFLARE which modifies the supg and DG
 # tests to use the BoxMeshDM library to generate a mesh
-# Verify the solution is 1 everywhere in serial and parallel
+# Verify the solution is 1 everywhere in serial and parallel, in 2D and in 3D
+# The 3D sizes are coarse to keep them quick. On 2 ranks the box is long in x so
+# the tiles are at least 2 * (11 + final_smooth_its) edge lengths wide
 RUN set -e; \
     cd /build && \
     git clone https://github.com/PFLAREProject/PFLARE.git && \
@@ -50,6 +52,8 @@ RUN set -e; \
     ./adv_dg_upwind -target_edge_length 0.01 -pc_type air -verify_solution && \
     ./adv_dg_upwind -target_edge_length 0.01 -domain_height 2.0 -pc_type air -verify_solution && \
     mpiexec -n 2 ./adv_dg_upwind -target_edge_length 0.01 -pc_type air -verify_solution && \
-    mpiexec -n 2 ./adv_dg_upwind -target_edge_length 0.01 -domain_height 2.0 -pc_type air -verify_solution
+    mpiexec -n 2 ./adv_dg_upwind -target_edge_length 0.01 -domain_height 2.0 -pc_type air -verify_solution && \
+    ./adv_dg_upwind -dim 3 -target_edge_length 0.1 -pc_type air -verify_solution && \
+    mpiexec -n 2 ./adv_dg_upwind -dim 3 -target_edge_length 0.1 -final_smooth_its 0 -domain_width 4.5 -domain_height 0.5 -domain_depth 0.5 -pc_type air -verify_solution
 
 WORKDIR /build/BoxMeshDM
