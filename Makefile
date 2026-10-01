@@ -30,6 +30,12 @@ export PETSC_HAVE_TRIANGLE := $(if $(call _have_conf,PETSC_HAVE_TRIANGLE),1,0)
 ifeq ($(PETSC_HAVE_TRIANGLE),0)
 $(error PETSc has not been configured with Triangle support. Reconfigure PETSc with --download-triangle)
 endif
+# Check for TetGen support - optional, only the 3D generator needs it. Without it BoxMeshDM
+# still builds, and asking for a 3D mesh stops with an error
+export PETSC_HAVE_TETGEN := $(if $(call _have_conf,PETSC_HAVE_TETGEN),1,0)
+ifeq ($(PETSC_HAVE_TETGEN),0)
+$(warning PETSc has not been configured with TetGen support, 3D meshes are not available. Reconfigure PETSc with --download-tetgen to enable them)
+endif
 export PETSC_USE_SHARED_LIBRARIES := $(if $(call _have_conf,PETSC_USE_SHARED_LIBRARIES),1,0)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -58,8 +64,9 @@ endif
 endif
 
 # All the files required by BoxMeshDM - the library is built from these, the
-# executable also links in BoxMeshDM_main.o, which is the only object with main
-OBJS := BoxMeshDM.o
+# executable also links in BoxMeshDM_main.o, which is the only object with main.
+# BoxMeshDM_tetgen.o is the 3D Delaunay backend (TetGen), kept in its own object
+OBJS := BoxMeshDM.o BoxMeshDM_tetgen.o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Rules
@@ -107,6 +114,18 @@ else
 endif
 endif
 
+# Print per-rank hashes of a generated mesh, to compare two builds of the library bit for bit
+mesh_checksum: mesh_checksum.o $(LIB_OUT)
+ifeq ($(PETSC_USE_SHARED_LIBRARIES),0)
+	$(LINK.cc) -o mesh_checksum mesh_checksum.o $(LIB_OUT) $(PETSC_LIB)
+else
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
+	$(LINK.cc) -o mesh_checksum mesh_checksum.o -L. -lboxmeshdm $(PETSC_LIB) -Wl,-rpath,@loader_path
+else
+	$(LINK.cc) -o mesh_checksum mesh_checksum.o -L. -lboxmeshdm $(PETSC_LIB) -Wl,-rpath,'$$ORIGIN'
+endif
+endif
+
 tests_lib: test_lib
 	@echo "Running tests on library..."
 	./test_lib
@@ -135,7 +154,37 @@ tests: BoxMeshDM
 	./BoxMeshDM -target_edge_length 0.005 -agglomeration_factor 1
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -agglomeration_factor 2
 	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.5 -agglomeration_factor 2
+# Thin domain - the halo is wider than half the tile height, but y is not split between ranks
+	$(MPIEXEC) -n 2 ./BoxMeshDM -target_edge_length 0.005 -domain_width 2.0 -domain_height 0.1
+# Explicit -dim 2 is the default
+	./BoxMeshDM -dim 2 -target_edge_length 0.01
+# 1e5/2702.7... = 37 wall pieces per side; the last wall point used to land 1 ulp inside the far
+# corner (a side of 1024 or more is too long for the EPSILON test) and make a flat triangle
+	./BoxMeshDM -target_edge_length 2702.7027027027025 -domain_width 1e5 -domain_height 1e5
+# 3D (tetrahedral) meshes, only when PETSc has TetGen. TetGen is compiled at -O0 in debug builds,
+# so these are small and mostly without final smoothing. On every axis split between ranks the
+# tile must be at least 2 * (11 + final_smooth_its) target edge lengths, or the halo check stops
+ifeq ($(PETSC_HAVE_TETGEN),1)
+	@echo "Running 3D tests on executable..."
+# Default smoothing on one rank
+	./BoxMeshDM -dim 3 -target_edge_length 0.033
+# Non-cubic box on one rank, the halo is cut off by the walls on every axis
+	./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0 -domain_width 2.0 -domain_depth 0.5
+# Two ranks, one interface
+	$(MPIEXEC) -n 2 ./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0
+# 3x1x1 tiles on a 3 x 1 x 1 box - ranks 0 and 2 are not neighbours
+	$(MPIEXEC) -n 3 ./BoxMeshDM -dim 3 -target_edge_length 0.03 -final_smooth_its 0 -domain_width 3.0
+# Agglomeration, with a final smoothing iteration across the interfaces
+	$(MPIEXEC) -n 4 ./BoxMeshDM -dim 3 -target_edge_length 0.02 -final_smooth_its 1 -agglomeration_factor 2
+# 2x2x2 tiles - face, edge and corner neighbours
+	$(MPIEXEC) -n 8 ./BoxMeshDM -dim 3 -target_edge_length 0.022 -final_smooth_its 0
+# 1e5/9090.9... = 11 wall pieces per side; the last wall point used to land 1 ulp inside the far
+# edges and make flat tetrahedra
+	./BoxMeshDM -dim 3 -target_edge_length 9090.90909090909 -domain_width 1e5 -domain_height 1e5 -domain_depth 1e5
+endif
 	$(MAKE) lib
+# Build (not run) the checksum harness so it keeps compiling
+	$(MAKE) mesh_checksum
 	$(MAKE) tests_lib
 	@echo "All tests completed successfully!"
 
@@ -143,4 +192,4 @@ tests: BoxMeshDM
 
 # Cleanup
 clean::
-	$(RM) $(OUT) $(LIB_OUT) $(OBJS) BoxMeshDM_main.o test_lib test_lib.o *.dat
+	$(RM) $(OUT) $(LIB_OUT) $(OBJS) BoxMeshDM_main.o test_lib test_lib.o mesh_checksum mesh_checksum.o *.dat

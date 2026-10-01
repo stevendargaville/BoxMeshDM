@@ -1,8 +1,8 @@
-This code builds triangular unstructured meshes for a 2D rectangular domain in parallel with MPI, designed for use with PETSc. It depends on PETSc configured with triangle (``--download-triangle``) and returns a parallel DMPlex object which stores the unstructured mesh. To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
+This code builds unstructured meshes of a box in parallel with MPI, designed for use with PETSc: triangles on a 2D rectangle, or tetrahedra on a 3D box. It returns a parallel DMPlex object which stores the unstructured mesh. It depends on PETSc configured with Triangle (``--download-triangle``), and 3D meshes also need TetGen (``--download-tetgen``, see [Dependencies and licences](#dependencies-and-licences)). To generate large meshes ensure PETSc is configured with 64-bit integers (``--with-64-bit-indices``).
 
 ### Domain Size
 
-The domain size can be specified by passing in the ``-domain_width`` and ``-domain_height`` command line arguments. The default domain size is [0,1] x [0,1].
+The domain size can be specified by passing in the ``-domain_width`` and ``-domain_height`` command line arguments, and ``-domain_depth`` for 3D meshes. The default domain is [0,1] x [0,1] in 2D and [0,1] x [0,1] x [0,1] in 3D.
 
 ### Motivation
 
@@ -17,23 +17,35 @@ This code instead:
    - Produces load-balanced meshes without explicitly calling a mesh partitioner such as ParMETIS.
 
 To enable this several compromises were made, namely:   
-   - Can only produce meshes on a simple rectangular domain.
+   - Can only produce meshes on a simple rectangular (2D) or box (3D) domain.
    - Uniform resolution throughout the domain.
    - Produces good elements (e.g., with reasonable angles and volume ratios) but not necessarily optimal.
    - The mesh has reasonably low communication volume, but is not necessarily communication minimising. A mesh partitioner like ParMETIS can be explicitly called by using ``DMPlexDistribute`` on the returned DM to further minimise the communication volume.
    - Not fully optimised for speed/memory.
-   - Not robust when the number of elements per MPI rank is small (say <100k).
+   - Not robust when the number of elements per MPI rank is small (say <100k in 2D or <200k in 3D).
    - If differing numbers of MPI ranks are used, the mesh produced is not identical.
+
+### Dependencies and licences
+
+BoxMeshDM needs PETSc 3.24 or later. The 2D generator uses [Triangle](https://www.cs.cmu.edu/~quake/triangle.html) (``--download-triangle``), which is required. The 3D generator uses [TetGen](https://wias-berlin.de/software/tetgen/) 1.6 (``--download-tetgen``), which is optional: without it BoxMeshDM still builds (``make`` prints a warning), the 3D tests are skipped, and asking for a 3D mesh stops with an error at runtime.
+
+BoxMeshDM itself is MIT licensed, but the libraries it links against are not:
+   - Triangle may be used freely for research and private use, but distributing it as part of a commercial product requires an arrangement with its author.
+   - TetGen 1.6 is licensed under the GNU Affero General Public License v3 (AGPLv3). A commercial licence is available from its authors.
+
+Check that these terms suit you before distributing anything built against them.
 
 ### Building the code as an executable
 
 To build an executable which can be called from the command line for small scale testing, ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make``. 
 
-There are six input variables that can be changed from the command line:   
+The options that can be changed from the command line are below, along with ``-domain_width`` and ``-domain_height`` (see [Domain Size](#domain-size)):
    | Command line argument  | Default value | Details |
    | --- | -- | -- |
-   | ``-target_edge_length`` | 0.0025 | Target edge length for elements. Resulting mesh will have edges close to this value. |
+   | ``-dim`` | 2 | 2 for a triangular mesh of a rectangle, 3 for a tetrahedral mesh of a box (needs TetGen). |
+   | ``-target_edge_length`` | 0.0025 | Target edge length for elements. Resulting mesh will have edges close to this value. The default is a 2D size: in 3D it means about 64M points on one rank, so pass a larger value there, e.g. 0.02. |
    | ``-final_smooth_its`` | 4 | How many iterations of smoothing (LLoyds + springs) to do. More iterations will increase mesh quality and runtime. |
+   | ``-domain_depth`` | 1.0 | Extent of the domain in z, used only when ``-dim 3``. |
    | ``-write_mesh`` | false | Output the PETSc DM to disk in HDF5 format. |
    | ``-integrity_check`` | true | Run mesh integrity checks and return NULL if not valid. This takes extra memory and time. Recommend disabling this for production runs. |
    | ``-print_stats`` | true | Print global mesh statistics on rank 0. This takes extra memory and time. Recommend disabling this for production runs. |
@@ -47,13 +59,17 @@ which will generate a mesh with the default parameters. To decrease the edge len
 
      mpiexec -n 2 ./BoxMeshDM -target_edge_length 0.001
 
+and to generate a tetrahedral mesh of a 2 x 1 x 0.5 box instead,
+
+     mpiexec -n 2 ./BoxMeshDM -dim 3 -target_edge_length 0.02 -domain_width 2.0 -domain_depth 0.5
+
 If you wish to write out the meshes generated this way, ensure PETSc has been configured with HDF5 (``--download-hdf5``) and run the code with ``-write_mesh true``. The resulting ``.h5`` file can be read into a PETSc DMPlex with ``-dm_plex_filename box_mesh.h5``.
 
 To visualise the mesh, from the command line run ``${PETSC_DIR}/lib/petsc/bin/petsc_gen_xdmf.py box_mesh.h5``. The resulting ``.xmf`` file can be visualised in Paraview with the XDMF reader.
 
 ### Building the code as a library
 
-For large scale use, the code can be compiled as a library. Hence instead of writing out the mesh, the routine ``GenerateBoxMeshDM`` can be called directly from existing code. This returns a parallel, load balanced PETSc DMPlex object that can be used without I/O. 
+For large scale use, the code can be compiled as a library. Hence instead of writing out the mesh, the routine ``GenerateBoxMeshDM`` (or ``GenerateBoxMeshDM3D``) can be called directly from existing code. This returns a parallel, load balanced PETSc DMPlex object that can be used without I/O.
 
 Ensure ``PETSC_DIR`` and ``PETSC_ARCH`` environmental variables are set and then call ``make clean && make lib``. You then need to include the ``.h`` file in your code and link to the output library ``libboxmeshdm``. 
 
@@ -85,9 +101,36 @@ In your code, to generate a PETSc DM that can then be used as normal, you can ca
      // Enable the use of command line options for this DM
      ierr = DMSetFromOptions(dm);
 
+A 3D tetrahedral mesh of the box [0,width] x [0,height] x [0,depth] is generated in the same way, with the depth after the height:
+
+     // Tetrahedral mesh of a 2.0 x 1.5 x 0.75 box
+     dm = GenerateBoxMeshDM3D(PETSC_COMM_WORLD, 0.02, 2.0, 1.5, 0.75, final_smooth_its, integrity_check, print_stats);
+
+### Boundary labels
+
+The boundary faces (edges in 2D) are labelled in both the ``"Face Sets"`` and ``"markers"`` labels. The labels are reapplied when the DM is refined, e.g., with ``-dm_refine``.
+
+In 2D:
+   | Value | Boundary |
+   | --- | --- |
+   | 1 | Bottom, y = 0 |
+   | 2 | Right, x = width |
+   | 3 | Top, y = height |
+   | 4 | Left, x = 0 |
+
+In 3D, with the same values as PETSc's ``DMPlexCreateBoxMesh``:
+   | Value | Boundary |
+   | --- | --- |
+   | 1 | Bottom, z = 0 |
+   | 2 | Top, z = depth |
+   | 3 | Front, y = 0 |
+   | 4 | Back, y = height |
+   | 5 | Right, x = width |
+   | 6 | Left, x = 0 |
+
 ### Agglomeration
 
-The domain is decomposed into one tile per MPI rank, with the decomposition chosen to minimise the total interface length. By default decompositions aren't nested, which can be inconvenient in some cases. For example, consider a node on a HPC system with one CPU (with 64 cores) and 4 GPUs and we want to run a simulation where we have one MPI rank per GPU. BoxMeshDM runs on the CPU - given this we would like to use the full 64 CPU cores to generate the mesh, assemble a matrix and then redistribute the matrix onto a sub-communicator with 4 ranks ready to run on the GPUs, but without having to call a repartitioner like ParMETIS. 
+The domain is decomposed into one tile per MPI rank, with the decomposition chosen to minimise the total interface length (area in 3D). By default decompositions aren't nested, which can be inconvenient in some cases. For example, consider a node on a HPC system with one CPU (with 64 cores) and 4 GPUs and we want to run a simulation where we have one MPI rank per GPU. BoxMeshDM runs on the CPU - given this we would like to use the full 64 CPU cores to generate the mesh, assemble a matrix and then redistribute the matrix onto a sub-communicator with 4 ranks ready to run on the GPUs, but without having to call a repartitioner like ParMETIS.
 
 BoxMeshDM allows you to specify an "agglomeration factor" such that the decomposition contains nested ranks. That way it is easy to redistribute the matrix on a sub-communicator, while still ensuring low total interface length. In the example above, if we run BoxMeshDM with ``n = 64`` ranks and we specify an agglomeration factor ``k = 16``, the decomposition is built as a coarse grid of ``n/k = 4`` tiles, with each split into ``k = 16`` fine tiles. The rank numbering of the ``k`` fine tiles is contiguous, and if the unknown ordering in the matrix is contiguous in rank order, that means a contiguous range of rows can be merged to reproduce a matrix that would have been produced by a plain 4 rank decomposition. 
 
@@ -101,11 +144,11 @@ For the example case, if we have an MPI program run on 64 ranks, in C/C++ you ca
      // ... the rows are numbered contiguously with rank
      // ... merge contiguous rows in blocks of 250 onto a sub-communicator with 4 ranks
 
-Setting ``agglom_factor = 1`` produces exactly the same mesh as ``GenerateBoxMeshDM``.
+Setting ``agglom_factor = 1`` produces exactly the same mesh as ``GenerateBoxMeshDM``. ``GenerateBoxMeshDM3DAgglom`` does the same in 3D.
 
 ### Weak scaling   
 
-Weak scaling results on ARCHER2 show the code is reasonably performant when generating large meshes in parallel:
+Weak scaling results in 2D on ARCHER2 show the code is reasonably performant when generating large meshes in parallel:
 
    | Compute nodes  | MPI ranks | Target edge length | Elements | Min angle (degrees) | Min/max volume ratio | Load imbalance | Time (s) |
    | --- | -- | -- | --- | --- | --- | --- |  --- |
@@ -115,4 +158,4 @@ Weak scaling results on ARCHER2 show the code is reasonably performant when gene
    | 4 | 512 | 6.25e-5 | 512M | 21.5 | 13.6 | 1.00125 | 92 |   
    | 1 | 128 | 1.25e-4 | 128M | 16.7 | 11.4 | 1.00111 | 82 |   
 
-To improve the mesh quality increase the number of final smoothing iterations. To improve the runtime, disable both the integrity check and statistics printing.       
+To improve the mesh quality increase the number of final smoothing iterations. To improve the runtime, disable both the integrity check and statistics printing.

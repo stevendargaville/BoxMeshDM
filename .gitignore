@@ -2,6 +2,7 @@
 /BoxMeshDM
 *.o
 /test_lib
+/mesh_checksum
 libboxmeshdm.a
 libboxmeshdm.so
 libboxmeshdm.dylib

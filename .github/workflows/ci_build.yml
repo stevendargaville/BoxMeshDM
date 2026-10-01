@@ -42,6 +42,10 @@ jobs:
         run: |
           docker system prune --volumes -af            
 
+  # The Docker jobs build on the stevendargaville/petsc base images, which are built with
+  # --download-tetgen. The Makefile only runs the 3D (TetGen) tests when PETSc has TetGen, so
+  # a base image without it would silently test 2D only. The macOS job below builds its own
+  # PETSc with TetGen.
   gnu_debug:
     runs-on: ubuntu-22.04
     needs: setup
@@ -172,11 +176,15 @@ jobs:
             --download-parmetis \
             --download-fblaslapack \
             --download-triangle \
+            --download-tetgen \
             --with-make-np=3 \
             --with-python-exec="${{ steps.venv.outputs.pybin }}"
           make -j3
       - name: Build box mesh (debug, CPU)
         shell: bash
+        # The only job that runs the 3D tests, so trap floating-point errors as the debug Docker job does
+        env:
+          PETSC_OPTIONS: "-on_error_abort -fp_trap on"
         run: |
           set -e
           export PETSC_DIR="${GITHUB_WORKSPACE}/petsc"
